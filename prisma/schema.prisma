@@ -1,0 +1,67 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TradingMode {
+  PAPER
+  LIVE
+}
+
+enum TradingRunStatus {
+  STARTED
+  COMPLETED
+  BLOCKED
+  FAILED
+}
+
+enum BrokerOrderStatus {
+  CREATED
+  FILLED
+  REJECTED
+  CANCELLED
+}
+
+model TradingRun {
+  id        String           @id @default(cuid())
+  mode      TradingMode
+  status    TradingRunStatus @default(STARTED)
+  startedAt DateTime         @default(now())
+  endedAt   DateTime?
+  reason    String?
+  orders    BrokerOrder[]
+  events    AuditEvent[]
+}
+
+model BrokerOrder {
+  id            String            @id @default(cuid())
+  runId         String
+  clientOrderId String            @unique
+  symbol        String
+  side          String
+  quantity      Int
+  limitPrice    Decimal           @db.Decimal(18, 4)
+  notional      Decimal           @db.Decimal(18, 4)
+  status        BrokerOrderStatus @default(CREATED)
+  brokerOrderId String?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  run           TradingRun        @relation(fields: [runId], references: [id], onDelete: Cascade)
+}
+
+model AuditEvent {
+  id        String      @id @default(cuid())
+  runId     String?
+  category  String
+  message   String
+  payload   Json?
+  createdAt DateTime    @default(now())
+  run       TradingRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([category])
+}
