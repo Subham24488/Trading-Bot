@@ -1,6 +1,7 @@
 import type { TradingMode } from '@prisma/client';
 
 import type { BrokerAdapter } from '../broker/BrokerAdapter.js';
+import type { PortfolioDetails } from '../domain.js';
 import type { RiskGate } from '../risk/RiskGate.js';
 import type { AuditService } from './AuditService.js';
 import type { TradingControl } from './TradingControl.js';
@@ -25,6 +26,10 @@ export class TradingService {
       ...this.control.snapshot(),
       strategyEnabled: false,
     };
+  }
+
+  public async getPortfolio(): Promise<PortfolioDetails> {
+    return this.broker.getPortfolioDetails();
   }
 
   public async runDailyCycle(): Promise<{

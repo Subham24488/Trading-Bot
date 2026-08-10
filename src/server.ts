@@ -5,7 +5,7 @@ import { Decimal } from 'decimal.js';
 import Fastify from 'fastify';
 import type { PgBoss } from 'pg-boss';
 
-import { PaperBroker } from './broker/PaperBroker.js';
+import { KiteBroker } from './broker/KiteBroker.js';
 import { config } from './config.js';
 import { database } from './database.js';
 import { RiskGate } from './risk/RiskGate.js';
@@ -16,7 +16,7 @@ import { TradingService } from './services/TradingService.js';
 
 const application = Fastify({ logger: { level: config.logLevel } });
 const control = new TradingControl();
-const broker = new PaperBroker();
+const broker = new KiteBroker();
 const riskGate = new RiskGate({
   maxOrderNotionalInr: new Decimal(config.maxOrderNotionalInr),
   maxOrdersPerRun: config.maxOrdersPerRun,
@@ -57,22 +57,28 @@ application.get('/health', async () => {
 
 application.get('/api/v1/readiness', async () => tradingService.getReadiness());
 
-application.post('/api/v1/control/pause', async (request) => {
+application.get('/api/v1/portfolio', async (request) => {
   await requireAdmin(request);
-  control.pause('Paused by an authenticated operator.');
-  return tradingService.getReadiness();
+  return tradingService.getPortfolio();
 });
 
-application.post('/api/v1/control/resume', async (request) => {
-  await requireAdmin(request);
-  control.resume();
-  return tradingService.getReadiness();
-});
+// Control endpoints are disabled for now.
+// application.post('/api/v1/control/pause', async (request) => {
+//   await requireAdmin(request);
+//   control.pause('Paused by an authenticated operator.');
+//   return tradingService.getReadiness();
+// });
 
-application.post('/api/v1/runs/daily', async (request) => {
-  await requireAdmin(request);
-  return tradingService.runDailyCycle();
-});
+// application.post('/api/v1/control/resume', async (request) => {
+//   await requireAdmin(request);
+//   control.resume();
+//   return tradingService.getReadiness();
+// });
+
+// application.post('/api/v1/runs/daily', async (request) => {
+//   await requireAdmin(request);
+//   return tradingService.runDailyCycle();
+// });
 
 application.addHook('onClose', async () => {
   await scheduler?.stop();

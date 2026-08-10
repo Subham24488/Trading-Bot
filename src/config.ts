@@ -15,6 +15,7 @@ const environmentSchema = z
     KITE_API_KEY: z.string().optional(),
     KITE_API_SECRET: z.string().optional(),
     KITE_ACCESS_TOKEN: z.string().optional(),
+    KITE_REQUEST_TOKEN: z.string().optional(),
     LIVE_TRADING_ACKNOWLEDGEMENT: z.string().optional(),
   })
   .superRefine((environment, context) => {
@@ -52,5 +53,6 @@ export const config = {
     apiKey: parsedEnvironment.KITE_API_KEY,
     apiSecret: parsedEnvironment.KITE_API_SECRET,
     accessToken: parsedEnvironment.KITE_ACCESS_TOKEN,
+    requestToken: parsedEnvironment.KITE_REQUEST_TOKEN,
   },
 } as const;

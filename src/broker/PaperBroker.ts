@@ -1,7 +1,12 @@
 import { Decimal } from 'decimal.js';
 
 import type { BrokerAdapter } from './BrokerAdapter.js';
-import type { BrokerOrderResult, IntendedOrder, PortfolioSnapshot } from '../domain.js';
+import type {
+  BrokerOrderResult,
+  IntendedOrder,
+  PortfolioDetails,
+  PortfolioSnapshot,
+} from '../domain.js';
 
 export class PaperBroker implements BrokerAdapter {
   public readonly name = 'paper';
@@ -12,6 +17,23 @@ export class PaperBroker implements BrokerAdapter {
       cashAvailable: '100000.00',
       positions: new Map(),
       asOf: new Date(),
+    };
+  }
+
+  public async getPortfolioDetails(): Promise<PortfolioDetails> {
+    const asOf = new Date();
+    return {
+      cashAvailable: '100000.00',
+      asOf,
+      holdings: [],
+      stocks: [],
+      mutualFunds: [],
+      profitAndLoss: {
+        holdingsPnl: '0.00',
+        holdingsDayChange: '0.00',
+        mutualFundsPnl: '0.00',
+        totalPnl: '0.00',
+      },
     };
   }
 
