@@ -1,3 +1,6 @@
+import { readFile, writeFile, unlink } from 'node:fs/promises';
+import path from 'node:path';
+
 import { Decimal } from 'decimal.js';
 import { KiteConnect } from 'kiteconnect';
 import type { Connect, MFHolding, Order, PortfolioHolding } from 'kiteconnect';
@@ -14,6 +17,8 @@ import type {
 } from '../domain.js';
 import type { BrokerAdapter } from './BrokerAdapter.js';
 
+const DEFAULT_SESSION_FILE = path.resolve('.kite-session.json');
+
 /**
  * Zerodha Kite Connect adapter for NSE cash-delivery limit orders.
  *
@@ -26,6 +31,7 @@ export type KiteClient = Pick<
   Connect,
   | 'setAccessToken'
   | 'generateSession'
+  | 'getProfile'
   | 'getMargins'
   | 'getHoldings'
   | 'getMFHoldings'
@@ -39,6 +45,7 @@ export type KiteBrokerOptions = {
   accessToken?: string;
   requestToken?: string;
   client?: KiteClient;
+  sessionFilePath?: string;
 };
 
 function money(value: number): string {
@@ -95,8 +102,10 @@ function mapMutualFund(holding: MFHolding): MutualFundHolding {
 export class KiteBroker implements BrokerAdapter {
   public readonly name = 'kite';
   private readonly client: KiteClient;
+  private readonly apiKey: string;
   private readonly apiSecret: string | undefined;
   private readonly requestTokenFromOptions: string | undefined;
+  private readonly sessionFilePath: string;
   private accessToken: string | null = null;
   private readonly submittedOrderIds = new Set<string>();
 
@@ -108,8 +117,10 @@ export class KiteBroker implements BrokerAdapter {
       throw new Error('KiteBroker requires KITE_API_KEY.');
     }
 
+    this.apiKey = apiKey;
     this.apiSecret = normalizeToken(options.apiSecret ?? config.kite.apiSecret);
     this.requestTokenFromOptions = normalizeToken(options.requestToken);
+    this.sessionFilePath = options.sessionFilePath ?? DEFAULT_SESSION_FILE;
     this.client = options.client ?? new KiteConnect({ api_key: apiKey });
 
     if (accessToken) {
@@ -117,14 +128,24 @@ export class KiteBroker implements BrokerAdapter {
     }
   }
 
+  public getApiKey(): string {
+    return this.apiKey;
+  }
+
   /** Current in-memory access token used for Kite API calls, if set. */
   public getAccessToken(): string | null {
     return this.accessToken;
   }
 
+  /** Clear the in-memory access token (persisted session file is kept for next boot). */
+  public clearAccessToken(): void {
+    this.accessToken = null;
+    this.client.setAccessToken('');
+  }
+
   /**
    * Exchange `KITE_REQUEST_TOKEN` (or an explicit request token) for an access
-   * token, store it in memory, and apply it to the Kite client for API calls.
+   * token, store it in memory + `.kite-session.json`, and apply it to the client.
    */
   public async generateAccessToken(requestToken?: string): Promise<string> {
     const token =
@@ -140,23 +161,115 @@ export class KiteBroker implements BrokerAdapter {
       throw new Error('KiteBroker requires KITE_API_SECRET to generate an access token.');
     }
 
-    const session = await this.client.generateSession(token, apiSecret);
-    this.setAccessToken(session.access_token);
-    return session.access_token;
+    try {
+      const session = await this.client.generateSession(token, apiSecret);
+      this.setAccessToken(session.access_token);
+      await this.persistAccessToken(session.access_token);
+      return session.access_token;
+    } catch (error: unknown) {
+      throw toKiteError(
+        error,
+        'KITE_REQUEST_TOKEN is invalid or expired. Complete Kite login again, set a fresh KITE_REQUEST_TOKEN (single-use), then restart.',
+      );
+    }
   }
 
-  /** Use the in-memory token, or exchange the request token when none is set. */
+  /** Use in-memory, env, or persisted access token; otherwise exchange the request token. */
   public async ensureAccessToken(): Promise<string> {
     if (this.accessToken) {
       return this.accessToken;
     }
 
+    const fromEnv = normalizeToken(config.kite.accessToken);
+    if (fromEnv) {
+      this.setAccessToken(fromEnv);
+      return fromEnv;
+    }
+
+    const fromDisk = await this.readPersistedAccessToken();
+    if (fromDisk) {
+      this.setAccessToken(fromDisk);
+      return fromDisk;
+    }
+
     return this.generateAccessToken();
+  }
+
+  /**
+   * Authenticate against Kite REST.
+   * Prefers env/persisted access token; exchanges KITE_REQUEST_TOKEN only when needed
+   * (request tokens are single-use and must not be reused on every boot).
+   */
+  public async connect(): Promise<void> {
+    this.clearAccessToken();
+
+    try {
+      const existing =
+        normalizeToken(config.kite.accessToken) ?? (await this.readPersistedAccessToken());
+
+      if (existing) {
+        this.setAccessToken(existing);
+        try {
+          await this.verifyProfile();
+          return;
+        } catch {
+          this.clearAccessToken();
+          await this.clearPersistedAccessToken();
+        }
+      }
+
+      await this.generateAccessToken();
+      await this.verifyProfile();
+    } catch (error: unknown) {
+      const normalized = toKiteError(error, 'Unknown Kite connection error.');
+      throw new Error(
+        `KiteBroker connect failed: ${normalized.message}. If using KITE_REQUEST_TOKEN, paste a fresh single-use request_token from the login redirect and restart once; the access token is then cached in .kite-session.json for later boots.`,
+      );
+    }
+  }
+
+  private async verifyProfile(): Promise<void> {
+    const profile = await this.client.getProfile();
+    if (!profile?.user_id) {
+      throw new Error('KiteBroker connect failed: profile response did not include user_id.');
+    }
   }
 
   private setAccessToken(accessToken: string): void {
     this.accessToken = accessToken;
     this.client.setAccessToken(accessToken);
+  }
+
+  private async persistAccessToken(accessToken: string): Promise<void> {
+    try {
+      await writeFile(
+        this.sessionFilePath,
+        JSON.stringify({ accessToken, savedAt: new Date().toISOString() }),
+        'utf8',
+      );
+    } catch {
+      // Best-effort; in-memory token still works for this process.
+    }
+  }
+
+  private async readPersistedAccessToken(): Promise<string | undefined> {
+    try {
+      const raw = await readFile(this.sessionFilePath, 'utf8');
+      const parsed = JSON.parse(raw) as { accessToken?: unknown };
+      return typeof parsed.accessToken === 'string'
+        ? normalizeToken(parsed.accessToken)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async clearPersistedAccessToken(): Promise<void> {
+    try {
+      await unlink(this.sessionFilePath);
+    } catch {
+      // Ignore missing file.
+    }
   }
 
   public async getPortfolio(): Promise<PortfolioSnapshot> {
@@ -292,4 +405,23 @@ export class KiteBroker implements BrokerAdapter {
 function normalizeToken(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function toKiteError(error: unknown, fallback: string): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (error && typeof error === 'object') {
+    const kiteError = error as { message?: unknown; error_type?: unknown };
+    const message =
+      typeof kiteError.message === 'string' && kiteError.message.trim()
+        ? kiteError.message
+        : fallback;
+    const typed = new Error(message);
+    if (typeof kiteError.error_type === 'string') {
+      (typed as Error & { error_type?: string }).error_type = kiteError.error_type;
+    }
+    return typed;
+  }
+  return new Error(fallback);
 }

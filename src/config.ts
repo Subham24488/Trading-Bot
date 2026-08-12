@@ -17,6 +17,12 @@ const environmentSchema = z
     KITE_ACCESS_TOKEN: z.string().optional(),
     KITE_REQUEST_TOKEN: z.string().optional(),
     LIVE_TRADING_ACKNOWLEDGEMENT: z.string().optional(),
+    SESSION_START_HOUR: z.coerce.number().int().min(0).max(23).default(9),
+    SESSION_END_HOUR: z.coerce.number().int().min(1).max(24).default(15),
+    SESSION_TICK_SECONDS: z.coerce.number().int().positive().default(60),
+    KITE_WS_MODE: z.enum(['ltp', 'quote', 'full']).default('quote'),
+    MAX_SESSION_INSTRUMENTS: z.coerce.number().int().positive().max(200).default(20),
+    SESSION_QUOTE_LOG_PATH: z.string().min(1).default('logs/session-quotes.jsonl'),
   })
   .superRefine((environment, context) => {
     if (
@@ -28,6 +34,13 @@ const environmentSchema = z
         message:
           'LIVE_TRADING_ACKNOWLEDGEMENT must equal I_UNDERSTAND_LIVE_TRADING_RISKS in live mode.',
         path: ['LIVE_TRADING_ACKNOWLEDGEMENT'],
+      });
+    }
+    if (environment.SESSION_END_HOUR <= environment.SESSION_START_HOUR) {
+      context.addIssue({
+        code: 'custom',
+        message: 'SESSION_END_HOUR must be greater than SESSION_START_HOUR.',
+        path: ['SESSION_END_HOUR'],
       });
     }
   });
@@ -54,5 +67,13 @@ export const config = {
     apiSecret: parsedEnvironment.KITE_API_SECRET,
     accessToken: parsedEnvironment.KITE_ACCESS_TOKEN,
     requestToken: parsedEnvironment.KITE_REQUEST_TOKEN,
+  },
+  session: {
+    startHour: parsedEnvironment.SESSION_START_HOUR,
+    endHour: parsedEnvironment.SESSION_END_HOUR,
+    tickSeconds: parsedEnvironment.SESSION_TICK_SECONDS,
+    wsMode: parsedEnvironment.KITE_WS_MODE,
+    maxInstruments: parsedEnvironment.MAX_SESSION_INSTRUMENTS,
+    quoteLogPath: parsedEnvironment.SESSION_QUOTE_LOG_PATH,
   },
 } as const;

@@ -7,7 +7,7 @@ vi.mock('../src/config.js', () => ({
     kite: {
       apiKey: 'test-api-key',
       apiSecret: 'test-api-secret',
-      accessToken: 'test-access-token',
+      accessToken: '',
       requestToken: 'test-request-token',
     },
   },
@@ -23,6 +23,7 @@ function createMockClient(overrides: Partial<KiteClient> = {}): KiteClient {
   return {
     setAccessToken: vi.fn(),
     generateSession: vi.fn().mockResolvedValue({ access_token: 'generated-access-token' }),
+    getProfile: vi.fn().mockResolvedValue({ user_id: 'AB1234' }),
     getMargins: vi.fn().mockResolvedValue({
       equity: {
         enabled: true,
@@ -153,6 +154,7 @@ describe('KiteBroker', () => {
       apiKey: 'test-api-key',
       apiSecret: 'test-api-secret',
       client,
+      sessionFilePath: 'logs/test-kite-session-generate.json',
     });
 
     await expect(broker.generateAccessToken()).resolves.toBe('generated-access-token');
@@ -168,6 +170,7 @@ describe('KiteBroker', () => {
       apiSecret: 'test-api-secret',
       accessToken: '',
       client,
+      sessionFilePath: 'logs/test-kite-session-missing.json',
     });
 
     await broker.getPortfolio();

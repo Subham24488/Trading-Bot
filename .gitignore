@@ -1,3 +1,5 @@
+logs/
+.kite-session.json
 node_modules/
 dist/
 coverage/

@@ -86,3 +86,28 @@ export interface RiskDecision {
   reasons: string[];
   notional: string | null;
 }
+
+export interface SessionInstrument {
+  instrumentToken: number;
+  exchange: string;
+  tradingsymbol: string;
+}
+
+export type SessionRunState = 'stopped' | 'running';
+
+export interface SessionStatusView {
+  state: SessionRunState;
+  running: boolean;
+  instruments: SessionInstrument[];
+  streamConnected: boolean;
+  startedAt: string | null;
+  elapsedSeconds: number;
+  lastSnapshotAt: string | null;
+  insideMarketWindow: boolean;
+  tickSeconds: number;
+}
+
+export interface SessionStartRequest {
+  instruments: SessionInstrument[];
+}
+
