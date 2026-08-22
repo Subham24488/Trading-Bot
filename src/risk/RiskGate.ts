@@ -5,7 +5,7 @@ import type { IntendedOrder, PortfolioSnapshot, RiskDecision } from '../domain.j
 export interface RiskPolicy {
   maxOrderNotionalInr: Decimal;
   maxOrdersPerRun: number;
-  allowedSymbols: ReadonlySet<string>;
+  catalogSymbols: ReadonlySet<string>;
 }
 
 export class RiskGate {
@@ -26,8 +26,8 @@ export class RiskGate {
     if (!limitPrice.isFinite() || limitPrice.lte(0)) {
       reasons.push('Limit price must be a positive finite number.');
     }
-    if (!this.policy.allowedSymbols.has(order.symbol.toUpperCase())) {
-      reasons.push(`Symbol ${order.symbol} is not on the approved universe.`);
+    if (!this.policy.catalogSymbols.has(order.symbol.toUpperCase())) {
+      reasons.push(`Symbol ${order.symbol} is not in the Kite instrument catalog.`);
     }
     if (ordersAlreadyApproved >= this.policy.maxOrdersPerRun) {
       reasons.push('Maximum orders per run has been reached.');

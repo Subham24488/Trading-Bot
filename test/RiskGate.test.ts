@@ -12,7 +12,7 @@ const portfolio = {
 const gate = new RiskGate({
   maxOrderNotionalInr: new Decimal(5000),
   maxOrdersPerRun: 3,
-  allowedSymbols: new Set(['NIFTYBEES']),
+  catalogSymbols: new Set(['NIFTYBEES']),
 });
 
 describe('RiskGate', () => {
@@ -34,7 +34,7 @@ describe('RiskGate', () => {
     );
 
     expect(result.allowed).toBe(false);
-    expect(result.reasons).toContain('Symbol UNAPPROVED is not on the approved universe.');
+    expect(result.reasons).toContain('Symbol UNAPPROVED is not in the Kite instrument catalog.');
     expect(result.reasons).toContain('Maximum orders per run has been reached.');
     expect(result.reasons).toContain('Order notional exceeds the configured safety limit.');
   });

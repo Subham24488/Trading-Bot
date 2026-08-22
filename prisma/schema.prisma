@@ -65,3 +65,30 @@ model AuditEvent {
   @@index([createdAt])
   @@index([category])
 }
+
+enum LlmTradeAction {
+  BUY
+  HOLD
+  EXIT
+}
+
+/// LLM buy/hold/exit intents. Rows are never sent to a broker from application code.
+model LlmTradeDecision {
+  id                     String         @id @default(cuid())
+  decidedAt              DateTime       @default(now())
+  asOf                   DateTime
+  symbol                 String
+  action                 LlmTradeAction
+  confidence             Decimal?       @db.Decimal(6, 4)
+  rationale              String
+  model                  String
+  promptHash             String
+  rawCompletion          String
+  marketSnapshot         Json
+  watchlistFile          String?
+  executed               Boolean        @default(false)
+  executionBlockedReason String         @default("LLM decisions are never sent to the broker.")
+
+  @@index([decidedAt])
+  @@index([symbol, decidedAt])
+}

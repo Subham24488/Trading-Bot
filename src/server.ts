@@ -16,6 +16,10 @@ import { MarketDataSessionService } from './services/MarketDataSessionService.js
 import { SessionControl } from './services/SessionControl.js';
 import { TradingControl } from './services/TradingControl.js';
 import { TradingService } from './services/TradingService.js';
+import { HuggingFaceClient } from './llm/huggingfaceClient.js';
+import { LlmTradeAdvisorService } from './llm/LlmTradeAdvisorService.js';
+import { NewsService } from './news/NewsService.js';
+import { getCatalogTradingsymbols } from './instruments/kiteInstruments.js';
 import { parseSessionStartBody } from './session/sessionStartSchema.js';
 
 const application = Fastify({ logger: { level: config.logLevel } });
@@ -24,7 +28,7 @@ const broker = new KiteBroker();
 const riskGate = new RiskGate({
   maxOrderNotionalInr: new Decimal(config.maxOrderNotionalInr),
   maxOrdersPerRun: config.maxOrdersPerRun,
-  allowedSymbols: config.allowedSymbols,
+  catalogSymbols: new Set(getCatalogTradingsymbols()),
 });
 const tradingService = new TradingService(
   config.tradingMode === 'live' ? 'LIVE' : 'PAPER',
@@ -37,6 +41,12 @@ const sessionControl = new SessionControl();
 const sessionService = new MarketDataSessionService({
   broker,
   sessionControl,
+  logger: application.log,
+});
+const llmClient = new HuggingFaceClient();
+const llmAdvisor = new LlmTradeAdvisorService({
+  llm: llmClient,
+  news: new NewsService(),
   logger: application.log,
 });
 
@@ -243,6 +253,86 @@ application.get(
   },
 );
 
+application.post(
+  '/api/v1/llm/universe',
+  {
+    schema: {
+      tags: ['llm'],
+      summary: 'Suggest stocks from news, mapped to Kite instruments for session/start',
+      security: [{ adminToken: [] }],
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string' },
+            asOfIst: { type: 'string' },
+            model: { type: 'string' },
+            newsItemCount: { type: 'integer' },
+            includedSymbols: { type: 'array', items: { type: 'string' } },
+            unmappedSymbols: { type: 'array', items: { type: 'string' } },
+            sessionStartPayload: {
+              type: 'object',
+              properties: {
+                instruments: { type: 'array', items: sessionInstrumentSchema },
+              },
+            },
+            suggestion: { type: 'object', additionalProperties: true },
+          },
+        },
+      },
+    },
+  },
+  async (request) => {
+    await requireAdmin(request);
+    try {
+      return await llmAdvisor.suggestUniverse();
+    } catch (error: unknown) {
+      if (error instanceof ZodError) {
+        throw Object.assign(new Error(error.issues.map((issue) => issue.message).join('; ')), {
+          statusCode: 502,
+        });
+      }
+      throw error;
+    }
+  },
+);
+
+application.get(
+  '/api/v1/llm/universe',
+  {
+    schema: {
+      tags: ['llm'],
+      summary: 'Current in-memory LLM watchlist (from last suggest call)',
+      security: [{ adminToken: [] }],
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            includedSymbols: { type: 'array', items: { type: 'string' } },
+            watchlistFile: { type: ['string', 'null'] },
+            sessionStartPayload: {
+              type: 'object',
+              properties: {
+                instruments: { type: 'array', items: sessionInstrumentSchema },
+              },
+            },
+            decisionIntervalMinutes: { type: 'integer' },
+          },
+        },
+      },
+    },
+  },
+  async (request) => {
+    await requireAdmin(request);
+    return {
+      includedSymbols: [...llmAdvisor.getIncludedSymbols()],
+      watchlistFile: llmAdvisor.getWatchlistFile(),
+      sessionStartPayload: llmAdvisor.getSessionStartPayload(),
+      decisionIntervalMinutes: config.llm.decisionIntervalMinutes,
+    };
+  },
+);
+
 // Control endpoints are disabled for now.
 // application.post('/api/v1/control/pause', async (request) => {
 //   await requireAdmin(request);
@@ -262,6 +352,7 @@ application.get(
 // });
 
 application.addHook('onClose', async () => {
+  llmAdvisor.stop();
   await sessionService.shutdown();
   await database.$disconnect();
 });
@@ -269,6 +360,12 @@ application.addHook('onClose', async () => {
 async function main(): Promise<void> {
   application.log.info('Bootstrapping Kite broker and WebSocket before listen.');
   await sessionService.connectAtBoot();
+
+  application.log.info({ model: config.huggingface.model }, 'Connecting Hugging Face LLM before listen.');
+  await llmClient.connect();
+  application.log.info('Hugging Face LLM connected and ready.');
+
+  llmAdvisor.startDecisionLoop();
 
   await application.listen({ host: '0.0.0.0', port: config.port });
   application.log.info({ docs: `http://localhost:${config.port}/docs` }, 'Swagger UI available.');

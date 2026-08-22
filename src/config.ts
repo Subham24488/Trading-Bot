@@ -9,7 +9,6 @@ const environmentSchema = z
     TRADING_MODE: z.enum(['paper', 'live']).default('paper'),
     MAX_ORDER_NOTIONAL_INR: z.coerce.number().positive().default(5000),
     MAX_ORDERS_PER_RUN: z.coerce.number().int().positive().max(10).default(5),
-    ALLOWED_SYMBOLS: z.string().default('NIFTYBEES,LIQUIDBEES'),
     DAILY_ORDER_CUTOFF_HOUR: z.coerce.number().int().min(9).max(15).default(14),
     ADMIN_TOKEN: z.string().min(24),
     KITE_API_KEY: z.string().optional(),
@@ -23,6 +22,16 @@ const environmentSchema = z
     KITE_WS_MODE: z.enum(['ltp', 'quote', 'full']).default('quote'),
     MAX_SESSION_INSTRUMENTS: z.coerce.number().int().positive().max(200).default(20),
     SESSION_QUOTE_LOG_PATH: z.string().min(1).default('logs/session-quotes.jsonl'),
+    HF_TOKEN: z.string().min(8, 'HF_TOKEN is required to call Hugging Face Inference.'),
+    HF_BASE_URL: z.string().url().default('https://router.huggingface.co/v1'),
+    HF_MODEL: z.string().min(1).default('Qwen/Qwen3-14B:fastest'),
+    HF_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+    HF_MAX_TOKENS: z.coerce.number().int().positive().max(8192).default(1200),
+    LLM_DECISION_INTERVAL_MINUTES: z.coerce.number().int().positive().max(240).default(15),
+    LLM_NEWS_LOOKBACK_DAYS: z.coerce.number().int().positive().max(90).default(30),
+    LLM_NEWS_ITEMS_PER_SYMBOL: z.coerce.number().int().positive().max(20).default(8),
+    TRADES_DIR: z.string().min(1).default('trades'),
+    KITE_INSTRUMENTS_PATH: z.string().min(1).default('data/kite-instruments.json'),
   })
   .superRefine((environment, context) => {
     if (
@@ -55,11 +64,6 @@ export const config = {
   tradingMode: parsedEnvironment.TRADING_MODE,
   maxOrderNotionalInr: parsedEnvironment.MAX_ORDER_NOTIONAL_INR,
   maxOrdersPerRun: parsedEnvironment.MAX_ORDERS_PER_RUN,
-  allowedSymbols: new Set(
-    parsedEnvironment.ALLOWED_SYMBOLS.split(',')
-      .map((symbol) => symbol.trim().toUpperCase())
-      .filter(Boolean),
-  ),
   dailyOrderCutoffHour: parsedEnvironment.DAILY_ORDER_CUTOFF_HOUR,
   adminToken: parsedEnvironment.ADMIN_TOKEN,
   kite: {
@@ -75,5 +79,19 @@ export const config = {
     wsMode: parsedEnvironment.KITE_WS_MODE,
     maxInstruments: parsedEnvironment.MAX_SESSION_INSTRUMENTS,
     quoteLogPath: parsedEnvironment.SESSION_QUOTE_LOG_PATH,
+  },
+  huggingface: {
+    token: parsedEnvironment.HF_TOKEN,
+    baseUrl: parsedEnvironment.HF_BASE_URL.replace(/\/$/, ''),
+    model: parsedEnvironment.HF_MODEL,
+    timeoutMs: parsedEnvironment.HF_TIMEOUT_MS,
+    maxTokens: parsedEnvironment.HF_MAX_TOKENS,
+  },
+  llm: {
+    decisionIntervalMinutes: parsedEnvironment.LLM_DECISION_INTERVAL_MINUTES,
+    newsLookbackDays: parsedEnvironment.LLM_NEWS_LOOKBACK_DAYS,
+    newsItemsPerSymbol: parsedEnvironment.LLM_NEWS_ITEMS_PER_SYMBOL,
+    tradesDir: parsedEnvironment.TRADES_DIR,
+    kiteInstrumentsPath: parsedEnvironment.KITE_INSTRUMENTS_PATH,
   },
 } as const;

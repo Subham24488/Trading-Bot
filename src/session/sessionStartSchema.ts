@@ -1,7 +1,8 @@
 import { z } from 'zod';
 
-import { config } from '../config.js';
 import type { SessionInstrument, SessionStartRequest } from '../domain.js';
+import { matchesCatalogInstrument } from '../instruments/kiteInstruments.js';
+import { config } from '../config.js';
 
 export const sessionInstrumentSchema = z.object({
   instrumentToken: z.number().int().positive(),
@@ -19,11 +20,15 @@ export const sessionStartBodySchema = z
   .superRefine((body, context) => {
     const seen = new Set<number>();
     for (const [index, instrument] of body.instruments.entries()) {
-      const symbol = instrument.tradingsymbol.trim().toUpperCase();
-      if (!config.allowedSymbols.has(symbol)) {
+      const normalized: SessionInstrument = {
+        instrumentToken: instrument.instrumentToken,
+        exchange: instrument.exchange.trim().toUpperCase(),
+        tradingsymbol: instrument.tradingsymbol.trim().toUpperCase(),
+      };
+      if (!matchesCatalogInstrument(normalized)) {
         context.addIssue({
           code: 'custom',
-          message: `Symbol ${symbol} is not in ALLOWED_SYMBOLS.`,
+          message: `Symbol ${normalized.tradingsymbol} is not in data/kite-instruments.json (or token/exchange does not match Kite).`,
           path: ['instruments', index, 'tradingsymbol'],
         });
       }

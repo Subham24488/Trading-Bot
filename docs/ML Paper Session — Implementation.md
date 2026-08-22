@@ -133,7 +133,7 @@ POST
 
 /api/v1/session/start
 
-Validate body; intersect with ALLOWED_SYMBOLS; start ticker + runner
+Validate body; intersect with data/kite-instruments.json; start ticker + runner
 
 POST
 
@@ -199,7 +199,7 @@ Start without instruments → 400; ticker not connected
 
 Start with tokens A,B → subscribe exactly [A,B]
 
-Symbol outside ALLOWED_SYMBOLS rejected
+Symbol outside Kite instrument catalog rejected
 
 Mock ticker tick → QuoteCache update
 
@@ -230,7 +230,7 @@ Changing/removing existing HTTP APIs or commented control blocks
 
 Live Kite orders from the model
 
-Auto-subscribing ALLOWED_SYMBOLS without start body tokens
+Auto-subscribing Kite catalog symbols without start body tokens
 
 Full-market quote/stream fetches
 

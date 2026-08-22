@@ -135,6 +135,7 @@ function createMockClient(overrides: Partial<KiteClient> = {}): KiteClient {
         guid: '',
       },
     ]),
+    getInstruments: vi.fn().mockResolvedValue([]),
     ...overrides,
   };
 }
@@ -170,7 +171,7 @@ describe('KiteBroker', () => {
       apiSecret: 'test-api-secret',
       accessToken: '',
       client,
-      sessionFilePath: 'logs/test-kite-session-missing.json',
+      sessionFilePath: `logs/test-kite-session-missing-${Date.now()}.json`,
     });
 
     await broker.getPortfolio();
@@ -281,5 +282,33 @@ describe('KiteBroker', () => {
       filledQuantity: 0,
       averagePrice: null,
     });
+  });
+
+  it('resolves NSE EQ instrument tokens for watchlist symbols', async () => {
+    const client = createMockClient({
+      getInstruments: vi.fn().mockResolvedValue([
+        {
+          instrument_token: 738561,
+          tradingsymbol: 'RELIANCE',
+          instrument_type: 'EQ',
+          exchange: 'NSE',
+        },
+        {
+          instrument_token: 999,
+          tradingsymbol: 'RELIANCE',
+          instrument_type: 'FUT',
+          exchange: 'NFO',
+        },
+      ]),
+    });
+    const broker = new KiteBroker({
+      accessToken: 'persisted-token',
+      client,
+      sessionFilePath: 'C:\\tmp\\unused-kite-session.json',
+    });
+
+    await expect(broker.resolveNseInstruments(['reliance'])).resolves.toEqual([
+      { instrumentToken: 738561, exchange: 'NSE', tradingsymbol: 'RELIANCE' },
+    ]);
   });
 });

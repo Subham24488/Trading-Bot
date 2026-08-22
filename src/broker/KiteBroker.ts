@@ -13,6 +13,7 @@ import type {
   MutualFundHolding,
   PortfolioDetails,
   PortfolioSnapshot,
+  SessionInstrument,
   StockPosition,
 } from '../domain.js';
 import type { BrokerAdapter } from './BrokerAdapter.js';
@@ -37,6 +38,7 @@ export type KiteClient = Pick<
   | 'getMFHoldings'
   | 'placeOrder'
   | 'getOrderHistory'
+  | 'getInstruments'
 >;
 
 export type KiteBrokerOptions = {
@@ -108,6 +110,7 @@ export class KiteBroker implements BrokerAdapter {
   private readonly sessionFilePath: string;
   private accessToken: string | null = null;
   private readonly submittedOrderIds = new Set<string>();
+  private nseInstrumentCache: Awaited<ReturnType<KiteClient['getInstruments']>> | undefined;
 
   public constructor(options: KiteBrokerOptions = {}) {
     const apiKey = normalizeToken(options.apiKey ?? config.kite.apiKey);
@@ -270,6 +273,41 @@ export class KiteBroker implements BrokerAdapter {
     } catch {
       // Ignore missing file.
     }
+  }
+
+  public async resolveNseInstruments(symbols: readonly string[]): Promise<SessionInstrument[]> {
+    await this.ensureAccessToken();
+    if (!this.nseInstrumentCache) {
+      this.nseInstrumentCache = await this.client.getInstruments('NSE');
+    }
+
+    const wanted = new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean));
+    const resolved = new Map<string, SessionInstrument>();
+
+    for (const row of this.nseInstrumentCache) {
+      const tradingsymbol = String(row.tradingsymbol ?? '').trim().toUpperCase();
+      if (!wanted.has(tradingsymbol) || resolved.has(tradingsymbol)) {
+        continue;
+      }
+
+      const instrumentType = String(row.instrument_type ?? 'EQ').toUpperCase();
+      if (instrumentType !== 'EQ') {
+        continue;
+      }
+
+      const token = Number(row.instrument_token);
+      if (!Number.isInteger(token) || token <= 0) {
+        continue;
+      }
+
+      resolved.set(tradingsymbol, {
+        instrumentToken: token,
+        exchange: 'NSE',
+        tradingsymbol,
+      });
+    }
+
+    return [...resolved.values()];
   }
 
   public async getPortfolio(): Promise<PortfolioSnapshot> {
