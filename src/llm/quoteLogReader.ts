@@ -74,3 +74,28 @@ export function filterSnapshotsToSymbols(
     }))
     .filter((snapshot) => snapshot.instruments.length > 0);
 }
+
+/** Last traded price from the newest snapshot that quotes the symbol. */
+export function lastPricesFromSnapshots(
+  snapshots: readonly QuoteLogSnapshot[],
+  symbols: readonly string[],
+): Record<string, number | null> {
+  const wanted = new Set(symbols.map((symbol) => symbol.toUpperCase()));
+  const prices: Record<string, number | null> = {};
+  for (const symbol of wanted) {
+    prices[symbol] = null;
+  }
+
+  for (const snapshot of snapshots) {
+    for (const instrument of snapshot.instruments) {
+      const symbol = instrument.tradingsymbol?.trim().toUpperCase();
+      if (!symbol || !wanted.has(symbol)) {
+        continue;
+      }
+      if (typeof instrument.lastPrice === 'number' && Number.isFinite(instrument.lastPrice)) {
+        prices[symbol] = instrument.lastPrice;
+      }
+    }
+  }
+  return prices;
+}

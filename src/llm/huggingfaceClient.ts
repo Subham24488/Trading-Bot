@@ -19,21 +19,33 @@ type ChatCompletionResponse = {
   choices?: Array<{
     message?: {
       content?: string | Array<{ type?: string; text?: string }>;
+      reasoning_content?: string;
+      reasoning?: string;
     };
   }>;
   error?: { message?: string };
 };
 
 function readContent(response: ChatCompletionResponse): string {
-  const content = response.choices?.[0]?.message?.content;
-  if (typeof content === 'string') {
+  const message = response.choices?.[0]?.message;
+  const content = message?.content;
+  if (typeof content === 'string' && content.trim()) {
     return content;
   }
   if (Array.isArray(content)) {
-    return content
+    const joined = content
       .map((part) => (typeof part.text === 'string' ? part.text : ''))
       .join('')
       .trim();
+    if (joined) {
+      return joined;
+    }
+  }
+  if (typeof message?.reasoning_content === 'string' && message.reasoning_content.trim()) {
+    return message.reasoning_content;
+  }
+  if (typeof message?.reasoning === 'string' && message.reasoning.trim()) {
+    return message.reasoning;
   }
   return '';
 }
@@ -83,10 +95,15 @@ export class HuggingFaceClient {
     this.connected = true;
   }
 
-  public async completeJson(messages: HuggingFaceChatMessage[]): Promise<{ text: string; parsed: unknown }> {
+  public async completeJson(
+    messages: HuggingFaceChatMessage[],
+    options: { maxTokens?: number } = {},
+  ): Promise<{ text: string; parsed: unknown }> {
     if (!this.connected) {
       throw new Error('Hugging Face LLM is not connected. Application boot did not complete connect().');
     }
+
+    const maxTokens = options.maxTokens ?? this.maxTokens;
 
     const response = await this.request(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -94,10 +111,12 @@ export class HuggingFaceClient {
       body: JSON.stringify({
         model: this.model,
         messages,
-        max_tokens: this.maxTokens,
+        max_tokens: maxTokens,
         temperature: 0,
         stream: false,
         response_format: { type: 'json_object' },
+        enable_thinking: false,
+        chat_template_kwargs: { enable_thinking: false },
       }),
     });
 

@@ -136,6 +136,7 @@ function createMockClient(overrides: Partial<KiteClient> = {}): KiteClient {
       },
     ]),
     getInstruments: vi.fn().mockResolvedValue([]),
+    getHistoricalData: vi.fn().mockResolvedValue([]),
     ...overrides,
   };
 }
@@ -310,5 +311,38 @@ describe('KiteBroker', () => {
     await expect(broker.resolveNseInstruments(['reliance'])).resolves.toEqual([
       { instrumentToken: 738561, exchange: 'NSE', tradingsymbol: 'RELIANCE' },
     ]);
+  });
+
+  it('maps Kite daily historical candles without placing orders', async () => {
+    const client = createMockClient({
+      getHistoricalData: vi.fn().mockResolvedValue([
+        {
+          date: new Date('2026-08-21T00:00:00.000+05:30'),
+          open: 10,
+          high: 11,
+          low: 9,
+          close: 10.5,
+          volume: 1_000_000,
+        },
+      ]),
+    });
+    const broker = new KiteBroker({
+      apiKey: 'test-api-key',
+      accessToken: 'test-access-token',
+      client,
+    });
+
+    await expect(broker.getDailyCandles(738561, '2026-08-01', '2026-08-21')).resolves.toEqual([
+      { d: '2026-08-21', o: 10, h: 11, l: 9, c: 10.5, v: 1_000_000 },
+    ]);
+    expect(client.getHistoricalData).toHaveBeenCalledWith(
+      738561,
+      'day',
+      '2026-08-01 00:00:00',
+      '2026-08-21 23:59:59',
+      false,
+      false,
+    );
+    expect(client.placeOrder).not.toHaveBeenCalled();
   });
 });

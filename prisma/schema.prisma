@@ -70,6 +70,7 @@ enum LlmTradeAction {
   BUY
   HOLD
   EXIT
+  SKIP
 }
 
 /// LLM buy/hold/exit intents. Rows are never sent to a broker from application code.
@@ -86,6 +87,8 @@ model LlmTradeDecision {
   rawCompletion          String
   marketSnapshot         Json
   watchlistFile          String?
+  buyPrice               Decimal?       @db.Decimal(18, 4)
+  sellPrice              Decimal?       @db.Decimal(18, 4)
   executed               Boolean        @default(false)
   executionBlockedReason String         @default("LLM decisions are never sent to the broker.")
 

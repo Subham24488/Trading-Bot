@@ -16,7 +16,11 @@ import type {
   SessionInstrument,
   StockPosition,
 } from '../domain.js';
+import type { DailyBar } from '../universe/types.js';
+import { istYmd } from '../universe/dates.js';
 import type { BrokerAdapter } from './BrokerAdapter.js';
+
+const HISTORICAL_MIN_INTERVAL_MS = 350;
 
 const DEFAULT_SESSION_FILE = path.resolve('.kite-session.json');
 
@@ -39,6 +43,7 @@ export type KiteClient = Pick<
   | 'placeOrder'
   | 'getOrderHistory'
   | 'getInstruments'
+  | 'getHistoricalData'
 >;
 
 export type KiteBrokerOptions = {
@@ -111,6 +116,7 @@ export class KiteBroker implements BrokerAdapter {
   private accessToken: string | null = null;
   private readonly submittedOrderIds = new Set<string>();
   private nseInstrumentCache: Awaited<ReturnType<KiteClient['getInstruments']>> | undefined;
+  private lastHistoricalMs = 0;
 
   public constructor(options: KiteBrokerOptions = {}) {
     const apiKey = normalizeToken(options.apiKey ?? config.kite.apiKey);
@@ -353,6 +359,44 @@ export class KiteBroker implements BrokerAdapter {
         totalPnl: money(holdingsPnl + mutualFundsPnl),
       },
     };
+  }
+
+  private async throttleHistorical(): Promise<void> {
+    const wait = this.lastHistoricalMs + HISTORICAL_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, wait);
+      });
+    }
+    this.lastHistoricalMs = Date.now();
+  }
+
+  public async getDailyCandles(
+    instrumentToken: number,
+    fromYmd: string,
+    toYmd: string,
+  ): Promise<DailyBar[]> {
+    await this.ensureAccessToken();
+    await this.throttleHistorical();
+    const rows = await this.client.getHistoricalData(
+      instrumentToken,
+      'day',
+      `${fromYmd} 00:00:00`,
+      `${toYmd} 23:59:59`,
+      false,
+      false,
+    );
+    return rows.map((row) => {
+      const date = row.date instanceof Date ? row.date : new Date(String(row.date));
+      return {
+        d: istYmd(date),
+        o: row.open,
+        h: row.high,
+        l: row.low,
+        c: row.close,
+        v: row.volume,
+      };
+    });
   }
 
   public async placeLimitOrder(order: IntendedOrder): Promise<BrokerOrderResult> {

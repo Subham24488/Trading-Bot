@@ -47,6 +47,7 @@ const llmClient = new HuggingFaceClient();
 const llmAdvisor = new LlmTradeAdvisorService({
   llm: llmClient,
   news: new NewsService(),
+  kite: broker,
   logger: application.log,
 });
 
@@ -258,7 +259,7 @@ application.post(
   {
     schema: {
       tags: ['llm'],
-      summary: 'Suggest stocks from news, mapped to Kite instruments for session/start',
+      summary: 'Rank catalog names from Kite dailies plus filings; LLM confirms at most two',
       security: [{ adminToken: [] }],
       response: {
         200: {
@@ -268,6 +269,8 @@ application.post(
             asOfIst: { type: 'string' },
             model: { type: 'string' },
             newsItemCount: { type: 'integer' },
+            knowledgeFile: { type: ['string', 'null'] },
+            candidateSymbols: { type: 'array', items: { type: 'string' } },
             includedSymbols: { type: 'array', items: { type: 'string' } },
             unmappedSymbols: { type: 'array', items: { type: 'string' } },
             sessionStartPayload: {
@@ -333,6 +336,64 @@ application.get(
   },
 );
 
+const llmDecisionLoopStatusSchema = {
+  type: 'object',
+  properties: {
+    running: { type: 'boolean' },
+    decisionIntervalMinutes: { type: 'integer' },
+    includedSymbols: { type: 'array', items: { type: 'string' } },
+    watchlistFile: { type: ['string', 'null'] },
+  },
+};
+
+application.post(
+  '/api/v1/llm/decisions/start',
+  {
+    schema: {
+      tags: ['llm'],
+      summary: 'Start the BUY/HOLD/EXIT/SKIP decision loop (does not place orders)',
+      security: [{ adminToken: [] }],
+      response: { 200: llmDecisionLoopStatusSchema },
+    },
+  },
+  async (request) => {
+    await requireAdmin(request);
+    return llmAdvisor.startDecisionLoop();
+  },
+);
+
+application.post(
+  '/api/v1/llm/decisions/stop',
+  {
+    schema: {
+      tags: ['llm'],
+      summary: 'Stop the BUY/HOLD/EXIT decision loop',
+      security: [{ adminToken: [] }],
+      response: { 200: llmDecisionLoopStatusSchema },
+    },
+  },
+  async (request) => {
+    await requireAdmin(request);
+    return llmAdvisor.stop();
+  },
+);
+
+application.get(
+  '/api/v1/llm/decisions',
+  {
+    schema: {
+      tags: ['llm'],
+      summary: 'LLM decision-loop status',
+      security: [{ adminToken: [] }],
+      response: { 200: llmDecisionLoopStatusSchema },
+    },
+  },
+  async (request) => {
+    await requireAdmin(request);
+    return llmAdvisor.getDecisionLoopStatus();
+  },
+);
+
 // Control endpoints are disabled for now.
 // application.post('/api/v1/control/pause', async (request) => {
 //   await requireAdmin(request);
@@ -364,8 +425,6 @@ async function main(): Promise<void> {
   application.log.info({ model: config.huggingface.model }, 'Connecting Hugging Face LLM before listen.');
   await llmClient.connect();
   application.log.info('Hugging Face LLM connected and ready.');
-
-  llmAdvisor.startDecisionLoop();
 
   await application.listen({ host: '0.0.0.0', port: config.port });
   application.log.info({ docs: `http://localhost:${config.port}/docs` }, 'Swagger UI available.');

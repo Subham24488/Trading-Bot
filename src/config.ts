@@ -26,11 +26,12 @@ const environmentSchema = z
     HF_BASE_URL: z.string().url().default('https://router.huggingface.co/v1'),
     HF_MODEL: z.string().min(1).default('Qwen/Qwen3-14B:fastest'),
     HF_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
-    HF_MAX_TOKENS: z.coerce.number().int().positive().max(8192).default(1200),
+    HF_MAX_TOKENS: z.coerce.number().int().positive().max(8192).default(400),
     LLM_DECISION_INTERVAL_MINUTES: z.coerce.number().int().positive().max(240).default(15),
     LLM_NEWS_LOOKBACK_DAYS: z.coerce.number().int().positive().max(90).default(30),
     LLM_NEWS_ITEMS_PER_SYMBOL: z.coerce.number().int().positive().max(20).default(8),
     TRADES_DIR: z.string().min(1).default('trades'),
+    UNIVERSE_DIR: z.string().min(1).default('universe'),
     KITE_INSTRUMENTS_PATH: z.string().min(1).default('data/kite-instruments.json'),
   })
   .superRefine((environment, context) => {
@@ -92,6 +93,7 @@ export const config = {
     newsLookbackDays: parsedEnvironment.LLM_NEWS_LOOKBACK_DAYS,
     newsItemsPerSymbol: parsedEnvironment.LLM_NEWS_ITEMS_PER_SYMBOL,
     tradesDir: parsedEnvironment.TRADES_DIR,
+    universeDir: parsedEnvironment.UNIVERSE_DIR,
     kiteInstrumentsPath: parsedEnvironment.KITE_INSTRUMENTS_PATH,
   },
 } as const;
