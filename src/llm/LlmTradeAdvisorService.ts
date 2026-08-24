@@ -7,6 +7,7 @@ import { config } from '../config.js';
 import type { SessionInstrument } from '../domain.js';
 import {
   getCatalogTradingsymbols,
+  findKiteInstrument,
   loadKiteInstruments,
   lookupSessionStartInstruments,
   type KiteInstrumentRef,
@@ -21,6 +22,7 @@ import {
 import { filterSnapshotsToSymbols, lastPricesFromSnapshots, readRecentQuoteSnapshots } from './quoteLogReader.js';
 import {
   clampWatchlistToTop,
+  dropIncludesNotPassing,
   decisionBatchSchema,
   filterDecisionsToSymbols,
   clampDecisionsToAllowed,
@@ -31,15 +33,11 @@ import {
 } from './schemas.js';
 import { formatIstTimestamp, hashPrompt, latestActionsForSymbols, persistDecisions, writeUniverseFile } from './decisionStore.js';
 import type { NewsService } from '../news/NewsService.js';
-import {
-  UNIVERSE_BAR_LOOKBACK_DAYS,
-  computeFetchWindow,
-  istYmd,
-  ymdToUtcDate,
-} from '../universe/dates.js';
-import { rankCandidates } from '../universe/features.js';
+import { UNIVERSE_BAR_LOOKBACK_DAYS, UNIVERSE_MIN_BARS_FOR_MOMENTUM, addCalendarDays, computeFetchWindow, istYmd, ymdToUtcDate } from '../universe/dates.js';
 import { mergeKnowledge, readLatestKnowledge, writeKnowledgeFile } from '../universe/knowledgeStore.js';
-import type { DailyBar } from '../universe/types.js';
+import { diversifyByCorrelation, screenUniverse, UNIVERSE_MAX_INCLUDES } from '../universe/universeScreen.js';
+import type { DailyBar, IntradayBar } from '../universe/types.js';
+import { applyPlaybookClamp, evaluatePlaybook, type PlaybookSignal } from './tradePlaybook.js';
 
 export type LlmTradeAdvisorOptions = {
   llm: HuggingFaceClient;
@@ -91,7 +89,7 @@ export class LlmTradeAdvisorService {
   }
 
   /**
-   * Incremental Kite dailies + NSE filings, local rank, LLM confirms 0–2 names.
+   * Incremental Kite dailies + NSE filings, local factor screen, LLM confirms 0–5 names.
    * Writes knowledge under universe/ and the pick under trades/. Does not place orders.
    */
   public async suggestUniverse(): Promise<UniverseSuggestResult> {
@@ -125,6 +123,9 @@ export class LlmTradeAdvisorService {
     let bars: Record<string, DailyBar[]> = {};
     let knowledgeFile: string | null = null;
     let knowledge = previous;
+    const tokens = Object.fromEntries(
+      catalog.map((instrument) => [instrument.tradingsymbol, instrument.instrumentToken]),
+    );
 
     if (!window.skipRemote) {
       news = await this.news.fetchNewsForRange(
@@ -134,9 +135,6 @@ export class LlmTradeAdvisorService {
         { requireSome: window.isSeed },
       );
       bars = await this.fetchDailyBars(catalog, window.barsFrom, window.barsTo);
-      const tokens = Object.fromEntries(
-        catalog.map((instrument) => [instrument.tradingsymbol, instrument.instrumentToken]),
-      );
       knowledge = mergeKnowledge({
         previous,
         asOfIst,
@@ -156,21 +154,64 @@ export class LlmTradeAdvisorService {
       throw new Error('Universe knowledge is empty after selection; cannot rank candidates.');
     }
 
+    const backfill = await this.backfillShortDailyBars(catalog, knowledge, today);
+    if (Object.keys(backfill).length > 0) {
+      knowledge = mergeKnowledge({
+        previous: knowledge,
+        asOfIst,
+        today,
+        coverageFrom: knowledge.coverageFrom,
+        fetchedFrom: addCalendarDays(today, -UNIVERSE_BAR_LOOKBACK_DAYS),
+        fetchedTo: today,
+        catalogPath,
+        news: [],
+        bars: backfill,
+        tokens,
+      });
+      knowledgeFile = await writeKnowledgeFile(knowledge);
+    }
+
     const newsItemCount = window.skipRemote
       ? Object.values(knowledge.symbols).reduce((sum, entry) => sum + entry.filings.length, 0)
       : news.reduce((sum, entry) => sum + entry.items.length, 0);
 
-    const candidates = rankCandidates(knowledge.symbols, 8);
+    const { candidates, preselected } = screenUniverse(knowledge.symbols);
     const candidateSymbols = candidates.map((candidate) => candidate.symbol);
-    const messages = buildUniverseMessages(asOfIst, candidates);
+    const passing = new Set(candidates.filter((candidate) => candidate.pass).map((candidate) => candidate.symbol));
+    const messages = buildUniverseMessages(
+      asOfIst,
+      candidates,
+      preselected.map((candidate) => candidate.symbol),
+    );
     const completion = await this.completeWithRetry(messages, 'universe');
     const parsed = clampWatchlistToTop(
-      intersectWatchlistWithCatalog(
-        universeSuggestionSchema.parse(completion.parsed),
-        new Set(kiteTradingsymbols),
+      dropIncludesNotPassing(
+        intersectWatchlistWithCatalog(
+          universeSuggestionSchema.parse(completion.parsed),
+          new Set(kiteTradingsymbols),
+        ),
+        passing,
       ),
+      UNIVERSE_MAX_INCLUDES,
     );
-    const includedSymbols = parsed.watchlist
+    const includedCandidates = parsed.watchlist
+      .filter((item) => item.include)
+      .map((item) => candidates.find((candidate) => candidate.symbol === item.symbol))
+      .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate));
+    const diversified = diversifyByCorrelation(includedCandidates, knowledge.symbols, UNIVERSE_MAX_INCLUDES);
+    const diversifiedSymbols = new Set(diversified.map((candidate) => candidate.symbol));
+    const cloneDropped = parsed.watchlist
+      .filter((item) => item.include && !diversifiedSymbols.has(item.symbol))
+      .map((item) => ({ symbol: item.symbol, reason: 'Dropped as a 20d-return clone of a higher-ranked pick.' }));
+    const suggestion = {
+      ...parsed,
+      watchlist: diversified.map((candidate, index) => {
+        const row = parsed.watchlist.find((item) => item.symbol === candidate.symbol)!;
+        return { ...row, include: true as const, rank: index + 1 };
+      }),
+      exclude: [...parsed.exclude, ...cloneDropped],
+    };
+    const includedSymbols = suggestion.watchlist
       .filter((item) => item.include)
       .map((item) => item.symbol);
     const { instruments, unmappedSymbols } = lookupSessionStartInstruments(includedSymbols, catalog);
@@ -181,7 +222,7 @@ export class LlmTradeAdvisorService {
       asOfIst,
       model: this.llm.getModel(),
       newsItemCount,
-      suggestion: parsed,
+      suggestion,
       includedSymbols,
       sessionStartPayload,
       unmappedSymbols,
@@ -200,7 +241,7 @@ export class LlmTradeAdvisorService {
         candidateSymbols,
         includedSymbols: this.includedSymbols,
         unmappedSymbols,
-        excludedCount: parsed.exclude.length,
+        excludedCount: suggestion.exclude.length,
         newsItemCount,
       },
       'Wrote universe knowledge and LLM pick JSON. No broker orders were sent.',
@@ -216,7 +257,7 @@ export class LlmTradeAdvisorService {
       includedSymbols: this.includedSymbols,
       unmappedSymbols,
       sessionStartPayload,
-      suggestion: parsed,
+      suggestion,
     };
   }
 
@@ -290,15 +331,30 @@ export class LlmTradeAdvisorService {
     const priorBuyPriceBySymbol = Object.fromEntries(
       this.includedSymbols.map((symbol) => [symbol, latestBySymbol[symbol]?.buyPrice ?? null]),
     );
-    const messages = buildDecisionMessages(asOfIst, this.includedSymbols, snapshots, allowedRows);
+    const playbook = await this.buildPlaybookSignals({
+      lastPriceBySymbol,
+      priorBuyPriceBySymbol,
+      allowedRows,
+    });
+    const messages = buildDecisionMessages(
+      asOfIst,
+      this.includedSymbols,
+      snapshots,
+      allowedRows,
+      playbook,
+    );
     const completion = await this.completeWithRetry(messages, 'decision');
     const filtered = filterDecisionsToSymbols(decisionBatchSchema.parse(completion.parsed), symbols);
-    const { batch, dropped } = clampDecisionsToAllowed(filtered, allowedBySymbol);
+    const { batch: allowedBatch, dropped } = clampDecisionsToAllowed(filtered, allowedBySymbol);
     if (dropped.length > 0) {
       this.logger.warn(
         { dropped },
         'Dropped LLM decisions whose action was not in the allowed set for that symbol.',
       );
+    }
+    const { batch, overrides } = applyPlaybookClamp(allowedBatch, playbook, allowedBySymbol);
+    if (overrides.length > 0) {
+      this.logger.warn({ overrides }, 'Overrode LLM actions that fought the candle playbook.');
     }
 
     const stored = await persistDecisions({
@@ -307,7 +363,7 @@ export class LlmTradeAdvisorService {
       model: this.llm.getModel(),
       promptHash: hashPrompt(messages),
       rawCompletion: completion.text,
-      marketSnapshot: JSON.parse(JSON.stringify(snapshots)) as Prisma.InputJsonValue,
+      marketSnapshot: JSON.parse(JSON.stringify({ snapshots, playbook })) as Prisma.InputJsonValue,
       watchlistFile: this.watchlistFile,
       lastPriceBySymbol,
       priorBuyPriceBySymbol,
@@ -319,6 +375,99 @@ export class LlmTradeAdvisorService {
     );
 
     return stored;
+  }
+
+  private async buildPlaybookSignals(input: {
+    lastPriceBySymbol: Record<string, number | null>;
+    priorBuyPriceBySymbol: Record<string, string | null>;
+    allowedRows: Array<{
+      symbol: string;
+      last: import('./schemas.js').LlmTradeActionName | null;
+      allowed: readonly import('./schemas.js').LlmTradeActionName[];
+    }>;
+  }): Promise<PlaybookSignal[]> {
+    const today = istYmd();
+    const fromYmd = addCalendarDays(today, -UNIVERSE_BAR_LOOKBACK_DAYS);
+    const knowledge = await readLatestKnowledge();
+    const niftyRef = findKiteInstrument('NIFTYBEES');
+    let niftyDaily = knowledge?.symbols.NIFTYBEES?.bars ?? [];
+    if (niftyDaily.length < 50 && niftyRef) {
+      try {
+        niftyDaily = await this.kite.getDailyCandles(niftyRef.instrumentToken, fromYmd, today);
+      } catch (error: unknown) {
+        this.logger.warn({ err: error }, 'Kite daily historical for NIFTYBEES failed.');
+      }
+    }
+
+    const signals: PlaybookSignal[] = [];
+    for (const row of input.allowedRows) {
+      const listed = findKiteInstrument(row.symbol);
+      const sessionToken = this.sessionStartPayload.instruments.find(
+        (instrument) => instrument.tradingsymbol === row.symbol,
+      )?.instrumentToken;
+      const token = listed?.instrumentToken ?? sessionToken;
+      let daily = knowledge?.symbols[row.symbol]?.bars ?? [];
+      if (daily.length < 50 && token) {
+        try {
+          daily = await this.kite.getDailyCandles(token, fromYmd, today);
+        } catch (error: unknown) {
+          this.logger.warn({ err: error, symbol: row.symbol }, 'Kite daily historical failed for playbook.');
+        }
+      }
+
+      let minutes15: IntradayBar[] = [];
+      if (token) {
+        try {
+          minutes15 = await this.kite.getFifteenMinuteCandles(token, today);
+        } catch (error: unknown) {
+          this.logger.warn({ err: error, symbol: row.symbol }, 'Kite 15-minute historical failed for playbook.');
+        }
+      }
+
+      const buyRaw = input.priorBuyPriceBySymbol[row.symbol];
+      const buyPrice = buyRaw === null || buyRaw === undefined ? null : Number(buyRaw);
+      signals.push(
+        evaluatePlaybook({
+          symbol: row.symbol,
+          lastAction: row.last as import('./schemas.js').LlmTradeActionName | null,
+          allowed: row.allowed,
+          lastPrice: input.lastPriceBySymbol[row.symbol] ?? null,
+          buyPrice: buyPrice !== null && Number.isFinite(buyPrice) ? buyPrice : null,
+          daily,
+          niftyDaily,
+          minutes15,
+        }),
+      );
+    }
+    return signals;
+  }
+
+  private async backfillShortDailyBars(
+    catalog: readonly KiteInstrumentRef[],
+    knowledge: { symbols: Record<string, { bars: DailyBar[] }> },
+    today: string,
+  ): Promise<Record<string, DailyBar[]>> {
+    const fromYmd = addCalendarDays(today, -UNIVERSE_BAR_LOOKBACK_DAYS);
+    const bars: Record<string, DailyBar[]> = {};
+    for (const instrument of catalog) {
+      const existing = knowledge.symbols[instrument.tradingsymbol]?.bars ?? [];
+      if (existing.length >= UNIVERSE_MIN_BARS_FOR_MOMENTUM) {
+        continue;
+      }
+      try {
+        bars[instrument.tradingsymbol] = await this.kite.getDailyCandles(
+          instrument.instrumentToken,
+          fromYmd,
+          today,
+        );
+      } catch (error: unknown) {
+        this.logger.warn(
+          { err: error, symbol: instrument.tradingsymbol },
+          'Kite daily backfill failed; ranking with stored bars only.',
+        );
+      }
+    }
+    return bars;
   }
 
   private async fetchDailyBars(

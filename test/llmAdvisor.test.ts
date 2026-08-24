@@ -155,6 +155,9 @@ describe('compact universe prompts', () => {
       {
         symbol: 'RELIANCE',
         score: 20,
+        pass: true,
+        failReasons: [],
+        momRiskAdj: 1.2,
         features: {
           sma20: 1400,
           sma50: 1350,
@@ -170,9 +173,9 @@ describe('compact universe prompts', () => {
       },
     ]);
     expect(messages[1]?.content.length).toBeLessThan(12_000);
-    expect(messages[0]?.content).toContain('at most 2');
+    expect(messages[0]?.content).toContain('at most 5');
     expect(messages[0]?.content).toContain('Zero includes is valid');
-    expect(messages[1]?.content).toContain('"maxInclude":2');
+    expect(messages[1]?.content).toContain('"maxInclude":5');
     expect(messages[1]?.content).not.toContain('outputSchema');
     expect(messages[1]?.content).not.toContain('kiteTradingsymbols');
   });
@@ -203,19 +206,27 @@ describe('LLM schemas', () => {
     expect(batch.decisions[1]?.action).toBe('SKIP');
   });
 
-  it('clamps more than two includes and allows an empty pick', () => {
+  it('clamps more than five includes and allows an empty pick', () => {
     const clamped = clampWatchlistToTop(
       universeSuggestionSchema.parse({
         watchlist: [
-          { symbol: 'RELIANCE', include: true, rationale: 'results plus rs' },
-          { symbol: 'TCS', include: true, rationale: 'buyback' },
-          { symbol: 'INFY', include: true, rationale: 'third' },
+          { symbol: 'RELIANCE', include: true, rationale: 'one' },
+          { symbol: 'TCS', include: true, rationale: 'two' },
+          { symbol: 'INFY', include: true, rationale: 'three' },
+          { symbol: 'HDFCBANK', include: true, rationale: 'four' },
+          { symbol: 'ICICIBANK', include: true, rationale: 'five' },
+          { symbol: 'SBIN', include: true, rationale: 'six' },
         ],
       }),
     );
-    expect(clamped.watchlist.map((item) => item.symbol)).toEqual(['RELIANCE', 'TCS']);
-    expect(clamped.watchlist.every((item) => item.include)).toBe(true);
-    expect(clamped.exclude.some((item) => item.symbol === 'INFY')).toBe(true);
+    expect(clamped.watchlist.map((item) => item.symbol)).toEqual([
+      'RELIANCE',
+      'TCS',
+      'INFY',
+      'HDFCBANK',
+      'ICICIBANK',
+    ]);
+    expect(clamped.exclude.some((item) => item.symbol === 'SBIN')).toBe(true);
 
     const empty = clampWatchlistToTop(
       universeSuggestionSchema.parse({
@@ -230,7 +241,7 @@ describe('LLM schemas', () => {
     expect(allowedActionsForLatest('EXIT')).toEqual(['BUY', 'SKIP']);
     expect(allowedActionsForLatest('SKIP')).toEqual(['BUY', 'SKIP']);
     expect(allowedActionsForLatest('BUY')).toEqual(['HOLD', 'EXIT']);
-    expect(allowedActionsForLatest('HOLD')).toEqual(['EXIT']);
+    expect(allowedActionsForLatest('HOLD')).toEqual(['HOLD', 'EXIT']);
     expect(decisionBatchSchema.parse({
       decisions: [{ symbol: 'RELIANCE', action: 'SKIP', rationale: 'no setup this interval' }],
     }).decisions[0]?.action).toBe('SKIP');
@@ -264,10 +275,13 @@ describe('decision prompts', () => {
       [{ symbol: 'RELIANCE', last: 'BUY', allowed: ['HOLD', 'EXIT'] }],
     );
     expect(messages[0]?.content).toContain('do not force BUY');
+    expect(messages[0]?.content).toContain('pb[]');
     const payload = JSON.parse(messages[1]?.content ?? '{}') as {
       allowed: Array<{ s: string; last: string; opts: string[] }>;
+      pb: unknown[];
     };
     expect(payload.allowed).toEqual([{ s: 'RELIANCE', last: 'BUY', opts: ['HOLD', 'SELL'] }]);
+    expect(payload.pb).toEqual([]);
   });
 });
 

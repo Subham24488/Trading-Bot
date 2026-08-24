@@ -25,7 +25,7 @@ export const watchlistItemSchema = z.object({
   symbol: z.string().trim().min(1).transform((value) => value.toUpperCase()),
   include: z.boolean(),
   rationale: z.string().trim().min(1),
-  rank: z.number().int().min(1).max(2).optional(),
+  rank: z.number().int().min(1).max(5).optional(),
   maxPositionInr: z.number().positive().optional(),
 });
 
@@ -77,7 +77,7 @@ export function intersectWatchlistWithCatalog(
   };
 }
 
-export function clampWatchlistToTop(suggestion: UniverseSuggestion, maxInclude = 2): UniverseSuggestion {
+export function clampWatchlistToTop(suggestion: UniverseSuggestion, maxInclude = 5): UniverseSuggestion {
   const included = suggestion.watchlist.filter((item) => item.include);
   const dropped = included.slice(maxInclude).map((item) => ({
     symbol: item.symbol,
@@ -86,9 +86,27 @@ export function clampWatchlistToTop(suggestion: UniverseSuggestion, maxInclude =
   const kept = included.slice(0, maxInclude).map((item, index) => ({
     ...item,
     include: true as const,
-    rank: (index + 1) as 1 | 2,
+    rank: index + 1,
   }));
 
+  return {
+    ...suggestion,
+    watchlist: kept,
+    exclude: [...suggestion.exclude, ...dropped],
+  };
+}
+
+export function dropIncludesNotPassing(
+  suggestion: UniverseSuggestion,
+  passingSymbols: ReadonlySet<string>,
+): UniverseSuggestion {
+  const kept = suggestion.watchlist.filter((item) => !item.include || passingSymbols.has(item.symbol));
+  const dropped = suggestion.watchlist
+    .filter((item) => item.include && !passingSymbols.has(item.symbol))
+    .map((item) => ({
+      symbol: item.symbol,
+      reason: 'Failed local liquidity/trend/RS/ATR screen.',
+    }));
   return {
     ...suggestion,
     watchlist: kept,
@@ -113,7 +131,7 @@ export function allowedActionsForLatest(
     return ['HOLD', 'EXIT'];
   }
   if (latest === 'HOLD') {
-    return ['EXIT'];
+    return ['HOLD', 'EXIT'];
   }
   return ['BUY', 'SKIP'];
 }

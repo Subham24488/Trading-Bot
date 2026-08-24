@@ -9,6 +9,15 @@ export type DailyBar = {
   v: number;
 };
 
+export type IntradayBar = {
+  t: string;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+};
+
 export type FeatureSnapshot = {
   sma20: number | null;
   sma50: number | null;
@@ -43,6 +52,9 @@ export type UniverseKnowledgeFile = {
 export type UniverseCandidate = {
   symbol: string;
   score: number;
+  pass: boolean;
+  failReasons: string[];
+  momRiskAdj: number | null;
   features: FeatureSnapshot;
   filings: Array<{ k: string; d: string; t: string; src: string }>;
 };

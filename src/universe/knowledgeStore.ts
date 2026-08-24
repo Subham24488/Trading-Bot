@@ -4,6 +4,7 @@ import path from 'node:path';
 import { config } from '../config.js';
 import { tradesFileName } from '../llm/decisionStore.js';
 import type { NewsItem } from '../news/NewsService.js';
+import { UNIVERSE_BAR_KEEP } from './dates.js';
 import { attachFeatures } from './features.js';
 import type { DailyBar, SymbolKnowledge, UniverseKnowledgeFile } from './types.js';
 
@@ -49,7 +50,7 @@ export async function readLatestKnowledge(
   return latest;
 }
 
-export function mergeBars(existing: DailyBar[], incoming: DailyBar[], keep = 60): DailyBar[] {
+export function mergeBars(existing: DailyBar[], incoming: DailyBar[], keep = UNIVERSE_BAR_KEEP): DailyBar[] {
   const byDate = new Map<string, DailyBar>();
   for (const bar of [...existing, ...incoming]) {
     byDate.set(bar.d, bar);

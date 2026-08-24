@@ -3,6 +3,7 @@ import type { UniverseCandidate } from '../universe/types.js';
 import type { QuoteLogSnapshot } from './quoteLogReader.js';
 import type { LlmTradeActionName } from './schemas.js';
 import { promptActionLabels } from './schemas.js';
+import { compactPlaybookForPrompt, type PlaybookSignal } from './tradePlaybook.js';
 
 /** Keep completion small so input+output stays under typical 40k context. */
 export const UNIVERSE_MAX_OUTPUT_TOKENS = 700;
@@ -195,17 +196,22 @@ export function compactSnapshotsForPrompt(snapshots: readonly QuoteLogSnapshot[]
 export function buildUniverseMessages(
   asOfIst: string,
   candidates: readonly UniverseCandidate[],
+  preselected: readonly string[] = [],
 ): Array<{ role: 'system' | 'user'; content: string }> {
-  const allowed = candidates.map((candidate) => candidate.symbol);
+  const allowed = candidates.filter((candidate) => candidate.pass).map((candidate) => candidate.symbol);
   const compact = candidates.map((candidate) => ({
     s: candidate.symbol,
+    pass: candidate.pass,
     score: candidate.score,
+    mom: candidate.momRiskAdj,
     sma20: candidate.features.sma20,
     sma50: candidate.features.sma50,
     rs: candidate.features.rsNifty20,
     vol: candidate.features.volVs20,
     distH: candidate.features.distFrom20HighPct,
+    atr: candidate.features.atrPct,
     ev: candidate.features.eventScore,
+    why: candidate.failReasons,
     n: candidate.filings,
   }));
 
@@ -213,13 +219,14 @@ export function buildUniverseMessages(
     {
       role: 'system',
       content:
-        'NSE cash-equity desk. Ranked candidates already passed liquidity and structure filters. ' +
-        'Pick at most 2 include=true names from allowed[] that combine (1) real catalyst in n[] (RESULT,BUYBACK,DEFAULT,RAISE, not shell MERGER/incorporation) and (2) rs/sma20>sma50 or vol. ' +
-        'Zero includes is valid if nothing qualifies. JSON only: {watchlist:[{symbol,include,rationale,rank}]}. rank 1 or 2. No live orders. /no_think',
+        'NSE cash-equity desk. c[] is a local screen (SMA20>SMA50, 20d RS vs NIFTYBEES, volume, ATR%, risk-adjusted momentum). ' +
+        'Include at most 5 names from allowed[] with pass=true. Prefer pref[] then high mom+rs and real catalyst in n[] (RESULT,BUYBACK,DEFAULT,RAISE, not shell MERGER). ' +
+        'Do not pick two names that move as clones. Zero includes is valid if nothing qualifies. ' +
+        'JSON only: {watchlist:[{symbol,include,rationale,rank}]}. rank 1-5. No live orders. /no_think',
     },
     {
       role: 'user',
-      content: JSON.stringify({ asOfIst, allowed, maxInclude: 2, c: compact }),
+      content: JSON.stringify({ asOfIst, allowed, pref: preselected, maxInclude: 5, c: compact }),
     },
   ];
 }
@@ -235,6 +242,7 @@ export function buildDecisionMessages(
   watchlistSymbols: readonly string[],
   snapshots: readonly QuoteLogSnapshot[],
   allowedRows: readonly DecisionAllowedRow[] = [],
+  playbook: readonly PlaybookSignal[] = [],
 ): Array<{ role: 'system' | 'user'; content: string }> {
   const bySymbol = new Map(allowedRows.map((row) => [row.symbol, row]));
   const allowed = watchlistSymbols.map((symbol) => {
@@ -251,10 +259,10 @@ export function buildDecisionMessages(
     {
       role: 'system',
       content:
-        'NSE paper assistant. For every wl symbol pick action only from that symbol opts. ' +
-        'When opts include SKIP, not taking a trade is valid — do not force BUY. ' +
-        'Do not invent other actions. Use quote bars (ltp, ohlc, ch, v). ' +
-        'JSON only: {decisions:[{symbol,action,rationale}]}. One row per wl name. Rationale ≤12 words. No live orders. /no_think',
+        'NSE cash paper desk. For every wl symbol pick action only from that symbol opts. ' +
+        'pb[] is the local playbook (trend SMA20/50, 20d RS vs NIFTYBEES, volume, ATR, 15m vs VWAP, +20/−10 overlay). ' +
+        'Follow rec unless opts forbid it. Do not BUY when rec is SKIP. SELL when rec is SELL (stop or target). ' +
+        'SKIP is valid — do not force BUY. JSON only: {decisions:[{symbol,action,rationale}]}. One row per wl. Rationale ≤12 words. No live orders. /no_think',
     },
     {
       role: 'user',
@@ -262,6 +270,7 @@ export function buildDecisionMessages(
         asOfIst,
         wl: watchlistSymbols,
         allowed,
+        pb: compactPlaybookForPrompt(playbook),
         q: compactSnapshotsForPrompt(snapshots),
       }),
     },

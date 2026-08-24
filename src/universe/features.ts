@@ -134,6 +134,9 @@ export function rankCandidates(symbols: Record<string, SymbolKnowledge>, limit =
   return ranked.map((knowledge) => ({
     symbol: knowledge.symbol,
     score: knowledge.features?.score ?? 0,
+    pass: true,
+    failReasons: [],
+    momRiskAdj: null,
     features: knowledge.features ?? computeFeatures(knowledge.bars, knowledge.filings, symbols[BENCHMARK]?.bars ?? []),
     filings: knowledge.filings.slice(0, 2).map((item) => ({
       k: classifyFilingKind(item.title),

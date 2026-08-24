@@ -345,4 +345,44 @@ describe('KiteBroker', () => {
     );
     expect(client.placeOrder).not.toHaveBeenCalled();
   });
+
+  it('maps Kite 15-minute historical candles without placing orders', async () => {
+    const client = createMockClient({
+      getHistoricalData: vi.fn().mockResolvedValue([
+        {
+          date: new Date('2026-08-24T09:15:00.000+05:30'),
+          open: 10,
+          high: 11,
+          low: 9,
+          close: 10.2,
+          volume: 50_000,
+        },
+      ]),
+    });
+    const broker = new KiteBroker({
+      apiKey: 'test-api-key',
+      accessToken: 'test-access-token',
+      client,
+    });
+
+    await expect(broker.getFifteenMinuteCandles(738561, '2026-08-24')).resolves.toEqual([
+      {
+        t: new Date('2026-08-24T09:15:00.000+05:30').toISOString(),
+        o: 10,
+        h: 11,
+        l: 9,
+        c: 10.2,
+        v: 50_000,
+      },
+    ]);
+    expect(client.getHistoricalData).toHaveBeenCalledWith(
+      738561,
+      '15minute',
+      '2026-08-24 09:15:00',
+      '2026-08-24 15:30:00',
+      false,
+      false,
+    );
+    expect(client.placeOrder).not.toHaveBeenCalled();
+  });
 });

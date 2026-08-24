@@ -16,7 +16,9 @@ export function addCalendarDays(ymd: string, days: number): string {
   return new Date(utc + days * 86_400_000).toISOString().slice(0, 10);
 }
 
-export const UNIVERSE_BAR_LOOKBACK_DAYS = 60;
+export const UNIVERSE_BAR_LOOKBACK_DAYS = 400;
+export const UNIVERSE_BAR_KEEP = 260;
+export const UNIVERSE_MIN_BARS_FOR_MOMENTUM = 200;
 
 /** Calendar YMD as a Date whose IST date matches `ymd`. */
 export function ymdToUtcDate(ymd: string): Date {

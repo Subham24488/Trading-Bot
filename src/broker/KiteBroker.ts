@@ -16,7 +16,7 @@ import type {
   SessionInstrument,
   StockPosition,
 } from '../domain.js';
-import type { DailyBar } from '../universe/types.js';
+import type { DailyBar, IntradayBar } from '../universe/types.js';
 import { istYmd } from '../universe/dates.js';
 import type { BrokerAdapter } from './BrokerAdapter.js';
 
@@ -376,15 +376,11 @@ export class KiteBroker implements BrokerAdapter {
     fromYmd: string,
     toYmd: string,
   ): Promise<DailyBar[]> {
-    await this.ensureAccessToken();
-    await this.throttleHistorical();
-    const rows = await this.client.getHistoricalData(
+    const rows = await this.fetchHistorical(
       instrumentToken,
       'day',
       `${fromYmd} 00:00:00`,
       `${toYmd} 23:59:59`,
-      false,
-      false,
     );
     return rows.map((row) => {
       const date = row.date instanceof Date ? row.date : new Date(String(row.date));
@@ -397,6 +393,41 @@ export class KiteBroker implements BrokerAdapter {
         v: row.volume,
       };
     });
+  }
+
+  /** NSE cash session 15-minute bars for one IST calendar day (09:15–15:30). */
+  public async getFifteenMinuteCandles(
+    instrumentToken: number,
+    sessionYmd: string,
+  ): Promise<IntradayBar[]> {
+    const rows = await this.fetchHistorical(
+      instrumentToken,
+      '15minute',
+      `${sessionYmd} 09:15:00`,
+      `${sessionYmd} 15:30:00`,
+    );
+    return rows.map((row) => {
+      const date = row.date instanceof Date ? row.date : new Date(String(row.date));
+      return {
+        t: date.toISOString(),
+        o: row.open,
+        h: row.high,
+        l: row.low,
+        c: row.close,
+        v: row.volume,
+      };
+    });
+  }
+
+  private async fetchHistorical(
+    instrumentToken: number,
+    interval: 'day' | '15minute',
+    from: string,
+    to: string,
+  ) {
+    await this.ensureAccessToken();
+    await this.throttleHistorical();
+    return this.client.getHistoricalData(instrumentToken, interval, from, to, false, false);
   }
 
   public async placeLimitOrder(order: IntendedOrder): Promise<BrokerOrderResult> {
