@@ -38,6 +38,8 @@ export type SymbolKnowledge = {
   features: FeatureSnapshot | null;
 };
 
+export type UniverseBook = 'equity' | 'options';
+
 export type UniverseKnowledgeFile = {
   generatedAt: string;
   asOfIst: string;
@@ -46,6 +48,7 @@ export type UniverseKnowledgeFile = {
   fetchedFrom: string | null;
   fetchedTo: string | null;
   catalogPath: string;
+  book?: UniverseBook;
   symbols: Record<string, SymbolKnowledge>;
 };
 

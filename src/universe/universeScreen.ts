@@ -7,7 +7,7 @@ import type { DailyBar, SymbolKnowledge, UniverseCandidate } from './types.js';
 const BENCHMARK = 'NIFTYBEES';
 const EXCLUDE_FROM_PICKS = new Set(['NIFTYBEES', 'LIQUIDBEES']);
 const CORRELATION_MAX = 0.85;
-export const UNIVERSE_MAX_INCLUDES = 5;
+export const UNIVERSE_MAX_INCLUDES = 1;
 export const UNIVERSE_LLM_CANDIDATES = 12;
 
 /**

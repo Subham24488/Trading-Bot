@@ -229,6 +229,28 @@ export class NewsService {
     return this.fetchRss(googleUrl, symbol, 'google-news-rss');
   }
 
+  public async fetchIndexNews(
+    queries: readonly { symbol: string; query: string }[],
+    from: Date,
+    to: Date,
+  ): Promise<SymbolNews[]> {
+    const spanDays = Math.max(
+      1,
+      Math.ceil(Math.abs(to.getTime() - from.getTime()) / 86_400_000),
+    );
+    const results: SymbolNews[] = [];
+    for (const entry of queries) {
+      const googleUrl =
+        `https://news.google.com/rss/search?q=${encodeURIComponent(`${entry.query} India`)}` +
+        `+when:${spanDays}d&hl=en-IN&gl=IN&ceid=IN:en`;
+      results.push({
+        symbol: entry.symbol.toUpperCase(),
+        items: await this.fetchRss(googleUrl, entry.symbol.toUpperCase(), 'google-news-rss'),
+      });
+    }
+    return results;
+  }
+
   private async fetchNseAnnouncements(symbol: string, from: Date, to: Date): Promise<NewsItem[]> {
     const params = new URLSearchParams({
       index: 'equities',

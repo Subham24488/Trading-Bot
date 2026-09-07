@@ -33,6 +33,7 @@ const environmentSchema = z
     TRADES_DIR: z.string().min(1).default('trades'),
     UNIVERSE_DIR: z.string().min(1).default('universe'),
     KITE_INSTRUMENTS_PATH: z.string().min(1).default('data/kite-instruments.json'),
+    KITE_INDEX_UNDERLYINGS_PATH: z.string().min(1).default('data/kite-index-underlyings.json'),
   })
   .superRefine((environment, context) => {
     if (
@@ -95,5 +96,6 @@ export const config = {
     tradesDir: parsedEnvironment.TRADES_DIR,
     universeDir: parsedEnvironment.UNIVERSE_DIR,
     kiteInstrumentsPath: parsedEnvironment.KITE_INSTRUMENTS_PATH,
+    kiteIndexUnderlyingsPath: parsedEnvironment.KITE_INDEX_UNDERLYINGS_PATH,
   },
 } as const;

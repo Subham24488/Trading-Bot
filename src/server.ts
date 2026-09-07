@@ -21,8 +21,20 @@ import { LlmTradeAdvisorService } from './llm/LlmTradeAdvisorService.js';
 import { NewsService } from './news/NewsService.js';
 import { getCatalogTradingsymbols } from './instruments/kiteInstruments.js';
 import { parseSessionStartBody } from './session/sessionStartSchema.js';
+import { universeBookBodySchema } from './llm/schemas.js';
 
 const application = Fastify({ logger: { level: config.logLevel } });
+application.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) => {
+  if (!body || String(body).trim() === '') {
+    done(null, {});
+    return;
+  }
+  try {
+    done(null, JSON.parse(String(body)));
+  } catch (error: unknown) {
+    done(error instanceof Error ? error : new Error('Invalid JSON body.'), undefined);
+  }
+});
 const control = new TradingControl();
 const broker = new KiteBroker();
 const riskGate = new RiskGate({
@@ -205,7 +217,11 @@ application.post(
   async (request) => {
     await requireAdmin(request);
     try {
-      const body = parseSessionStartBody(request.body);
+      const body = parseSessionStartBody(request.body, {
+        nfoAllowlist: llmAdvisor
+          .getSessionStartPayload()
+          .instruments.filter((instrument) => instrument.exchange === 'NFO'),
+      });
       return await sessionService.start(body.instruments);
     } catch (error: unknown) {
       if (error instanceof ZodError) {
@@ -259,8 +275,15 @@ application.post(
   {
     schema: {
       tags: ['llm'],
-      summary: 'Rank catalog names from Kite dailies plus filings; LLM confirms at most two',
+      summary: 'Rank NSE cash names or NIFTY/BANKNIFTY/FINNIFTY index options; LLM confirms 0–1',
       security: [{ adminToken: [] }],
+      body: {
+        type: 'object',
+        required: ['book'],
+        properties: {
+          book: { type: 'string', enum: ['equity', 'options'] },
+        },
+      },
       response: {
         200: {
           type: 'object',
@@ -268,6 +291,7 @@ application.post(
             filePath: { type: 'string' },
             asOfIst: { type: 'string' },
             model: { type: 'string' },
+            book: { type: 'string', enum: ['equity', 'options'] },
             newsItemCount: { type: 'integer' },
             knowledgeFile: { type: ['string', 'null'] },
             candidateSymbols: { type: 'array', items: { type: 'string' } },
@@ -288,7 +312,10 @@ application.post(
   async (request) => {
     await requireAdmin(request);
     try {
-      return await llmAdvisor.suggestUniverse();
+      const body = universeBookBodySchema.parse(request.body);
+      return body.book === 'options'
+        ? await llmAdvisor.suggestOptionsUniverse()
+        : await llmAdvisor.suggestUniverse();
     } catch (error: unknown) {
       if (error instanceof ZodError) {
         throw Object.assign(new Error(error.issues.map((issue) => issue.message).join('; ')), {
@@ -313,6 +340,7 @@ application.get(
           properties: {
             includedSymbols: { type: 'array', items: { type: 'string' } },
             watchlistFile: { type: ['string', 'null'] },
+            book: { type: 'string', enum: ['equity', 'options'] },
             sessionStartPayload: {
               type: 'object',
               properties: {
@@ -330,6 +358,7 @@ application.get(
     return {
       includedSymbols: [...llmAdvisor.getIncludedSymbols()],
       watchlistFile: llmAdvisor.getWatchlistFile(),
+      book: llmAdvisor.getBook(),
       sessionStartPayload: llmAdvisor.getSessionStartPayload(),
       decisionIntervalMinutes: config.llm.decisionIntervalMinutes,
     };
@@ -343,6 +372,8 @@ const llmDecisionLoopStatusSchema = {
     decisionIntervalMinutes: { type: 'integer' },
     includedSymbols: { type: 'array', items: { type: 'string' } },
     watchlistFile: { type: ['string', 'null'] },
+    book: { type: 'string', enum: ['equity', 'options'] },
+    instruments: { type: 'array', items: sessionInstrumentSchema },
   },
 };
 
@@ -353,12 +384,37 @@ application.post(
       tags: ['llm'],
       summary: 'Start the BUY/HOLD/EXIT/SKIP decision loop (does not place orders)',
       security: [{ adminToken: [] }],
+      body: {
+        type: 'object',
+        required: ['instruments'],
+        properties: {
+          instruments: {
+            type: 'array',
+            minItems: 1,
+            items: sessionInstrumentSchema,
+          },
+        },
+      },
       response: { 200: llmDecisionLoopStatusSchema },
     },
   },
   async (request) => {
     await requireAdmin(request);
-    return llmAdvisor.startDecisionLoop();
+    try {
+      const body = parseSessionStartBody(request.body, {
+        nfoAllowlist: llmAdvisor
+          .getSessionStartPayload()
+          .instruments.filter((instrument) => instrument.exchange === 'NFO'),
+      });
+      return await llmAdvisor.startDecisionLoop(body.instruments);
+    } catch (error: unknown) {
+      if (error instanceof ZodError) {
+        throw Object.assign(new Error(error.issues.map((issue) => issue.message).join('; ')), {
+          statusCode: 400,
+        });
+      }
+      throw error;
+    }
   },
 );
 

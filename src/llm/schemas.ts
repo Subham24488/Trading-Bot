@@ -1,5 +1,9 @@
 import { z } from 'zod';
 
+export const universeBookBodySchema = z.object({
+  book: z.enum(['equity', 'options']),
+});
+
 export const llmTradeActionSchema = z.enum(['BUY', 'HOLD', 'EXIT', 'SKIP']);
 export type LlmTradeActionName = z.infer<typeof llmTradeActionSchema>;
 
@@ -25,7 +29,7 @@ export const watchlistItemSchema = z.object({
   symbol: z.string().trim().min(1).transform((value) => value.toUpperCase()),
   include: z.boolean(),
   rationale: z.string().trim().min(1),
-  rank: z.number().int().min(1).max(5).optional(),
+  rank: z.number().int().min(1).max(1).optional(),
   maxPositionInr: z.number().positive().optional(),
 });
 
@@ -77,7 +81,7 @@ export function intersectWatchlistWithCatalog(
   };
 }
 
-export function clampWatchlistToTop(suggestion: UniverseSuggestion, maxInclude = 5): UniverseSuggestion {
+export function clampWatchlistToTop(suggestion: UniverseSuggestion, maxInclude = 1): UniverseSuggestion {
   const included = suggestion.watchlist.filter((item) => item.include);
   const dropped = included.slice(maxInclude).map((item) => ({
     symbol: item.symbol,

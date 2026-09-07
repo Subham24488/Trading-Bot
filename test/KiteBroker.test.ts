@@ -10,6 +10,9 @@ vi.mock('../src/config.js', () => ({
       accessToken: '',
       requestToken: 'test-request-token',
     },
+    llm: {
+      kiteIndexUnderlyingsPath: 'data/kite-index-underlyings.json',
+    },
   },
 }));
 
@@ -137,6 +140,7 @@ function createMockClient(overrides: Partial<KiteClient> = {}): KiteClient {
     ]),
     getInstruments: vi.fn().mockResolvedValue([]),
     getHistoricalData: vi.fn().mockResolvedValue([]),
+    getQuote: vi.fn().mockResolvedValue({}),
     ...overrides,
   };
 }
@@ -383,6 +387,72 @@ describe('KiteBroker', () => {
       false,
       false,
     );
+    expect(client.placeOrder).not.toHaveBeenCalled();
+  });
+
+  it('screens nearest weekly ATM NFO index options without placing orders', async () => {
+    const client = createMockClient({
+      getInstruments: vi.fn().mockResolvedValue([
+        {
+          instrument_token: 11,
+          tradingsymbol: 'NIFTY25SEP25000CE',
+          name: 'NIFTY',
+          expiry: '2026-09-01',
+          strike: 25000,
+          instrument_type: 'CE',
+          exchange: 'NFO',
+        },
+        {
+          instrument_token: 12,
+          tradingsymbol: 'NIFTY25SEP25000PE',
+          name: 'NIFTY',
+          expiry: '2026-09-01',
+          strike: 25000,
+          instrument_type: 'PE',
+          exchange: 'NFO',
+        },
+        {
+          instrument_token: 13,
+          tradingsymbol: 'NIFTY25OCT25000CE',
+          name: 'NIFTY',
+          expiry: '2026-10-06',
+          strike: 25000,
+          instrument_type: 'CE',
+          exchange: 'NFO',
+        },
+      ]),
+    });
+    const broker = new KiteBroker({
+      apiKey: 'test-api-key',
+      accessToken: 'test-access-token',
+      client,
+    });
+
+    await expect(
+      broker.getNfoIndexOptions({
+        names: ['NIFTY'],
+        spots: { NIFTY: 25010 },
+        asOfYmd: '2026-08-31',
+      }),
+    ).resolves.toEqual([
+      {
+        instrumentToken: 11,
+        tradingsymbol: 'NIFTY25SEP25000CE',
+        name: 'NIFTY',
+        expiry: '2026-09-01',
+        strike: 25000,
+        instrumentType: 'CE',
+      },
+      {
+        instrumentToken: 12,
+        tradingsymbol: 'NIFTY25SEP25000PE',
+        name: 'NIFTY',
+        expiry: '2026-09-01',
+        strike: 25000,
+        instrumentType: 'PE',
+      },
+    ]);
+    expect(client.getInstruments).toHaveBeenCalledWith('NFO');
     expect(client.placeOrder).not.toHaveBeenCalled();
   });
 });

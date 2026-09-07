@@ -1,4 +1,3 @@
-import type { Prisma } from '@prisma/client';
 import path from 'node:path';
 
 import type { KiteBroker } from '../broker/KiteBroker.js';
@@ -15,6 +14,7 @@ import {
 import type { HuggingFaceClient } from './huggingfaceClient.js';
 import {
   buildDecisionMessages,
+  buildOptionsUniverseMessages,
   buildUniverseMessages,
   DECISION_MAX_OUTPUT_TOKENS,
   UNIVERSE_MAX_OUTPUT_TOKENS,
@@ -31,13 +31,34 @@ import {
   universeSuggestionSchema,
   type UniverseSuggestion,
 } from './schemas.js';
-import { formatIstTimestamp, hashPrompt, latestActionsForSymbols, persistDecisions, writeUniverseFile } from './decisionStore.js';
+import { formatIstTimestamp, latestActionsForSymbols, persistDecisions, writeUniverseFile } from './decisionStore.js';
 import type { NewsService } from '../news/NewsService.js';
 import { UNIVERSE_BAR_LOOKBACK_DAYS, UNIVERSE_MIN_BARS_FOR_MOMENTUM, addCalendarDays, computeFetchWindow, istYmd, ymdToUtcDate } from '../universe/dates.js';
 import { mergeKnowledge, readLatestKnowledge, writeKnowledgeFile } from '../universe/knowledgeStore.js';
 import { diversifyByCorrelation, screenUniverse, UNIVERSE_MAX_INCLUDES } from '../universe/universeScreen.js';
 import type { DailyBar, IntradayBar } from '../universe/types.js';
-import { applyPlaybookClamp, evaluatePlaybook, type PlaybookSignal } from './tradePlaybook.js';
+import { applyPlaybookClamp, evaluateOptionPlaybook, evaluatePlaybook, type PlaybookSignal } from './tradePlaybook.js';
+import {
+  indexNameFromOptionSymbol,
+  loadIndexUnderlyings,
+  optionSideFromSymbol,
+  type IndexOptionName,
+} from '../instruments/kiteIndexUnderlyings.js';
+import {
+  OPTIONS_MAX_INCLUDES,
+  indexOptionBias,
+  pickOptionContracts,
+  screenIndexOptions,
+  toSessionInstruments,
+  toUniverseCandidates,
+  type OptionQuote,
+  type OptionScreenRow,
+} from '../options/optionsScreen.js';
+import {
+  OPTION_BAR_LOOKBACK_DAYS,
+  pickBestOptionRule,
+} from '../options/optionRuleScoreboard.js';
+import type { UniverseBook } from '../universe/types.js';
 
 export type LlmTradeAdvisorOptions = {
   llm: HuggingFaceClient;
@@ -50,6 +71,7 @@ export type UniverseSuggestResult = {
   filePath: string;
   asOfIst: string;
   model: string;
+  book: UniverseBook;
   newsItemCount: number;
   knowledgeFile: string | null;
   candidateSymbols: string[];
@@ -68,6 +90,7 @@ export class LlmTradeAdvisorService {
   private includedSymbols: string[] = [];
   private sessionStartPayload: { instruments: SessionInstrument[] } = { instruments: [] };
   private watchlistFile: string | null = null;
+  private book: UniverseBook = 'equity';
 
   public constructor(options: LlmTradeAdvisorOptions) {
     this.llm = options.llm;
@@ -88,11 +111,16 @@ export class LlmTradeAdvisorService {
     return this.sessionStartPayload;
   }
 
+  public getBook(): UniverseBook {
+    return this.book;
+  }
+
   /**
-   * Incremental Kite dailies + NSE filings, local factor screen, LLM confirms 0–5 names.
+   * Incremental Kite dailies + NSE filings, local factor screen, LLM confirms 0–1 names.
    * Writes knowledge under universe/ and the pick under trades/. Does not place orders.
    */
   public async suggestUniverse(): Promise<UniverseSuggestResult> {
+    this.book = 'equity';
     const catalogPath = path.resolve(config.llm.kiteInstrumentsPath);
     const catalog = loadKiteInstruments(catalogPath);
     const kiteTradingsymbols = getCatalogTradingsymbols(catalogPath);
@@ -139,6 +167,7 @@ export class LlmTradeAdvisorService {
         previous,
         asOfIst,
         today,
+        book: 'equity',
         coverageFrom: window.isSeed ? window.newsFrom : (previous?.coverageFrom ?? window.newsFrom),
         fetchedFrom: window.newsFrom,
         fetchedTo: window.newsTo,
@@ -160,6 +189,7 @@ export class LlmTradeAdvisorService {
         previous: knowledge,
         asOfIst,
         today,
+        book: 'equity',
         coverageFrom: knowledge.coverageFrom,
         fetchedFrom: addCalendarDays(today, -UNIVERSE_BAR_LOOKBACK_DAYS),
         fetchedTo: today,
@@ -221,6 +251,7 @@ export class LlmTradeAdvisorService {
       generatedAt: new Date().toISOString(),
       asOfIst,
       model: this.llm.getModel(),
+      book: 'equity',
       newsItemCount,
       suggestion,
       includedSymbols,
@@ -251,6 +282,274 @@ export class LlmTradeAdvisorService {
       filePath,
       asOfIst,
       model: this.llm.getModel(),
+      book: 'equity',
+      newsItemCount,
+      knowledgeFile,
+      candidateSymbols,
+      includedSymbols: this.includedSymbols,
+      unmappedSymbols,
+      sessionStartPayload,
+      suggestion,
+    };
+  }
+
+  public async suggestOptionsUniverse(): Promise<UniverseSuggestResult> {
+    this.book = 'options';
+    const underlyings = loadIndexUnderlyings();
+    const catalogPath = path.resolve(config.llm.kiteIndexUnderlyingsPath);
+    const asOfIst = formatIstTimestamp();
+    const today = istYmd();
+    const previous = await readLatestKnowledge(undefined, 'options');
+    const window = computeFetchWindow(
+      previous?.coverageTo ?? null,
+      today,
+      config.llm.newsLookbackDays,
+      UNIVERSE_BAR_LOOKBACK_DAYS,
+    );
+
+    this.logger.info(
+      {
+        indexes: underlyings.map((row) => row.tradingsymbol),
+        coverageTo: previous?.coverageTo ?? null,
+        skipRemote: window.skipRemote,
+      },
+      'Building index-options universe from Kite NFO chain, index dailies, and Google RSS.',
+    );
+
+    let news: Awaited<ReturnType<NewsService['fetchIndexNews']>> = [];
+    let bars: Record<string, DailyBar[]> = {};
+    let knowledgeFile: string | null = null;
+    let knowledge = previous;
+    const tokens = Object.fromEntries(
+      underlyings.map((row) => [row.tradingsymbol, row.instrumentToken]),
+    );
+
+    if (!window.skipRemote) {
+      news = await this.news.fetchIndexNews(
+        underlyings.map((row) => ({ symbol: row.tradingsymbol, query: row.googleQuery })),
+        ymdToUtcDate(window.newsFrom),
+        ymdToUtcDate(window.newsTo),
+      );
+      bars = await this.fetchDailyBars(
+        underlyings.map((row) => ({
+          tradingsymbol: row.tradingsymbol,
+          exchange: row.exchange,
+          instrumentToken: row.instrumentToken,
+        })),
+        window.barsFrom,
+        window.barsTo,
+      );
+      knowledge = mergeKnowledge({
+        previous,
+        asOfIst,
+        today,
+        book: 'options',
+        coverageFrom: window.isSeed ? window.newsFrom : (previous?.coverageFrom ?? window.newsFrom),
+        fetchedFrom: window.newsFrom,
+        fetchedTo: window.newsTo,
+        catalogPath,
+        news,
+        bars,
+        tokens,
+      });
+      knowledgeFile = await writeKnowledgeFile(knowledge);
+    }
+
+    if (!knowledge) {
+      throw new Error('Index-options knowledge is empty after selection; cannot screen contracts.');
+    }
+
+    const backfill = await this.backfillShortDailyBars(
+      underlyings.map((row) => ({
+        tradingsymbol: row.tradingsymbol,
+        exchange: row.exchange,
+        instrumentToken: row.instrumentToken,
+      })),
+      knowledge,
+      today,
+    );
+    if (Object.keys(backfill).length > 0) {
+      knowledge = mergeKnowledge({
+        previous: knowledge,
+        asOfIst,
+        today,
+        book: 'options',
+        coverageFrom: knowledge.coverageFrom,
+        fetchedFrom: addCalendarDays(today, -UNIVERSE_BAR_LOOKBACK_DAYS),
+        fetchedTo: today,
+        catalogPath,
+        news: [],
+        bars: backfill,
+        tokens,
+      });
+      knowledgeFile = await writeKnowledgeFile(knowledge);
+    }
+
+    const indexQuoteKeys = underlyings.map((row) => `${row.exchange}:${row.kiteQuoteSymbol}`);
+    const indexQuotes = await this.kite.getQuotes(indexQuoteKeys);
+    const spots: Partial<Record<IndexOptionName, number>> = {};
+    for (const row of underlyings) {
+      const quote =
+        indexQuotes[`${row.exchange}:${row.kiteQuoteSymbol}`] ??
+        indexQuotes[`${row.exchange}:${row.kiteQuoteSymbol}`.toUpperCase()] ??
+        indexQuotes[row.kiteQuoteSymbol];
+      const lastBar = knowledge.symbols[row.tradingsymbol]?.bars.at(-1)?.c;
+      const spot = quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : lastBar;
+      if (spot && spot > 0) {
+        spots[row.tradingsymbol as IndexOptionName] = spot;
+      }
+    }
+
+    const chain = await this.kite.getNfoIndexOptions({ spots, asOfYmd: today });
+    const optionQuoteKeys = chain.map((contract) => `NFO:${contract.tradingsymbol}`);
+    const rawOptionQuotes = await this.kite.getQuotes(optionQuoteKeys);
+    const optionQuotes: Record<string, OptionQuote> = {};
+    for (const [key, quote] of Object.entries(rawOptionQuotes)) {
+      const symbol = (key.includes(':') ? key.slice(key.indexOf(':') + 1) : key).toUpperCase();
+      optionQuotes[symbol] = { lastPrice: quote.lastPrice, volume: quote.volume, oi: quote.oi };
+    }
+
+    const newsByIndex: Record<string, (typeof news)[number]['items']> = {};
+    for (const entry of news) {
+      newsByIndex[entry.symbol] = entry.items;
+    }
+    if (window.skipRemote) {
+      for (const name of Object.keys(knowledge.symbols)) {
+        newsByIndex[name] = knowledge.symbols[name]?.filings ?? [];
+      }
+    }
+
+    const biases = underlyings.map((row) =>
+      indexOptionBias(row.tradingsymbol as IndexOptionName, knowledge.symbols[row.tradingsymbol]?.bars ?? []),
+    );
+    const indexFeatures = Object.fromEntries(
+      underlyings.map((row) => [
+        row.tradingsymbol,
+        knowledge.symbols[row.tradingsymbol]?.features ?? {
+          sma20: null,
+          sma50: null,
+          atrPct: null,
+          rsNifty20: null,
+          volVs20: null,
+          distFrom20HighPct: null,
+          ret20Pct: null,
+          eventScore: 0,
+          score: 0,
+        },
+      ]),
+    );
+    const steps = Object.fromEntries(underlyings.map((row) => [row.tradingsymbol, row.strikeStep])) as Partial<
+      Record<IndexOptionName, number>
+    >;
+    const screened = screenIndexOptions({
+      contracts: chain,
+      quotes: optionQuotes,
+      biases,
+      spots,
+      steps,
+      newsByIndex,
+      indexFeatures,
+    });
+    const passingRows = screened.filter((row) => row.pass);
+    const preselected = pickOptionContracts(passingRows);
+    this.logger.info(
+      {
+        spots,
+        chainCount: chain.length,
+        screenedCount: screened.length,
+        passingCount: passingRows.length,
+        biases: biases.map((bias) => ({ index: bias.index, side: bias.side, reasons: bias.failReasons })),
+      },
+      'Index-options local screen finished.',
+    );
+    const candidates = toUniverseCandidates(passingRows);
+    const passing = new Set(passingRows.map((row) => row.symbol));
+    const rowBySymbol = new Map(screened.map((row) => [row.symbol, row]));
+    const messages = buildOptionsUniverseMessages(
+      asOfIst,
+      candidates,
+      preselected.map((row) => row.symbol),
+    );
+    const completion = await this.completeWithRetry(messages, 'universe');
+    const allowedSymbols = new Set(passingRows.map((row) => row.symbol));
+    const parsed = clampWatchlistToTop(
+      dropIncludesNotPassing(
+        intersectWatchlistWithCatalog(universeSuggestionSchema.parse(completion.parsed), allowedSymbols),
+        passing,
+      ),
+      OPTIONS_MAX_INCLUDES,
+    );
+    const rankedIncludes = parsed.watchlist
+      .filter((item) => item.include)
+      .sort((left, right) => (left.rank ?? 99) - (right.rank ?? 99))
+      .map((item) => item.symbol);
+    const fromLlm = pickOptionContracts(
+      rankedIncludes
+        .map((symbol) => rowBySymbol.get(symbol))
+        .filter((row): row is OptionScreenRow => Boolean(row)),
+    );
+    const keptRows = fromLlm.length > 0 ? fromLlm : preselected;
+    const keptSymbols = keptRows.map((row) => row.symbol);
+    const keptSet = new Set(keptSymbols);
+    const suggestion = {
+      ...parsed,
+      watchlist: keptRows.map((row, index) => {
+        const item = parsed.watchlist.find((entry) => entry.symbol === row.symbol);
+        return {
+          symbol: row.symbol,
+          include: true as const,
+          rank: index + 1,
+          rationale: item?.rationale ?? 'Local index-options screen.',
+        };
+      }),
+      exclude: [
+        ...parsed.exclude,
+        ...parsed.watchlist
+          .filter((item) => item.include && !keptSet.has(item.symbol))
+          .map((item) => ({ symbol: item.symbol, reason: 'Dropped by per-index cap or local screen.' })),
+      ],
+    };
+    const instruments = toSessionInstruments(keptRows);
+    const sessionStartPayload = { instruments };
+    const newsItemCount = window.skipRemote
+      ? Object.values(knowledge.symbols).reduce((sum, entry) => sum + entry.filings.length, 0)
+      : news.reduce((sum, entry) => sum + entry.items.length, 0);
+    const candidateSymbols = candidates.map((candidate) => candidate.symbol);
+    const unmappedSymbols: string[] = [];
+    const filePath = await writeUniverseFile({
+      generatedAt: new Date().toISOString(),
+      asOfIst,
+      model: this.llm.getModel(),
+      book: 'options',
+      newsItemCount,
+      suggestion,
+      includedSymbols: keptSymbols,
+      sessionStartPayload,
+      unmappedSymbols,
+      knowledgeFile,
+      candidateSymbols,
+    });
+
+    this.includedSymbols = instruments.map((instrument) => instrument.tradingsymbol);
+    this.sessionStartPayload = sessionStartPayload;
+    this.watchlistFile = filePath;
+
+    this.logger.info(
+      {
+        filePath,
+        knowledgeFile,
+        candidateSymbols,
+        includedSymbols: this.includedSymbols,
+        newsItemCount,
+      },
+      'Wrote index-options universe JSON. No broker orders were sent.',
+    );
+
+    return {
+      filePath,
+      asOfIst,
+      model: this.llm.getModel(),
+      book: 'options',
       newsItemCount,
       knowledgeFile,
       candidateSymbols,
@@ -270,27 +569,51 @@ export class LlmTradeAdvisorService {
       running: this.isDecisionLoopRunning(),
       decisionIntervalMinutes: config.llm.decisionIntervalMinutes,
       includedSymbols: [...this.includedSymbols],
+      instruments: this.sessionStartPayload.instruments,
       watchlistFile: this.watchlistFile,
+      book: this.book,
     };
   }
 
-  public startDecisionLoop(): ReturnType<LlmTradeAdvisorService['getDecisionLoopStatus']> {
+  public async startDecisionLoop(
+    instruments: readonly SessionInstrument[],
+  ): Promise<ReturnType<LlmTradeAdvisorService['getDecisionLoopStatus']>> {
     if (this.timer) {
       throw Object.assign(new Error('The LLM decision loop is already running.'), { statusCode: 400 });
     }
+    if (instruments.length === 0) {
+      throw Object.assign(new Error('At least one instrument is required to start the decision loop.'), {
+        statusCode: 400,
+      });
+    }
+
+    this.sessionStartPayload = { instruments: [...instruments] };
+    this.includedSymbols = instruments.map((instrument) => instrument.tradingsymbol);
+    this.book = instruments.some((instrument) => instrument.exchange === 'NFO') ? 'options' : 'equity';
 
     const intervalMs = config.llm.decisionIntervalMinutes * 60_000;
     this.timer = setInterval(() => {
-      void this.runDecisionCycle();
+      void this.runDecisionCycle().catch((error: unknown) => {
+        this.logger.error({ err: error }, 'LLM decision cycle failed.');
+      });
     }, intervalMs);
     this.timer.unref?.();
 
     this.logger.info(
-      { intervalMinutes: config.llm.decisionIntervalMinutes },
+      {
+        intervalMinutes: config.llm.decisionIntervalMinutes,
+        symbols: this.includedSymbols,
+        book: this.book,
+      },
       'Started LLM buy/hold/exit decision loop. Decisions are stored only; no broker orders.',
     );
 
-    void this.runDecisionCycle();
+    try {
+      await this.runDecisionCycle();
+    } catch (error: unknown) {
+      this.stop();
+      throw error;
+    }
     return this.getDecisionLoopStatus();
   }
 
@@ -310,10 +633,25 @@ export class LlmTradeAdvisorService {
 
     const symbols = new Set(this.includedSymbols);
     const snapshots = filterSnapshotsToSymbols(await readRecentQuoteSnapshots(), symbols);
-    if (snapshots.length === 0) {
+    const fromLog = lastPricesFromSnapshots(snapshots, this.includedSymbols);
+    const fromQuotes = await this.fetchLiveLastPrices();
+    const lastPriceBySymbol: Record<string, number | null> = {};
+    for (const symbol of this.includedSymbols) {
+      const logged = fromLog[symbol];
+      const quoted = fromQuotes[symbol];
+      lastPriceBySymbol[symbol] =
+        logged !== null && logged !== undefined && Number.isFinite(logged)
+          ? logged
+          : quoted ?? null;
+    }
+    const hasAnyPrice = this.includedSymbols.some((symbol) => {
+      const price = lastPriceBySymbol[symbol];
+      return price !== null && price !== undefined && Number.isFinite(price);
+    });
+    if (!hasAnyPrice) {
       this.logger.info(
         { symbols: this.includedSymbols, logPath: config.session.quoteLogPath },
-        'Skipping LLM decision cycle; no Kite quote snapshots in logs for the watchlist yet.',
+        'Skipping LLM decision cycle; no Kite quotes or JSONL last prices for the watchlist yet.',
       );
       return 0;
     }
@@ -327,9 +665,14 @@ export class LlmTradeAdvisorService {
       allowed: allowedActionsForLatest(latestBySymbol[symbol]?.action ?? null),
     }));
     const allowedBySymbol = new Map(allowedRows.map((row) => [row.symbol, row.allowed]));
-    const lastPriceBySymbol = lastPricesFromSnapshots(snapshots, this.includedSymbols);
     const priorBuyPriceBySymbol = Object.fromEntries(
       this.includedSymbols.map((symbol) => [symbol, latestBySymbol[symbol]?.buyPrice ?? null]),
+    );
+    const tokenBySymbol = Object.fromEntries(
+      this.sessionStartPayload.instruments.map((instrument) => [
+        instrument.tradingsymbol,
+        instrument.instrumentToken,
+      ]),
     );
     const playbook = await this.buildPlaybookSignals({
       lastPriceBySymbol,
@@ -342,6 +685,7 @@ export class LlmTradeAdvisorService {
       snapshots,
       allowedRows,
       playbook,
+      this.book,
     );
     const completion = await this.completeWithRetry(messages, 'decision');
     const filtered = filterDecisionsToSymbols(decisionBatchSchema.parse(completion.parsed), symbols);
@@ -360,13 +704,9 @@ export class LlmTradeAdvisorService {
     const stored = await persistDecisions({
       asOf,
       batch,
-      model: this.llm.getModel(),
-      promptHash: hashPrompt(messages),
-      rawCompletion: completion.text,
-      marketSnapshot: JSON.parse(JSON.stringify({ snapshots, playbook })) as Prisma.InputJsonValue,
-      watchlistFile: this.watchlistFile,
       lastPriceBySymbol,
       priorBuyPriceBySymbol,
+      tokenBySymbol,
     });
 
     this.logger.info(
@@ -388,25 +728,81 @@ export class LlmTradeAdvisorService {
   }): Promise<PlaybookSignal[]> {
     const today = istYmd();
     const fromYmd = addCalendarDays(today, -UNIVERSE_BAR_LOOKBACK_DAYS);
-    const knowledge = await readLatestKnowledge();
-    const niftyRef = findKiteInstrument('NIFTYBEES');
-    let niftyDaily = knowledge?.symbols.NIFTYBEES?.bars ?? [];
-    if (niftyDaily.length < 50 && niftyRef) {
-      try {
-        niftyDaily = await this.kite.getDailyCandles(niftyRef.instrumentToken, fromYmd, today);
-      } catch (error: unknown) {
-        this.logger.warn({ err: error }, 'Kite daily historical for NIFTYBEES failed.');
+    const optionFromYmd = addCalendarDays(today, -OPTION_BAR_LOOKBACK_DAYS);
+    const hasNfo = this.sessionStartPayload.instruments.some((instrument) => instrument.exchange === 'NFO');
+    const hasNse = this.sessionStartPayload.instruments.some((instrument) => instrument.exchange !== 'NFO');
+
+    const knowledgeEquity = hasNse ? await readLatestKnowledge() : null;
+    const knowledgeOptions = hasNfo ? await readLatestKnowledge(undefined, 'options') : null;
+
+    let niftyDaily: DailyBar[] = knowledgeEquity?.symbols.NIFTYBEES?.bars ?? [];
+    if (hasNse && niftyDaily.length < 50) {
+      const niftyRef = findKiteInstrument('NIFTYBEES');
+      if (niftyRef) {
+        try {
+          niftyDaily = await this.kite.getDailyCandles(niftyRef.instrumentToken, fromYmd, today);
+        } catch (error: unknown) {
+          this.logger.warn({ err: error }, 'Kite daily historical for NIFTYBEES failed.');
+        }
+      }
+    }
+
+    const indexBars: Partial<Record<IndexOptionName, DailyBar[]>> = {};
+    if (hasNfo) {
+      for (const underlying of loadIndexUnderlyings()) {
+        const name = underlying.tradingsymbol as IndexOptionName;
+        let daily = knowledgeOptions?.symbols[name]?.bars ?? [];
+        if (daily.length < 50) {
+          try {
+            daily = await this.kite.getDailyCandles(underlying.instrumentToken, fromYmd, today);
+          } catch (error: unknown) {
+            this.logger.warn({ err: error, index: name }, 'Kite index daily historical failed for option playbook.');
+          }
+        }
+        indexBars[name] = daily;
       }
     }
 
     const signals: PlaybookSignal[] = [];
     for (const row of input.allowedRows) {
-      const listed = findKiteInstrument(row.symbol);
-      const sessionToken = this.sessionStartPayload.instruments.find(
+      const listed = this.sessionStartPayload.instruments.find(
         (instrument) => instrument.tradingsymbol === row.symbol,
-      )?.instrumentToken;
-      const token = listed?.instrumentToken ?? sessionToken;
-      let daily = knowledge?.symbols[row.symbol]?.bars ?? [];
+      );
+      const buyRaw = input.priorBuyPriceBySymbol[row.symbol];
+      const buyPrice = buyRaw === null || buyRaw === undefined ? null : Number(buyRaw);
+      const lastPrice = input.lastPriceBySymbol[row.symbol] ?? null;
+
+      if (listed?.exchange === 'NFO') {
+        const index = indexNameFromOptionSymbol(row.symbol);
+        const side = optionSideFromSymbol(row.symbol) ?? 'CE';
+        const indexDaily = index ? (indexBars[index] ?? []) : [];
+        let optionDaily: DailyBar[] = [];
+        try {
+          optionDaily = await this.kite.getDailyCandles(listed.instrumentToken, optionFromYmd, today);
+        } catch (error: unknown) {
+          this.logger.warn({ err: error, symbol: row.symbol }, 'Kite option daily historical failed.');
+        }
+        const best = pickBestOptionRule(optionDaily, indexDaily, side);
+        signals.push(
+          evaluateOptionPlaybook({
+            symbol: row.symbol,
+            side,
+            lastAction: row.last as import('./schemas.js').LlmTradeActionName | null,
+            allowed: row.allowed,
+            lastPrice,
+            buyPrice: buyPrice !== null && Number.isFinite(buyPrice) ? buyPrice : null,
+            indexDaily,
+            stopLossPct: best.stopLossPct,
+            takeProfitPct: best.takeProfitPct,
+            ruleId: `${best.id} bt=${best.returnPct.toFixed(1)}% n=${best.trades}`,
+          }),
+        );
+        continue;
+      }
+
+      const catalogRef = findKiteInstrument(row.symbol);
+      const token = listed?.instrumentToken ?? catalogRef?.instrumentToken;
+      let daily = knowledgeEquity?.symbols[row.symbol]?.bars ?? [];
       if (daily.length < 50 && token) {
         try {
           daily = await this.kite.getDailyCandles(token, fromYmd, today);
@@ -414,7 +810,6 @@ export class LlmTradeAdvisorService {
           this.logger.warn({ err: error, symbol: row.symbol }, 'Kite daily historical failed for playbook.');
         }
       }
-
       let minutes15: IntradayBar[] = [];
       if (token) {
         try {
@@ -423,15 +818,12 @@ export class LlmTradeAdvisorService {
           this.logger.warn({ err: error, symbol: row.symbol }, 'Kite 15-minute historical failed for playbook.');
         }
       }
-
-      const buyRaw = input.priorBuyPriceBySymbol[row.symbol];
-      const buyPrice = buyRaw === null || buyRaw === undefined ? null : Number(buyRaw);
       signals.push(
         evaluatePlaybook({
           symbol: row.symbol,
           lastAction: row.last as import('./schemas.js').LlmTradeActionName | null,
           allowed: row.allowed,
-          lastPrice: input.lastPriceBySymbol[row.symbol] ?? null,
+          lastPrice,
           buyPrice: buyPrice !== null && Number.isFinite(buyPrice) ? buyPrice : null,
           daily,
           niftyDaily,
@@ -440,6 +832,28 @@ export class LlmTradeAdvisorService {
       );
     }
     return signals;
+  }
+
+  private async fetchLiveLastPrices(): Promise<Record<string, number | null>> {
+    const keys = this.sessionStartPayload.instruments.map(
+      (instrument) => `${instrument.exchange}:${instrument.tradingsymbol}`,
+    );
+    if (keys.length === 0) {
+      return {};
+    }
+    try {
+      const quotes = await this.kite.getQuotes(keys);
+      const out: Record<string, number | null> = {};
+      for (const instrument of this.sessionStartPayload.instruments) {
+        const quote =
+          quotes[`${instrument.exchange}:${instrument.tradingsymbol}`] ?? quotes[instrument.tradingsymbol];
+        out[instrument.tradingsymbol] = quote?.lastPrice ?? null;
+      }
+      return out;
+    } catch (error: unknown) {
+      this.logger.warn({ err: error }, 'Kite getQuotes failed for the decision cycle.');
+      return {};
+    }
   }
 
   private async backfillShortDailyBars(

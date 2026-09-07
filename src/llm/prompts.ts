@@ -220,13 +220,46 @@ export function buildUniverseMessages(
       role: 'system',
       content:
         'NSE cash-equity desk. c[] is a local screen (SMA20>SMA50, 20d RS vs NIFTYBEES, volume, ATR%, risk-adjusted momentum). ' +
-        'Include at most 5 names from allowed[] with pass=true. Prefer pref[] then high mom+rs and real catalyst in n[] (RESULT,BUYBACK,DEFAULT,RAISE, not shell MERGER). ' +
+        'Include at most 1 name from allowed[] with pass=true. Prefer pref[] then high mom+rs and real catalyst in n[] (RESULT,BUYBACK,DEFAULT,RAISE, not shell MERGER). ' +
         'Do not pick two names that move as clones. Zero includes is valid if nothing qualifies. ' +
-        'JSON only: {watchlist:[{symbol,include,rationale,rank}]}. rank 1-5. No live orders. /no_think',
+        'JSON only: {watchlist:[{symbol,include,rationale,rank}]}. rank 1. No live orders. /no_think',
     },
     {
       role: 'user',
-      content: JSON.stringify({ asOfIst, allowed, pref: preselected, maxInclude: 5, c: compact }),
+      content: JSON.stringify({ asOfIst, allowed, pref: preselected, maxInclude: 1, c: compact }),
+    },
+  ];
+}
+
+export function buildOptionsUniverseMessages(
+  asOfIst: string,
+  candidates: readonly UniverseCandidate[],
+  preselected: readonly string[] = [],
+): Array<{ role: 'system' | 'user'; content: string }> {
+  const allowed = candidates.filter((candidate) => candidate.pass).map((candidate) => candidate.symbol);
+  const compact = candidates.map((candidate) => ({
+    s: candidate.symbol,
+    pass: candidate.pass,
+    score: candidate.score,
+    sma20: candidate.features.sma20,
+    sma50: candidate.features.sma50,
+    ret20: candidate.features.ret20Pct,
+    atr: candidate.features.atrPct,
+    why: candidate.failReasons,
+    n: candidate.filings,
+  }));
+
+  return [
+    {
+      role: 'system',
+      content:
+        'NSE index-options desk (NIFTY, BANKNIFTY, FINNIFTY only). c[] is a local CE/PE screen from index trend plus chain liquidity. ' +
+        'Include at most 1 contract from allowed[] with pass=true. Prefer pref[]. ' +
+        'Use n[] headlines as catalyst only. Zero includes is valid. JSON only: {watchlist:[{symbol,include,rationale,rank}]}. rank 1. No live orders. /no_think',
+    },
+    {
+      role: 'user',
+      content: JSON.stringify({ asOfIst, allowed, pref: preselected, maxInclude: 1, c: compact }),
     },
   ];
 }
@@ -243,6 +276,7 @@ export function buildDecisionMessages(
   snapshots: readonly QuoteLogSnapshot[],
   allowedRows: readonly DecisionAllowedRow[] = [],
   playbook: readonly PlaybookSignal[] = [],
+  book: 'equity' | 'options' = 'equity',
 ): Array<{ role: 'system' | 'user'; content: string }> {
   const bySymbol = new Map(allowedRows.map((row) => [row.symbol, row]));
   const allowed = watchlistSymbols.map((symbol) => {
@@ -259,10 +293,15 @@ export function buildDecisionMessages(
     {
       role: 'system',
       content:
-        'NSE cash paper desk. For every wl symbol pick action only from that symbol opts. ' +
-        'pb[] is the local playbook (trend SMA20/50, 20d RS vs NIFTYBEES, volume, ATR, 15m vs VWAP, +20/−10 overlay). ' +
-        'Follow rec unless opts forbid it. Do not BUY when rec is SKIP. SELL when rec is SELL (stop or target). ' +
-        'SKIP is valid — do not force BUY. JSON only: {decisions:[{symbol,action,rationale}]}. One row per wl. Rationale ≤12 words. No live orders. /no_think',
+        book === 'options'
+          ? 'NSE index-options desk, store-only. For every wl contract pick action only from that symbol opts. ' +
+            'pb[] uses index SMA20/50 for bias and option LTP for +20/−10 premium overlay. ' +
+            'Follow rec unless opts forbid it. Do not BUY when rec is SKIP. SELL when rec is SELL (stop or target). ' +
+            'SKIP is valid. JSON only: {decisions:[{symbol,action,rationale}]}. One row per wl. Rationale ≤12 words. No live orders. /no_think'
+          : 'NSE cash paper desk. For every wl symbol pick action only from that symbol opts. ' +
+            'pb[] is the local playbook (trend SMA20/50, 20d RS vs NIFTYBEES, volume, ATR, 15m vs VWAP, +20/−10 overlay). ' +
+            'Follow rec unless opts forbid it. Do not BUY when rec is SKIP. SELL when rec is SELL (stop or target). ' +
+            'SKIP is valid — do not force BUY. JSON only: {decisions:[{symbol,action,rationale}]}. One row per wl. Rationale ≤12 words. No live orders. /no_think',
     },
     {
       role: 'user',

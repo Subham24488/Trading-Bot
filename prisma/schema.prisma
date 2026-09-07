@@ -7,25 +7,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum TradingMode {
-  PAPER
-  LIVE
-}
-
-enum TradingRunStatus {
-  STARTED
-  COMPLETED
-  BLOCKED
-  FAILED
-}
-
-enum BrokerOrderStatus {
-  CREATED
-  FILLED
-  REJECTED
-  CANCELLED
-}
-
 model TradingRun {
   id        String           @id @default(cuid())
   mode      TradingMode
@@ -33,8 +14,8 @@ model TradingRun {
   startedAt DateTime         @default(now())
   endedAt   DateTime?
   reason    String?
-  orders    BrokerOrder[]
   events    AuditEvent[]
+  orders    BrokerOrder[]
 }
 
 model BrokerOrder {
@@ -60,17 +41,10 @@ model AuditEvent {
   message   String
   payload   Json?
   createdAt DateTime    @default(now())
-  run       TradingRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+  run       TradingRun? @relation(fields: [runId], references: [id])
 
   @@index([createdAt])
   @@index([category])
-}
-
-enum LlmTradeAction {
-  BUY
-  HOLD
-  EXIT
-  SKIP
 }
 
 /// LLM buy/hold/exit intents. Rows are never sent to a broker from application code.
@@ -79,19 +53,47 @@ model LlmTradeDecision {
   decidedAt              DateTime       @default(now())
   asOf                   DateTime
   symbol                 String
+  instrumentToken        Int?
   action                 LlmTradeAction
   confidence             Decimal?       @db.Decimal(6, 4)
   rationale              String
-  model                  String
-  promptHash             String
-  rawCompletion          String
-  marketSnapshot         Json
+  model                  String?
+  promptHash             String?
+  rawCompletion          String?
+  marketSnapshot         Json?
   watchlistFile          String?
   buyPrice               Decimal?       @db.Decimal(18, 4)
+  currentPrice           Decimal?       @db.Decimal(18, 4)
   sellPrice              Decimal?       @db.Decimal(18, 4)
   executed               Boolean        @default(false)
   executionBlockedReason String         @default("LLM decisions are never sent to the broker.")
 
   @@index([decidedAt])
   @@index([symbol, decidedAt])
+}
+
+enum TradingMode {
+  PAPER
+  LIVE
+}
+
+enum TradingRunStatus {
+  STARTED
+  COMPLETED
+  BLOCKED
+  FAILED
+}
+
+enum BrokerOrderStatus {
+  CREATED
+  FILLED
+  REJECTED
+  CANCELLED
+}
+
+enum LlmTradeAction {
+  BUY
+  HOLD
+  EXIT
+  SKIP
 }

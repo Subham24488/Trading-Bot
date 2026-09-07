@@ -20,6 +20,7 @@ vi.mock('../src/config.js', () => ({
       tradesDir: 'trades',
       universeDir: 'universe',
       kiteInstrumentsPath: 'data/kite-instruments.json',
+      kiteIndexUnderlyingsPath: 'data/kite-index-underlyings.json',
     },
     session: {
       quoteLogPath: 'logs/session-quotes.jsonl',
@@ -173,9 +174,9 @@ describe('compact universe prompts', () => {
       },
     ]);
     expect(messages[1]?.content.length).toBeLessThan(12_000);
-    expect(messages[0]?.content).toContain('at most 5');
+    expect(messages[0]?.content).toContain('at most 1');
     expect(messages[0]?.content).toContain('Zero includes is valid');
-    expect(messages[1]?.content).toContain('"maxInclude":5');
+    expect(messages[1]?.content).toContain('"maxInclude":1');
     expect(messages[1]?.content).not.toContain('outputSchema');
     expect(messages[1]?.content).not.toContain('kiteTradingsymbols');
   });
@@ -206,27 +207,19 @@ describe('LLM schemas', () => {
     expect(batch.decisions[1]?.action).toBe('SKIP');
   });
 
-  it('clamps more than five includes and allows an empty pick', () => {
+  it('clamps more than one include and allows an empty pick', () => {
     const clamped = clampWatchlistToTop(
       universeSuggestionSchema.parse({
         watchlist: [
           { symbol: 'RELIANCE', include: true, rationale: 'one' },
           { symbol: 'TCS', include: true, rationale: 'two' },
           { symbol: 'INFY', include: true, rationale: 'three' },
-          { symbol: 'HDFCBANK', include: true, rationale: 'four' },
-          { symbol: 'ICICIBANK', include: true, rationale: 'five' },
-          { symbol: 'SBIN', include: true, rationale: 'six' },
         ],
       }),
     );
-    expect(clamped.watchlist.map((item) => item.symbol)).toEqual([
-      'RELIANCE',
-      'TCS',
-      'INFY',
-      'HDFCBANK',
-      'ICICIBANK',
-    ]);
-    expect(clamped.exclude.some((item) => item.symbol === 'SBIN')).toBe(true);
+    expect(clamped.watchlist.map((item) => item.symbol)).toEqual(['RELIANCE']);
+    expect(clamped.exclude.some((item) => item.symbol === 'TCS')).toBe(true);
+    expect(clamped.exclude.some((item) => item.symbol === 'INFY')).toBe(true);
 
     const empty = clampWatchlistToTop(
       universeSuggestionSchema.parse({
@@ -296,12 +289,8 @@ describe('persistDecisions', () => {
       batch: {
         decisions: [{ symbol: 'RELIANCE', action: 'BUY', rationale: 'news + quote' }],
       },
-      model: 'Qwen/Qwen3-14B:fastest',
-      promptHash: 'abc',
-      rawCompletion: '{"decisions":[]}',
-      marketSnapshot: [{ ts: '2026-08-21T10:15:00.000Z', instruments: [] }],
-      watchlistFile: 'trades/example.json',
       lastPriceBySymbol: { RELIANCE: 1400.5 },
+      tokenBySymbol: { RELIANCE: 738561 },
     });
 
     expect(count).toBe(1);
@@ -311,12 +300,19 @@ describe('persistDecisions', () => {
           symbol: 'RELIANCE',
           action: 'BUY',
           buyPrice: '1400.5000',
+          currentPrice: '1400.5000',
+          instrumentToken: 738561,
           executed: false,
           executionBlockedReason: LLM_EXECUTION_BLOCKED_REASON,
         }),
       ],
     });
     expect(createMany.mock.calls[0]?.[0]?.data[0]).not.toHaveProperty('sellPrice');
+    expect(createMany.mock.calls[0]?.[0]?.data[0]).toMatchObject({
+      promptHash: '',
+      rawCompletion: '',
+      marketSnapshot: {},
+    });
   });
 
   it('stores sellPrice on EXIT and carries the prior buyPrice', () => {
@@ -377,16 +373,22 @@ describe('LlmTradeAdvisorService safety', () => {
     const advisor = new LlmTradeAdvisorService({
       llm: {} as never,
       news: {} as never,
-      kite: {} as never,
+      kite: { getQuotes: vi.fn().mockResolvedValue({}) } as never,
       logger,
     });
 
     expect(advisor.getDecisionLoopStatus().running).toBe(false);
     expect(advisor.stop().running).toBe(false);
 
-    const started = advisor.startDecisionLoop();
+    const started = await advisor.startDecisionLoop([
+      { instrumentToken: 738561, exchange: 'NSE', tradingsymbol: 'RELIANCE' },
+    ]);
     expect(started.running).toBe(true);
-    expect(() => advisor.startDecisionLoop()).toThrow(/already running/);
+    await expect(
+      advisor.startDecisionLoop([
+        { instrumentToken: 738561, exchange: 'NSE', tradingsymbol: 'RELIANCE' },
+      ]),
+    ).rejects.toThrow(/already running/);
 
     advisor.stop();
     expect(advisor.isDecisionLoopRunning()).toBe(false);

@@ -14,6 +14,7 @@ export type StoredUniverseFile = {
   generatedAt: string;
   asOfIst: string;
   model: string;
+  book?: 'equity' | 'options';
   newsItemCount: number;
   suggestion: UniverseSuggestion;
   includedSymbols: string[];
@@ -60,13 +61,9 @@ export const LLM_EXECUTION_BLOCKED_REASON = 'LLM decisions are never sent to the
 export type DecisionRowInput = {
   asOf: Date;
   batch: DecisionBatch;
-  model: string;
-  promptHash: string;
-  rawCompletion: string;
-  marketSnapshot: Prisma.InputJsonValue;
-  watchlistFile: string | null;
   lastPriceBySymbol?: Record<string, number | null>;
   priorBuyPriceBySymbol?: Record<string, string | null>;
+  tokenBySymbol?: Record<string, number | null>;
 };
 
 export function pricesForDecision(
@@ -101,20 +98,27 @@ export async function persistDecisions(input: DecisionRowInput): Promise<number>
       input.lastPriceBySymbol?.[decision.symbol] ?? null,
       input.priorBuyPriceBySymbol?.[decision.symbol] ?? null,
     );
+    const current = input.lastPriceBySymbol?.[decision.symbol];
+    const token = input.tokenBySymbol?.[decision.symbol];
+    const currentPrice =
+      current !== null && current !== undefined && Number.isFinite(current)
+        ? current.toFixed(4)
+        : null;
     return {
       asOf: input.asOf,
       symbol: decision.symbol,
       action: decision.action,
       rationale: decision.rationale,
-      model: input.model,
-      promptHash: input.promptHash,
-      rawCompletion: input.rawCompletion,
-      marketSnapshot: input.marketSnapshot,
       executed: false as const,
       executionBlockedReason: LLM_EXECUTION_BLOCKED_REASON,
-      ...(decision.confidence === undefined ? {} : { confidence: decision.confidence.toFixed(4) }),
-      ...(input.watchlistFile === null ? {} : { watchlistFile: input.watchlistFile }),
+      promptHash: '',
+      rawCompletion: '',
+      marketSnapshot: {},
+      ...(token !== null && token !== undefined && Number.isInteger(token) && token > 0
+        ? { instrumentToken: token }
+        : {}),
       ...(prices.buyPrice === null ? {} : { buyPrice: prices.buyPrice }),
+      ...(currentPrice === null ? {} : { currentPrice }),
       ...(prices.sellPrice === null ? {} : { sellPrice: prices.sellPrice }),
     };
   });

@@ -6,7 +6,7 @@ import { tradesFileName } from '../llm/decisionStore.js';
 import type { NewsItem } from '../news/NewsService.js';
 import { UNIVERSE_BAR_KEEP } from './dates.js';
 import { attachFeatures } from './features.js';
-import type { DailyBar, SymbolKnowledge, UniverseKnowledgeFile } from './types.js';
+import type { DailyBar, SymbolKnowledge, UniverseBook, UniverseKnowledgeFile } from './types.js';
 
 const knowledgeSchemaHint = 'coverageTo';
 
@@ -24,6 +24,7 @@ function isKnowledgeFile(value: unknown): value is UniverseKnowledgeFile {
 
 export async function readLatestKnowledge(
   directory = universeDir(),
+  book: UniverseBook = 'equity',
 ): Promise<UniverseKnowledgeFile | null> {
   let names: string[];
   try {
@@ -38,6 +39,10 @@ export async function readLatestKnowledge(
     try {
       const parsed: unknown = JSON.parse(await readFile(path.join(directory, name), 'utf8'));
       if (!isKnowledgeFile(parsed)) {
+        continue;
+      }
+      const fileBook = parsed.book ?? 'equity';
+      if (fileBook !== book) {
         continue;
       }
       if (!latest || parsed.coverageTo > latest.coverageTo) {
@@ -76,6 +81,7 @@ export function mergeKnowledge(options: {
   previous: UniverseKnowledgeFile | null;
   asOfIst: string;
   today: string;
+  book?: UniverseBook;
   coverageFrom: string;
   fetchedFrom: string | null;
   fetchedTo: string | null;
@@ -112,6 +118,7 @@ export function mergeKnowledge(options: {
     fetchedFrom: options.fetchedFrom,
     fetchedTo: options.fetchedTo,
     catalogPath: options.catalogPath,
+    book: options.book ?? options.previous?.book ?? 'equity',
     symbols: attachFeatures(symbols),
   };
 }

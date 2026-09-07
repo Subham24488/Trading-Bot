@@ -16,6 +16,14 @@ import type {
   SessionInstrument,
   StockPosition,
 } from '../domain.js';
+import type { IndexOptionName } from '../instruments/kiteIndexUnderlyings.js';
+import { INDEX_OPTION_NAMES, loadIndexUnderlyings } from '../instruments/kiteIndexUnderlyings.js';
+import {
+  filterNearestWeeklyAtmBand,
+  parseNfoIndexOptions,
+  type NfoOptionContract,
+  type NfoRawInstrument,
+} from '../options/nfoChain.js';
 import type { DailyBar, IntradayBar } from '../universe/types.js';
 import { istYmd } from '../universe/dates.js';
 import type { BrokerAdapter } from './BrokerAdapter.js';
@@ -32,6 +40,12 @@ const DEFAULT_SESSION_FILE = path.resolve('.kite-session.json');
  * never assume a fill. Widen the domain status enum before treating resting orders
  * as success.
  */
+export type KiteQuote = {
+  last_price: number;
+  volume?: number;
+  oi?: number;
+};
+
 export type KiteClient = Pick<
   Connect,
   | 'setAccessToken'
@@ -44,7 +58,9 @@ export type KiteClient = Pick<
   | 'getOrderHistory'
   | 'getInstruments'
   | 'getHistoricalData'
->;
+> & {
+  getQuote: (instruments: string[]) => Promise<Record<string, KiteQuote>>;
+};
 
 export type KiteBrokerOptions = {
   apiKey?: string;
@@ -116,6 +132,7 @@ export class KiteBroker implements BrokerAdapter {
   private accessToken: string | null = null;
   private readonly submittedOrderIds = new Set<string>();
   private nseInstrumentCache: Awaited<ReturnType<KiteClient['getInstruments']>> | undefined;
+  private nfoInstrumentCache: { day: string; rows: Awaited<ReturnType<KiteClient['getInstruments']>> } | undefined;
   private lastHistoricalMs = 0;
 
   public constructor(options: KiteBrokerOptions = {}) {
@@ -130,7 +147,7 @@ export class KiteBroker implements BrokerAdapter {
     this.apiSecret = normalizeToken(options.apiSecret ?? config.kite.apiSecret);
     this.requestTokenFromOptions = normalizeToken(options.requestToken);
     this.sessionFilePath = options.sessionFilePath ?? DEFAULT_SESSION_FILE;
-    this.client = options.client ?? new KiteConnect({ api_key: apiKey });
+    this.client = (options.client ?? new KiteConnect({ api_key: apiKey })) as KiteClient;
 
     if (accessToken) {
       this.setAccessToken(accessToken);
@@ -314,6 +331,58 @@ export class KiteBroker implements BrokerAdapter {
     }
 
     return [...resolved.values()];
+  }
+
+  public async getQuotes(keys: readonly string[]): Promise<
+    Record<string, { lastPrice: number | null; volume: number; oi: number }>
+  > {
+    await this.ensureAccessToken();
+    if (keys.length === 0) {
+      return {};
+    }
+    const raw = await this.client.getQuote([...keys]);
+    const out: Record<string, { lastPrice: number | null; volume: number; oi: number }> = {};
+    for (const [key, quote] of Object.entries(raw)) {
+      const record = quote as KiteQuote & { ohlc?: { close?: number }; open_interest?: number };
+      const last = Number(record.last_price ?? record.ohlc?.close);
+      const oi = Number(record.oi ?? record.open_interest ?? 0) || 0;
+      const mapped = {
+        lastPrice: Number.isFinite(last) ? last : null,
+        volume: Number(record.volume ?? 0) || 0,
+        oi,
+      };
+      out[key] = mapped;
+      out[key.toUpperCase()] = mapped;
+    }
+    return out;
+  }
+
+  public async getNfoIndexOptions(input: {
+    names?: readonly IndexOptionName[];
+    spots: Partial<Record<IndexOptionName, number>>;
+    asOfYmd?: string;
+  }): Promise<NfoOptionContract[]> {
+    const names = input.names ?? INDEX_OPTION_NAMES;
+    const asOfYmd = input.asOfYmd ?? istYmd();
+    const rows = await this.loadNfoInstruments(asOfYmd);
+    const list = Array.isArray(rows) ? rows : [];
+    const contracts = parseNfoIndexOptions(list as NfoRawInstrument[], names);
+    const steps = Object.fromEntries(
+      loadIndexUnderlyings()
+        .filter((row) => names.includes(row.tradingsymbol as IndexOptionName))
+        .map((row) => [row.tradingsymbol, row.strikeStep]),
+    ) as Partial<Record<IndexOptionName, number>>;
+    return filterNearestWeeklyAtmBand(contracts, input.spots, steps, asOfYmd);
+  }
+
+  private async loadNfoInstruments(asOfYmd: string): Promise<Awaited<ReturnType<KiteClient['getInstruments']>>> {
+    await this.ensureAccessToken();
+    if (this.nfoInstrumentCache?.day === asOfYmd) {
+      return this.nfoInstrumentCache.rows;
+    }
+    const rows = await this.client.getInstruments('NFO');
+    this.nfoInstrumentCache = { day: asOfYmd, rows };
+    return rows;
   }
 
   public async getPortfolio(): Promise<PortfolioSnapshot> {

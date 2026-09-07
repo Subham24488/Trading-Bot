@@ -1,0 +1,30 @@
+{
+  "source": "Kite Connect NSE index tokens for historical (not orderable cash). Option contracts are resolved live from NFO.",
+  "exchange": "NSE",
+  "instruments": [
+    {
+      "tradingsymbol": "NIFTY",
+      "kiteQuoteSymbol": "NIFTY 50",
+      "googleQuery": "Nifty",
+      "exchange": "NSE",
+      "instrumentToken": 256265,
+      "strikeStep": 50
+    },
+    {
+      "tradingsymbol": "BANKNIFTY",
+      "kiteQuoteSymbol": "NIFTY BANK",
+      "googleQuery": "Bank Nifty",
+      "exchange": "NSE",
+      "instrumentToken": 260105,
+      "strikeStep": 100
+    },
+    {
+      "tradingsymbol": "FINNIFTY",
+      "kiteQuoteSymbol": "NIFTY FIN SERVICE",
+      "googleQuery": "FinNifty",
+      "exchange": "NSE",
+      "instrumentToken": 257801,
+      "strikeStep": 50
+    }
+  ]
+}

@@ -165,6 +165,87 @@ export function evaluatePlaybook(input: {
   };
 }
 
+export function evaluateOptionPlaybook(input: {
+  symbol: string;
+  side: 'CE' | 'PE';
+  lastAction: LlmTradeActionName | null;
+  allowed: readonly LlmTradeActionName[];
+  lastPrice: number | null;
+  buyPrice: number | null;
+  indexDaily: DailyBar[];
+  stopLossPct?: number;
+  takeProfitPct?: number;
+  ruleId?: string;
+}): PlaybookSignal {
+  const stopLossPct = input.stopLossPct ?? STOP_LOSS_PCT;
+  const takeProfitPct = input.takeProfitPct ?? TAKE_PROFIT_PCT;
+  const features = computeFeatures(input.indexDaily, [], input.indexDaily);
+  const lastPrice = input.lastPrice ?? input.indexDaily.at(-1)?.c ?? null;
+  const pnlPct = pnlPercent(lastPrice, input.buyPrice);
+  const reasons: string[] = [];
+  const inPosition = input.lastAction === 'BUY' || input.lastAction === 'HOLD';
+  const smaUp = features.sma20 !== null && features.sma50 !== null && features.sma20 > features.sma50;
+  const smaDown = features.sma20 !== null && features.sma50 !== null && features.sma20 < features.sma50;
+  const retUp = features.ret20Pct !== null && features.ret20Pct > 0;
+  const retDown = features.ret20Pct !== null && features.ret20Pct < 0;
+  const calm = features.atrPct === null || features.atrPct < MAX_ATR_PCT_FOR_BUY;
+  const sideFits =
+    input.side === 'CE' ? smaUp && retUp : input.side === 'PE' ? smaDown && retDown : false;
+
+  let bias: PlaybookBias = inPosition ? 'STAY' : 'WAIT';
+
+  if (inPosition && pnlPct !== null && pnlPct <= -stopLossPct) {
+    bias = 'LEAVE';
+    reasons.push(`premium stop ${pnlPct.toFixed(1)}% ≤ −${stopLossPct}%`);
+  } else if (inPosition && pnlPct !== null && pnlPct >= takeProfitPct) {
+    bias = 'LEAVE';
+    reasons.push(`premium take-profit ${pnlPct.toFixed(1)}% ≥ +${takeProfitPct}%`);
+  } else if (inPosition && input.side === 'CE' && smaDown) {
+    bias = 'LEAVE';
+    reasons.push('index SMA20 lost SMA50; exit CE');
+  } else if (inPosition && input.side === 'PE' && smaUp) {
+    bias = 'LEAVE';
+    reasons.push('index SMA20 regained SMA50; exit PE');
+  } else if (!inPosition) {
+    if (!calm) {
+      reasons.push('index ATR% too high');
+    }
+    if (!sideFits) {
+      reasons.push(`need ${input.side === 'CE' ? 'uptrend' : 'downtrend'} on the index`);
+    }
+    bias = calm && sideFits ? 'ENTER' : 'WAIT';
+    if (bias === 'ENTER') {
+      reasons.length = 0;
+      reasons.push(
+        `${input.side} aligned with index trend` +
+          (input.ruleId ? ` (${input.ruleId})` : ''),
+      );
+    }
+  } else {
+    reasons.push('index structure intact; hold premium');
+  }
+
+  const suggested = mapBiasToAction(bias, input.allowed);
+  return {
+    symbol: input.symbol,
+    suggested,
+    bias,
+    reasons: reasons.slice(0, 4),
+    lastPrice,
+    pnlPct: pnlPct === null ? null : Number(pnlPct.toFixed(2)),
+    features: {
+      sma20: features.sma20,
+      sma50: features.sma50,
+      atrPct: features.atrPct,
+      rsNifty20: features.ret20Pct,
+      volVs20: null,
+      distFrom20HighPct: null,
+      vwap15: null,
+      last15: null,
+    },
+  };
+}
+
 export function compactPlaybookForPrompt(signals: readonly PlaybookSignal[]) {
   return signals.map((signal) => ({
     s: signal.symbol,
