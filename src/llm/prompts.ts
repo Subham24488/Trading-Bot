@@ -1,7 +1,7 @@
 import type { SymbolNews } from '../news/NewsService.js';
 import type { UniverseCandidate } from '../universe/types.js';
 import type { QuoteLogSnapshot } from './quoteLogReader.js';
-import type { LlmTradeActionName } from './schemas.js';
+import { greeksIvCatalogForPrompt } from '../options/greeksIv.js';
 import { promptActionLabels } from './schemas.js';
 import { compactPlaybookForPrompt, type PlaybookSignal } from './tradePlaybook.js';
 
@@ -235,19 +235,26 @@ export function buildOptionsUniverseMessages(
   asOfIst: string,
   candidates: readonly UniverseCandidate[],
   preselected: readonly string[] = [],
+  greeksBySymbol: Record<string, { delta: number | null; iv: number | null; ivHv: number | null }> = {},
 ): Array<{ role: 'system' | 'user'; content: string }> {
   const allowed = candidates.filter((candidate) => candidate.pass).map((candidate) => candidate.symbol);
-  const compact = candidates.map((candidate) => ({
-    s: candidate.symbol,
-    pass: candidate.pass,
-    score: candidate.score,
-    sma20: candidate.features.sma20,
-    sma50: candidate.features.sma50,
-    ret20: candidate.features.ret20Pct,
-    atr: candidate.features.atrPct,
-    why: candidate.failReasons,
-    n: candidate.filings,
-  }));
+  const compact = candidates.map((candidate) => {
+    const greeks = greeksBySymbol[candidate.symbol];
+    return {
+      s: candidate.symbol,
+      pass: candidate.pass,
+      score: candidate.score,
+      sma20: candidate.features.sma20,
+      sma50: candidate.features.sma50,
+      ret20: candidate.features.ret20Pct,
+      atr: candidate.features.atrPct,
+      delta: greeks?.delta ?? null,
+      iv: greeks?.iv ?? null,
+      ivHv: greeks?.ivHv ?? null,
+      why: candidate.failReasons,
+      n: candidate.filings,
+    };
+  });
 
   return [
     {
@@ -255,11 +262,20 @@ export function buildOptionsUniverseMessages(
       content:
         'NSE index-options desk (NIFTY, BANKNIFTY, FINNIFTY only). c[] is a local CE/PE screen from index trend plus chain liquidity. ' +
         'Include at most 1 contract from allowed[] with pass=true. Prefer pref[]. ' +
-        'Use n[] headlines as catalyst only. Zero includes is valid. JSON only: {watchlist:[{symbol,include,rationale,rank}]}. rank 1. No live orders. /no_think',
+        'Set algorithm from algo[]: greeks_iv_atm (delta 0.40-0.70), greeks_iv_otm (delta 0.25-0.40), greeks_iv_skip if ivHv>1.40 or mixed tape. ' +
+        'Prefer ATM when IV is not rich; OTM only if ATM delta is too high. Use n[] headlines as catalyst only. Zero includes is valid. ' +
+        'JSON only: {watchlist:[{symbol,include,rationale,rank,algorithm}]}. rank 1. No live orders. /no_think',
     },
     {
       role: 'user',
-      content: JSON.stringify({ asOfIst, allowed, pref: preselected, maxInclude: 1, c: compact }),
+      content: JSON.stringify({
+        asOfIst,
+        allowed,
+        pref: preselected,
+        maxInclude: 1,
+        algo: greeksIvCatalogForPrompt(),
+        c: compact,
+      }),
     },
   ];
 }
@@ -295,8 +311,8 @@ export function buildDecisionMessages(
       content:
         book === 'options'
           ? 'NSE index-options desk, store-only. For every wl contract pick action only from that symbol opts. ' +
-            'pb[] uses index SMA20/50 for bias and option LTP for +20/−10 premium overlay. ' +
-            'Follow rec unless opts forbid it. Do not BUY when rec is SKIP. SELL when rec is SELL (stop or target). ' +
+            'pb[] is the bound greeks_iv book (delta band, IV/HV, option LTP, index SMA). Follow rec unless opts forbid it. ' +
+            'Do not BUY when rec is SKIP. SELL when rec is SELL (stop, target, dead delta, or DTE). ' +
             'SKIP is valid. JSON only: {decisions:[{symbol,action,rationale}]}. One row per wl. Rationale ≤12 words. No live orders. /no_think'
           : 'NSE cash paper desk. For every wl symbol pick action only from that symbol opts. ' +
             'pb[] is the local playbook (trend SMA20/50, 20d RS vs NIFTYBEES, volume, ATR, 15m vs VWAP, +20/−10 overlay). ' +

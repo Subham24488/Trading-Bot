@@ -1,5 +1,12 @@
 import type { DailyBar, FeatureSnapshot, IntradayBar } from '../universe/types.js';
 import { computeFeatures } from '../universe/features.js';
+import {
+  GREEKS_IV_CATALOG,
+  computeOptionGreeks,
+  isGreeksIvAlgorithm,
+  isOptionPremium,
+  type GreeksIvAlgorithmId,
+} from '../options/greeksIv.js';
 import type { LlmTradeActionName } from './schemas.js';
 import type { DecisionBatch } from './schemas.js';
 
@@ -36,6 +43,11 @@ export type PlaybookSignal = {
   reasons: string[];
   lastPrice: number | null;
   pnlPct: number | null;
+  algorithm?: GreeksIvAlgorithmId | null;
+  spot?: number | null;
+  iv?: number | null;
+  delta?: number | null;
+  ivHv?: number | null;
   features: Pick<
     FeatureSnapshot,
     'sma20' | 'sma50' | 'atrPct' | 'rsNifty20' | 'volVs20' | 'distFrom20HighPct'
@@ -180,7 +192,15 @@ export function evaluateOptionPlaybook(input: {
   const stopLossPct = input.stopLossPct ?? STOP_LOSS_PCT;
   const takeProfitPct = input.takeProfitPct ?? TAKE_PROFIT_PCT;
   const features = computeFeatures(input.indexDaily, [], input.indexDaily);
-  const lastPrice = input.lastPrice ?? input.indexDaily.at(-1)?.c ?? null;
+  const lastPrice = isOptionPremium(input.lastPrice, input.indexDaily.at(-1)?.c)
+    ? input.lastPrice
+    : input.lastPrice !== null &&
+        input.lastPrice !== undefined &&
+        Number.isFinite(input.lastPrice) &&
+        input.lastPrice > 0 &&
+        input.lastPrice < 10_000
+      ? input.lastPrice
+      : null;
   const pnlPct = pnlPercent(lastPrice, input.buyPrice);
   const reasons: string[] = [];
   const inPosition = input.lastAction === 'BUY' || input.lastAction === 'HOLD';
@@ -246,12 +266,140 @@ export function evaluateOptionPlaybook(input: {
   };
 }
 
+export function evaluateGreeksIvPlaybook(input: {
+  symbol: string;
+  side: 'CE' | 'PE';
+  lastAction: LlmTradeActionName | null;
+  allowed: readonly LlmTradeActionName[];
+  lastPrice: number | null;
+  buyPrice: number | null;
+  indexDaily: DailyBar[];
+  spot: number | null;
+  strike: number;
+  expiryYmd: string;
+  asOfYmd: string;
+  algorithm: string | null;
+}): PlaybookSignal {
+  const algorithm = isGreeksIvAlgorithm(input.algorithm) ? input.algorithm : null;
+  const features = computeFeatures(input.indexDaily, [], input.indexDaily);
+  const lastPrice = isOptionPremium(input.lastPrice, input.spot) ? input.lastPrice : null;
+  const pnlPct = pnlPercent(lastPrice, input.buyPrice);
+  const greeks = computeOptionGreeks({
+    premium: lastPrice,
+    spot: input.spot,
+    strike: input.strike,
+    expiryYmd: input.expiryYmd,
+    asOfYmd: input.asOfYmd,
+    side: input.side,
+    indexDaily: input.indexDaily,
+  });
+  const reasons: string[] = [];
+  const inPosition = input.lastAction === 'BUY' || input.lastAction === 'HOLD';
+  const smaUp = features.sma20 !== null && features.sma50 !== null && features.sma20 > features.sma50;
+  const smaDown = features.sma20 !== null && features.sma50 !== null && features.sma20 < features.sma50;
+  const sideFits = input.side === 'CE' ? smaUp : input.side === 'PE' ? smaDown : false;
+  const dteDays = greeks.timeYears * 365;
+  const absDelta = greeks.absDelta;
+
+  let bias: PlaybookBias = inPosition ? 'STAY' : 'WAIT';
+
+  if (!algorithm) {
+    bias = inPosition ? 'STAY' : 'WAIT';
+    reasons.push('unknown algorithm; skip new entries');
+  } else if (lastPrice === null && !inPosition) {
+    bias = 'WAIT';
+    reasons.push('no option premium LTP');
+  } else if (inPosition && lastPrice === null) {
+    bias = 'STAY';
+    reasons.push('no option premium LTP; hold without PnL');
+  } else if (inPosition && pnlPct !== null && pnlPct <= -STOP_LOSS_PCT) {
+    bias = 'LEAVE';
+    reasons.push(`premium stop ${pnlPct.toFixed(1)}% ≤ −${STOP_LOSS_PCT}%`);
+  } else if (inPosition && pnlPct !== null && pnlPct >= TAKE_PROFIT_PCT) {
+    bias = 'LEAVE';
+    reasons.push(`premium take-profit ${pnlPct.toFixed(1)}% ≥ +${TAKE_PROFIT_PCT}%`);
+  } else if (inPosition && dteDays < 1) {
+    bias = 'LEAVE';
+    reasons.push('DTE < 1; exit expiry risk');
+  } else if (inPosition && absDelta !== null && absDelta < 0.2) {
+    bias = 'LEAVE';
+    reasons.push(`delta ${absDelta.toFixed(2)} collapsed`);
+  } else if (inPosition && input.side === 'CE' && smaDown) {
+    bias = 'LEAVE';
+    reasons.push('index SMA20 lost SMA50; exit CE');
+  } else if (inPosition && input.side === 'PE' && smaUp) {
+    bias = 'LEAVE';
+    reasons.push('index SMA20 regained SMA50; exit PE');
+  } else if (!inPosition && algorithm === 'greeks_iv_skip') {
+    bias = 'WAIT';
+    reasons.push('greeks_iv_skip');
+  } else if (!inPosition) {
+    const variant = GREEKS_IV_CATALOG[algorithm];
+    const deltaOk =
+      absDelta !== null && absDelta >= variant.deltaMin && absDelta <= variant.deltaMax;
+    const ivOk = greeks.ivHv !== null && greeks.ivHv <= variant.ivHvEnterMax;
+    if (!sideFits) {
+      reasons.push(`need ${input.side === 'CE' ? 'uptrend' : 'downtrend'} on the index`);
+    }
+    if (!deltaOk) {
+      reasons.push(
+        absDelta === null
+          ? 'need delta'
+          : `delta ${absDelta.toFixed(2)} outside ${variant.deltaMin}-${variant.deltaMax}`,
+      );
+    }
+    if (!ivOk) {
+      reasons.push(
+        greeks.ivHv === null ? 'need IV/HV' : `IV/HV ${greeks.ivHv.toFixed(2)} > ${variant.ivHvEnterMax}`,
+      );
+    }
+    bias = sideFits && deltaOk && ivOk ? 'ENTER' : 'WAIT';
+    if (bias === 'ENTER') {
+      reasons.length = 0;
+      reasons.push(`${algorithm} delta+IV aligned`);
+    }
+  } else {
+    reasons.push('greeks structure intact; hold premium');
+  }
+
+  const suggested = mapBiasToAction(bias, input.allowed);
+  return {
+    symbol: input.symbol,
+    suggested,
+    bias,
+    reasons: reasons.slice(0, 4),
+    lastPrice,
+    pnlPct: pnlPct === null ? null : Number(pnlPct.toFixed(2)),
+    algorithm,
+    spot: input.spot,
+    iv: greeks.iv,
+    delta: greeks.delta,
+    ivHv: greeks.ivHv,
+    features: {
+      sma20: features.sma20,
+      sma50: features.sma50,
+      atrPct: features.atrPct,
+      rsNifty20: features.ret20Pct,
+      volVs20: null,
+      distFrom20HighPct: null,
+      vwap15: null,
+      last15: null,
+    },
+  };
+}
+
 export function compactPlaybookForPrompt(signals: readonly PlaybookSignal[]) {
   return signals.map((signal) => ({
     s: signal.symbol,
     bias: signal.bias,
     rec: signal.suggested === 'EXIT' ? 'SELL' : signal.suggested,
     pnl: signal.pnlPct,
+    ltp: signal.lastPrice,
+    spot: signal.spot ?? null,
+    iv: signal.iv ?? null,
+    delta: signal.delta ?? null,
+    ivHv: signal.ivHv ?? null,
+    algorithm: signal.algorithm ?? null,
     sma20: signal.features.sma20,
     sma50: signal.features.sma50,
     rs: signal.features.rsNifty20,

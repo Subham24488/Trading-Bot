@@ -115,6 +115,17 @@ const sessionInstrumentSchema = {
   },
 } as const;
 
+const decisionInstrumentSchema = {
+  type: 'object',
+  properties: {
+    instrumentToken: { type: 'integer', minimum: 1 },
+    exchange: { type: 'string' },
+    tradingsymbol: { type: 'string' },
+    currentPrice: { type: ['number', 'null'] },
+    algorithm: { type: ['string', 'null'] },
+  },
+} as const;
+
 const sessionStatusSchema = {
   type: 'object',
   properties: {
@@ -373,7 +384,7 @@ const llmDecisionLoopStatusSchema = {
     includedSymbols: { type: 'array', items: { type: 'string' } },
     watchlistFile: { type: ['string', 'null'] },
     book: { type: 'string', enum: ['equity', 'options'] },
-    instruments: { type: 'array', items: sessionInstrumentSchema },
+    instruments: { type: 'array', items: decisionInstrumentSchema },
   },
 };
 

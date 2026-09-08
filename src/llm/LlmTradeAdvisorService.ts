@@ -37,7 +37,7 @@ import { UNIVERSE_BAR_LOOKBACK_DAYS, UNIVERSE_MIN_BARS_FOR_MOMENTUM, addCalendar
 import { mergeKnowledge, readLatestKnowledge, writeKnowledgeFile } from '../universe/knowledgeStore.js';
 import { diversifyByCorrelation, screenUniverse, UNIVERSE_MAX_INCLUDES } from '../universe/universeScreen.js';
 import type { DailyBar, IntradayBar } from '../universe/types.js';
-import { applyPlaybookClamp, evaluateOptionPlaybook, evaluatePlaybook, type PlaybookSignal } from './tradePlaybook.js';
+import { applyPlaybookClamp, evaluateGreeksIvPlaybook, evaluatePlaybook, type PlaybookSignal } from './tradePlaybook.js';
 import {
   indexNameFromOptionSymbol,
   loadIndexUnderlyings,
@@ -55,9 +55,15 @@ import {
   type OptionScreenRow,
 } from '../options/optionsScreen.js';
 import {
-  OPTION_BAR_LOOKBACK_DAYS,
-  pickBestOptionRule,
-} from '../options/optionRuleScoreboard.js';
+  DEFAULT_GREEKS_IV_ALGORITHM,
+  IV_HV_SKIP_THRESHOLD,
+  computeOptionGreeks,
+  isOptionPremium,
+  parseGreeksIvAlgorithm,
+  strikeFromOptionSymbol,
+  type GreeksIvAlgorithmId,
+  type OptionContractMeta,
+} from '../options/greeksIv.js';
 import type { UniverseBook } from '../universe/types.js';
 
 export type LlmTradeAdvisorOptions = {
@@ -91,6 +97,9 @@ export class LlmTradeAdvisorService {
   private sessionStartPayload: { instruments: SessionInstrument[] } = { instruments: [] };
   private watchlistFile: string | null = null;
   private book: UniverseBook = 'equity';
+  private algorithmsBySymbol: Record<string, GreeksIvAlgorithmId> = {};
+  private optionContracts: OptionContractMeta[] = [];
+  private lastQuotedPriceBySymbol: Record<string, number | null> = {};
 
   public constructor(options: LlmTradeAdvisorOptions) {
     this.llm = options.llm;
@@ -264,6 +273,8 @@ export class LlmTradeAdvisorService {
     this.includedSymbols = instruments.map((instrument) => instrument.tradingsymbol);
     this.sessionStartPayload = sessionStartPayload;
     this.watchlistFile = filePath;
+    this.algorithmsBySymbol = {};
+    this.optionContracts = [];
 
     this.logger.info(
       {
@@ -465,10 +476,27 @@ export class LlmTradeAdvisorService {
     const candidates = toUniverseCandidates(passingRows);
     const passing = new Set(passingRows.map((row) => row.symbol));
     const rowBySymbol = new Map(screened.map((row) => [row.symbol, row]));
+    const indexDailyByName = Object.fromEntries(
+      underlyings.map((row) => [row.tradingsymbol, knowledge.symbols[row.tradingsymbol]?.bars ?? []]),
+    );
+    const greeksBySymbol: Record<string, { delta: number | null; iv: number | null; ivHv: number | null }> = {};
+    for (const row of passingRows) {
+      const snapshot = computeOptionGreeks({
+        premium: row.ltp,
+        spot: spots[row.index] ?? null,
+        strike: row.strike,
+        expiryYmd: row.expiry,
+        asOfYmd: today,
+        side: row.side,
+        indexDaily: indexDailyByName[row.index] ?? [],
+      });
+      greeksBySymbol[row.symbol] = { delta: snapshot.delta, iv: snapshot.iv, ivHv: snapshot.ivHv };
+    }
     const messages = buildOptionsUniverseMessages(
       asOfIst,
       candidates,
       preselected.map((row) => row.symbol),
+      greeksBySymbol,
     );
     const completion = await this.completeWithRetry(messages, 'universe');
     const allowedSymbols = new Set(passingRows.map((row) => row.symbol));
@@ -495,11 +523,20 @@ export class LlmTradeAdvisorService {
       ...parsed,
       watchlist: keptRows.map((row, index) => {
         const item = parsed.watchlist.find((entry) => entry.symbol === row.symbol);
+        const ivHv = greeksBySymbol[row.symbol]?.ivHv ?? null;
+        let algorithm = parseGreeksIvAlgorithm(item?.algorithm);
+        if (ivHv !== null && ivHv > IV_HV_SKIP_THRESHOLD) {
+          algorithm = 'greeks_iv_skip';
+        }
+        if (!item?.algorithm) {
+          this.logger.info({ symbol: row.symbol, algorithm }, 'Options universe defaulted algorithm.');
+        }
         return {
           symbol: row.symbol,
           include: true as const,
           rank: index + 1,
           rationale: item?.rationale ?? 'Local index-options screen.',
+          algorithm,
         };
       }),
       exclude: [
@@ -511,6 +548,17 @@ export class LlmTradeAdvisorService {
     };
     const instruments = toSessionInstruments(keptRows);
     const sessionStartPayload = { instruments };
+    const algorithmsBySymbol: Record<string, GreeksIvAlgorithmId> = Object.fromEntries(
+      suggestion.watchlist.map((item) => [item.symbol, item.algorithm]),
+    );
+    const optionContracts: OptionContractMeta[] = keptRows.map((row) => ({
+      symbol: row.symbol,
+      index: row.index,
+      side: row.side,
+      strike: row.strike,
+      expiry: row.expiry,
+      algorithm: algorithmsBySymbol[row.symbol] ?? DEFAULT_GREEKS_IV_ALGORITHM,
+    }));
     const newsItemCount = window.skipRemote
       ? Object.values(knowledge.symbols).reduce((sum, entry) => sum + entry.filings.length, 0)
       : news.reduce((sum, entry) => sum + entry.items.length, 0);
@@ -528,11 +576,15 @@ export class LlmTradeAdvisorService {
       unmappedSymbols,
       knowledgeFile,
       candidateSymbols,
+      algorithmsBySymbol,
+      optionContracts,
     });
 
     this.includedSymbols = instruments.map((instrument) => instrument.tradingsymbol);
     this.sessionStartPayload = sessionStartPayload;
     this.watchlistFile = filePath;
+    this.algorithmsBySymbol = algorithmsBySymbol;
+    this.optionContracts = optionContracts;
 
     this.logger.info(
       {
@@ -569,7 +621,11 @@ export class LlmTradeAdvisorService {
       running: this.isDecisionLoopRunning(),
       decisionIntervalMinutes: config.llm.decisionIntervalMinutes,
       includedSymbols: [...this.includedSymbols],
-      instruments: this.sessionStartPayload.instruments,
+      instruments: this.sessionStartPayload.instruments.map((instrument) => ({
+        ...instrument,
+        currentPrice: this.lastQuotedPriceBySymbol[instrument.tradingsymbol] ?? null,
+        algorithm: this.algorithmsBySymbol[instrument.tradingsymbol] ?? null,
+      })),
       watchlistFile: this.watchlistFile,
       book: this.book,
     };
@@ -590,6 +646,7 @@ export class LlmTradeAdvisorService {
     this.sessionStartPayload = { instruments: [...instruments] };
     this.includedSymbols = instruments.map((instrument) => instrument.tradingsymbol);
     this.book = instruments.some((instrument) => instrument.exchange === 'NFO') ? 'options' : 'equity';
+    this.lastQuotedPriceBySymbol = await this.fetchLiveLastPrices();
 
     const intervalMs = config.llm.decisionIntervalMinutes * 60_000;
     this.timer = setInterval(() => {
@@ -635,14 +692,30 @@ export class LlmTradeAdvisorService {
     const snapshots = filterSnapshotsToSymbols(await readRecentQuoteSnapshots(), symbols);
     const fromLog = lastPricesFromSnapshots(snapshots, this.includedSymbols);
     const fromQuotes = await this.fetchLiveLastPrices();
+    this.lastQuotedPriceBySymbol = { ...fromQuotes };
+    const indexSpots = this.book === 'options' ? await this.fetchIndexSpots() : {};
     const lastPriceBySymbol: Record<string, number | null> = {};
     for (const symbol of this.includedSymbols) {
+      const listed = this.sessionStartPayload.instruments.find(
+        (instrument) => instrument.tradingsymbol === symbol,
+      );
       const logged = fromLog[symbol];
       const quoted = fromQuotes[symbol];
-      lastPriceBySymbol[symbol] =
-        logged !== null && logged !== undefined && Number.isFinite(logged)
-          ? logged
-          : quoted ?? null;
+      if (listed?.exchange === 'NFO') {
+        const index = indexNameFromOptionSymbol(symbol);
+        const spot = index ? (indexSpots[index] ?? null) : null;
+        lastPriceBySymbol[symbol] = isOptionPremium(quoted, spot)
+          ? quoted
+          : isOptionPremium(logged, spot)
+            ? logged
+            : null;
+        this.lastQuotedPriceBySymbol[symbol] = lastPriceBySymbol[symbol];
+      } else {
+        lastPriceBySymbol[symbol] =
+          quoted !== null && quoted !== undefined && Number.isFinite(quoted)
+            ? quoted
+            : logged ?? null;
+      }
     }
     const hasAnyPrice = this.includedSymbols.some((symbol) => {
       const price = lastPriceBySymbol[symbol];
@@ -678,6 +751,7 @@ export class LlmTradeAdvisorService {
       lastPriceBySymbol,
       priorBuyPriceBySymbol,
       allowedRows,
+      indexSpots,
     });
     const messages = buildDecisionMessages(
       asOfIst,
@@ -701,12 +775,40 @@ export class LlmTradeAdvisorService {
       this.logger.warn({ overrides }, 'Overrode LLM actions that fought the candle playbook.');
     }
 
+    const persistable = {
+      ...batch,
+      decisions: batch.decisions.filter((item) => {
+        const listed = this.sessionStartPayload.instruments.find(
+          (instrument) => instrument.tradingsymbol === item.symbol,
+        );
+        if (listed?.exchange !== 'NFO') {
+          return true;
+        }
+        return lastPriceBySymbol[item.symbol] !== null;
+      }),
+    };
+    const marketSnapshotBySymbol = Object.fromEntries(
+      persistable.decisions.map((item) => {
+        const signal = playbook.find((row) => row.symbol === item.symbol);
+        return [
+          item.symbol,
+          {
+            algorithm: signal?.algorithm ?? this.algorithmsBySymbol[item.symbol] ?? null,
+            ltp: signal?.lastPrice ?? lastPriceBySymbol[item.symbol] ?? null,
+            spot: signal?.spot ?? null,
+            iv: signal?.iv ?? null,
+            delta: signal?.delta ?? null,
+          },
+        ];
+      }),
+    );
     const stored = await persistDecisions({
       asOf,
-      batch,
+      batch: persistable,
       lastPriceBySymbol,
       priorBuyPriceBySymbol,
       tokenBySymbol,
+      marketSnapshotBySymbol,
     });
 
     this.logger.info(
@@ -720,6 +822,7 @@ export class LlmTradeAdvisorService {
   private async buildPlaybookSignals(input: {
     lastPriceBySymbol: Record<string, number | null>;
     priorBuyPriceBySymbol: Record<string, string | null>;
+    indexSpots?: Partial<Record<IndexOptionName, number>>;
     allowedRows: Array<{
       symbol: string;
       last: import('./schemas.js').LlmTradeActionName | null;
@@ -728,7 +831,6 @@ export class LlmTradeAdvisorService {
   }): Promise<PlaybookSignal[]> {
     const today = istYmd();
     const fromYmd = addCalendarDays(today, -UNIVERSE_BAR_LOOKBACK_DAYS);
-    const optionFromYmd = addCalendarDays(today, -OPTION_BAR_LOOKBACK_DAYS);
     const hasNfo = this.sessionStartPayload.instruments.some((instrument) => instrument.exchange === 'NFO');
     const hasNse = this.sessionStartPayload.instruments.some((instrument) => instrument.exchange !== 'NFO');
 
@@ -776,15 +878,14 @@ export class LlmTradeAdvisorService {
         const index = indexNameFromOptionSymbol(row.symbol);
         const side = optionSideFromSymbol(row.symbol) ?? 'CE';
         const indexDaily = index ? (indexBars[index] ?? []) : [];
-        let optionDaily: DailyBar[] = [];
-        try {
-          optionDaily = await this.kite.getDailyCandles(listed.instrumentToken, optionFromYmd, today);
-        } catch (error: unknown) {
-          this.logger.warn({ err: error, symbol: row.symbol }, 'Kite option daily historical failed.');
-        }
-        const best = pickBestOptionRule(optionDaily, indexDaily, side);
+        const meta = this.optionContracts.find((contract) => contract.symbol === row.symbol);
+        const strike = meta?.strike ?? strikeFromOptionSymbol(row.symbol) ?? 0;
+        const expiryYmd = meta?.expiry ?? addCalendarDays(today, 30);
+        const algorithm =
+          this.algorithmsBySymbol[row.symbol] ?? meta?.algorithm ?? DEFAULT_GREEKS_IV_ALGORITHM;
+        const spot = index ? (input.indexSpots?.[index] ?? indexDaily.at(-1)?.c ?? null) : null;
         signals.push(
-          evaluateOptionPlaybook({
+          evaluateGreeksIvPlaybook({
             symbol: row.symbol,
             side,
             lastAction: row.last as import('./schemas.js').LlmTradeActionName | null,
@@ -792,9 +893,11 @@ export class LlmTradeAdvisorService {
             lastPrice,
             buyPrice: buyPrice !== null && Number.isFinite(buyPrice) ? buyPrice : null,
             indexDaily,
-            stopLossPct: best.stopLossPct,
-            takeProfitPct: best.takeProfitPct,
-            ruleId: `${best.id} bt=${best.returnPct.toFixed(1)}% n=${best.trades}`,
+            spot,
+            strike,
+            expiryYmd,
+            asOfYmd: today,
+            algorithm,
           }),
         );
         continue;
@@ -847,11 +950,37 @@ export class LlmTradeAdvisorService {
       for (const instrument of this.sessionStartPayload.instruments) {
         const quote =
           quotes[`${instrument.exchange}:${instrument.tradingsymbol}`] ?? quotes[instrument.tradingsymbol];
-        out[instrument.tradingsymbol] = quote?.lastPrice ?? null;
+        out[instrument.tradingsymbol] =
+          quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : null;
       }
       return out;
     } catch (error: unknown) {
       this.logger.warn({ err: error }, 'Kite getQuotes failed for the decision cycle.');
+      return {};
+    }
+  }
+
+  private async fetchIndexSpots(): Promise<Partial<Record<IndexOptionName, number>>> {
+    const underlyings = loadIndexUnderlyings();
+    const keys = underlyings.map((row) => `${row.exchange}:${row.kiteQuoteSymbol}`);
+    if (keys.length === 0) {
+      return {};
+    }
+    try {
+      const quotes = await this.kite.getQuotes(keys);
+      const spots: Partial<Record<IndexOptionName, number>> = {};
+      for (const row of underlyings) {
+        const quote =
+          quotes[`${row.exchange}:${row.kiteQuoteSymbol}`] ??
+          quotes[`${row.exchange}:${row.kiteQuoteSymbol}`.toUpperCase()] ??
+          quotes[row.kiteQuoteSymbol];
+        if (quote?.lastPrice && quote.lastPrice > 0) {
+          spots[row.tradingsymbol as IndexOptionName] = quote.lastPrice;
+        }
+      }
+      return spots;
+    } catch (error: unknown) {
+      this.logger.warn({ err: error }, 'Kite getQuotes failed for index spots.');
       return {};
     }
   }

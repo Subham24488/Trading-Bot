@@ -146,6 +146,22 @@ describe('index options universe helpers', () => {
     });
     expect(signal.bias).toBe('LEAVE');
     expect(signal.suggested).toBe('EXIT');
+    expect(signal.lastPrice).toBe(90);
+  });
+
+  it('does not use index close as option lastPrice', () => {
+    const bars = risingBars();
+    const signal = evaluateOptionPlaybook({
+      symbol: 'NIFTY25SEP25000CE',
+      side: 'CE',
+      lastAction: 'BUY',
+      allowed: ['HOLD', 'EXIT'],
+      lastPrice: null,
+      buyPrice: 100,
+      indexDaily: bars,
+    });
+    expect(signal.lastPrice).toBeNull();
+    expect(signal.pnlPct).toBeNull();
   });
 
   it('allows NFO session/start only from the last options universe payload', () => {

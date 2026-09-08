@@ -9,6 +9,7 @@ import { database } from '../database.js';
 import type { DecisionBatch } from './schemas.js';
 import type { UniverseSuggestion } from './schemas.js';
 import type { SessionInstrument } from '../domain.js';
+import type { GreeksIvAlgorithmId, OptionContractMeta } from '../options/greeksIv.js';
 
 export type StoredUniverseFile = {
   generatedAt: string;
@@ -22,6 +23,8 @@ export type StoredUniverseFile = {
   unmappedSymbols: string[];
   knowledgeFile?: string | null;
   candidateSymbols?: string[];
+  algorithmsBySymbol?: Record<string, GreeksIvAlgorithmId>;
+  optionContracts?: OptionContractMeta[];
 };
 
 export function formatIstTimestamp(date: Date = new Date()): string {
@@ -64,6 +67,7 @@ export type DecisionRowInput = {
   lastPriceBySymbol?: Record<string, number | null>;
   priorBuyPriceBySymbol?: Record<string, string | null>;
   tokenBySymbol?: Record<string, number | null>;
+  marketSnapshotBySymbol?: Record<string, Record<string, unknown>>;
 };
 
 export function pricesForDecision(
@@ -113,7 +117,7 @@ export async function persistDecisions(input: DecisionRowInput): Promise<number>
       executionBlockedReason: LLM_EXECUTION_BLOCKED_REASON,
       promptHash: '',
       rawCompletion: '',
-      marketSnapshot: {},
+      marketSnapshot: input.marketSnapshotBySymbol?.[decision.symbol] ?? {},
       ...(token !== null && token !== undefined && Number.isInteger(token) && token > 0
         ? { instrumentToken: token }
         : {}),

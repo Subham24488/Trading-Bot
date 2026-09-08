@@ -1,8 +1,13 @@
 import { z } from 'zod';
 
+import { GREEKS_IV_ALGORITHMS } from '../options/greeksIv.js';
+
 export const universeBookBodySchema = z.object({
   book: z.enum(['equity', 'options']),
 });
+
+export const greeksIvAlgorithmSchema = z.enum(GREEKS_IV_ALGORITHMS);
+export type GreeksIvAlgorithmName = z.infer<typeof greeksIvAlgorithmSchema>;
 
 export const llmTradeActionSchema = z.enum(['BUY', 'HOLD', 'EXIT', 'SKIP']);
 export type LlmTradeActionName = z.infer<typeof llmTradeActionSchema>;
@@ -31,6 +36,7 @@ export const watchlistItemSchema = z.object({
   rationale: z.string().trim().min(1),
   rank: z.number().int().min(1).max(1).optional(),
   maxPositionInr: z.number().positive().optional(),
+  algorithm: greeksIvAlgorithmSchema.optional(),
 });
 
 export const universeSuggestionSchema = z.object({

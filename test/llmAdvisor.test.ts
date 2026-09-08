@@ -393,6 +393,46 @@ describe('LlmTradeAdvisorService safety', () => {
     advisor.stop();
     expect(advisor.isDecisionLoopRunning()).toBe(false);
   });
+
+  it('returns live NFO premium LTP on Decision Start status', async () => {
+    const { LlmTradeAdvisorService } = await import('../src/llm/LlmTradeAdvisorService.js');
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const getQuotes = vi.fn(async (keys: string[]) => {
+      const out: Record<string, { lastPrice: number; volume: number; oi: number }> = {};
+      for (const key of keys) {
+        out[key] = {
+          lastPrice: key.includes('NFO:') ? 122.5 : 25_010,
+          volume: 1,
+          oi: 1,
+        };
+      }
+      return out;
+    });
+    const advisor = new LlmTradeAdvisorService({
+      llm: {
+        completeJson: vi.fn().mockResolvedValue({
+          parsed: {
+            decisions: [{ symbol: 'NIFTY25SEP25000CE', action: 'SKIP', rationale: 'no setup' }],
+          },
+        }),
+        getModel: () => 'test',
+      } as never,
+      news: {} as never,
+      kite: {
+        getQuotes,
+        getDailyCandles: vi.fn().mockResolvedValue([]),
+      } as never,
+      logger,
+    });
+
+    const started = await advisor.startDecisionLoop([
+      { instrumentToken: 11, exchange: 'NFO', tradingsymbol: 'NIFTY25SEP25000CE' },
+    ]);
+    expect(getQuotes).toHaveBeenCalled();
+    expect(started.instruments[0]?.currentPrice).toBe(122.5);
+    expect(started.instruments[0]?.currentPrice).not.toBe(25_010);
+    advisor.stop();
+  });
 });
 
 describe('filterSnapshotsToSymbols', () => {
