@@ -2,10 +2,17 @@ import type { DailyBar, FeatureSnapshot, IntradayBar } from '../universe/types.j
 import { computeFeatures } from '../universe/features.js';
 import {
   GREEKS_IV_CATALOG,
+  IV_HV_CRUSH_EXIT,
+  OPTIONS_DEAD_DELTA,
+  OPTIONS_EXIT_DTE_DAYS,
+  OPTIONS_MAX_ENTRY_DTE_DAYS,
+  OPTIONS_STOP_LOSS_PCT,
+  OPTIONS_TAKE_PROFIT_PCT,
   computeOptionGreeks,
   isGreeksIvAlgorithm,
   isOptionPremium,
   type GreeksIvAlgorithmId,
+  type OptionNewsRisk,
 } from '../options/greeksIv.js';
 import type { LlmTradeActionName } from './schemas.js';
 import type { DecisionBatch } from './schemas.js';
@@ -279,6 +286,7 @@ export function evaluateGreeksIvPlaybook(input: {
   expiryYmd: string;
   asOfYmd: string;
   algorithm: string | null;
+  newsRisk?: OptionNewsRisk | null;
 }): PlaybookSignal {
   const algorithm = isGreeksIvAlgorithm(input.algorithm) ? input.algorithm : null;
   const features = computeFeatures(input.indexDaily, [], input.indexDaily);
@@ -300,30 +308,41 @@ export function evaluateGreeksIvPlaybook(input: {
   const sideFits = input.side === 'CE' ? smaUp : input.side === 'PE' ? smaDown : false;
   const dteDays = greeks.timeYears * 365;
   const absDelta = greeks.absDelta;
+  const newsRisk = input.newsRisk ?? { level: 'none' as const, reasons: [] };
+  const calm = features.atrPct === null || features.atrPct < MAX_ATR_PCT_FOR_BUY;
 
   let bias: PlaybookBias = inPosition ? 'STAY' : 'WAIT';
 
   if (!algorithm) {
     bias = inPosition ? 'STAY' : 'WAIT';
     reasons.push('unknown algorithm; skip new entries');
+  } else if (newsRisk.level === 'high' && inPosition) {
+    bias = 'LEAVE';
+    reasons.push(newsRisk.reasons[0] ?? 'high event news; exit premium');
+  } else if (newsRisk.level === 'high' && !inPosition) {
+    bias = 'WAIT';
+    reasons.push(newsRisk.reasons[0] ?? 'high event news; skip entry');
   } else if (lastPrice === null && !inPosition) {
     bias = 'WAIT';
     reasons.push('no option premium LTP');
   } else if (inPosition && lastPrice === null) {
     bias = 'STAY';
     reasons.push('no option premium LTP; hold without PnL');
-  } else if (inPosition && pnlPct !== null && pnlPct <= -STOP_LOSS_PCT) {
+  } else if (inPosition && pnlPct !== null && pnlPct <= -OPTIONS_STOP_LOSS_PCT) {
     bias = 'LEAVE';
-    reasons.push(`premium stop ${pnlPct.toFixed(1)}% ≤ −${STOP_LOSS_PCT}%`);
-  } else if (inPosition && pnlPct !== null && pnlPct >= TAKE_PROFIT_PCT) {
+    reasons.push(`premium stop ${pnlPct.toFixed(1)}% ≤ −${OPTIONS_STOP_LOSS_PCT}%`);
+  } else if (inPosition && pnlPct !== null && pnlPct >= OPTIONS_TAKE_PROFIT_PCT) {
     bias = 'LEAVE';
-    reasons.push(`premium take-profit ${pnlPct.toFixed(1)}% ≥ +${TAKE_PROFIT_PCT}%`);
-  } else if (inPosition && dteDays < 1) {
+    reasons.push(`premium take-profit ${pnlPct.toFixed(1)}% ≥ +${OPTIONS_TAKE_PROFIT_PCT}%`);
+  } else if (inPosition && dteDays < OPTIONS_EXIT_DTE_DAYS) {
     bias = 'LEAVE';
-    reasons.push('DTE < 1; exit expiry risk');
-  } else if (inPosition && absDelta !== null && absDelta < 0.2) {
+    reasons.push(`DTE ${dteDays.toFixed(1)} < ${OPTIONS_EXIT_DTE_DAYS}; exit expiry risk`);
+  } else if (inPosition && absDelta !== null && absDelta < OPTIONS_DEAD_DELTA) {
     bias = 'LEAVE';
     reasons.push(`delta ${absDelta.toFixed(2)} collapsed`);
+  } else if (inPosition && greeks.ivHv !== null && greeks.ivHv > IV_HV_CRUSH_EXIT) {
+    bias = 'LEAVE';
+    reasons.push(`IV/HV ${greeks.ivHv.toFixed(2)} > ${IV_HV_CRUSH_EXIT}; vol expansion exit`);
   } else if (inPosition && input.side === 'CE' && smaDown) {
     bias = 'LEAVE';
     reasons.push('index SMA20 lost SMA50; exit CE');
@@ -333,11 +352,15 @@ export function evaluateGreeksIvPlaybook(input: {
   } else if (!inPosition && algorithm === 'greeks_iv_skip') {
     bias = 'WAIT';
     reasons.push('greeks_iv_skip');
+  } else if (!inPosition && newsRisk.level === 'elevated') {
+    bias = 'WAIT';
+    reasons.push(newsRisk.reasons[0] ?? 'elevated event news; skip entry');
   } else if (!inPosition) {
     const variant = GREEKS_IV_CATALOG[algorithm];
     const deltaOk =
       absDelta !== null && absDelta >= variant.deltaMin && absDelta <= variant.deltaMax;
     const ivOk = greeks.ivHv !== null && greeks.ivHv <= variant.ivHvEnterMax;
+    const dteOk = dteDays >= variant.minEntryDte && dteDays <= OPTIONS_MAX_ENTRY_DTE_DAYS;
     if (!sideFits) {
       reasons.push(`need ${input.side === 'CE' ? 'uptrend' : 'downtrend'} on the index`);
     }
@@ -353,10 +376,18 @@ export function evaluateGreeksIvPlaybook(input: {
         greeks.ivHv === null ? 'need IV/HV' : `IV/HV ${greeks.ivHv.toFixed(2)} > ${variant.ivHvEnterMax}`,
       );
     }
-    bias = sideFits && deltaOk && ivOk ? 'ENTER' : 'WAIT';
+    if (!dteOk) {
+      reasons.push(
+        `DTE ${dteDays.toFixed(1)} must be ${variant.minEntryDte}–${OPTIONS_MAX_ENTRY_DTE_DAYS}`,
+      );
+    }
+    if (!calm) {
+      reasons.push('index ATR% too high for new premium buy');
+    }
+    bias = sideFits && deltaOk && ivOk && dteOk && calm ? 'ENTER' : 'WAIT';
     if (bias === 'ENTER') {
       reasons.length = 0;
-      reasons.push(`${algorithm} delta+IV aligned`);
+      reasons.push(`${algorithm} delta+IV+DTE aligned`);
     }
   } else {
     reasons.push('greeks structure intact; hold premium');

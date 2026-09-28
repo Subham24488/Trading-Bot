@@ -2,7 +2,7 @@ import type { SymbolNews } from '../news/NewsService.js';
 import type { UniverseCandidate } from '../universe/types.js';
 import type { QuoteLogSnapshot } from './quoteLogReader.js';
 import { greeksIvCatalogForPrompt } from '../options/greeksIv.js';
-import { promptActionLabels } from './schemas.js';
+import { promptActionLabels, type LlmTradeActionName } from './schemas.js';
 import { compactPlaybookForPrompt, type PlaybookSignal } from './tradePlaybook.js';
 
 /** Keep completion small so input+output stays under typical 40k context. */
@@ -293,6 +293,7 @@ export function buildDecisionMessages(
   allowedRows: readonly DecisionAllowedRow[] = [],
   playbook: readonly PlaybookSignal[] = [],
   book: 'equity' | 'options' = 'equity',
+  news: readonly SymbolNews[] = [],
 ): Array<{ role: 'system' | 'user'; content: string }> {
   const bySymbol = new Map(allowedRows.map((row) => [row.symbol, row]));
   const allowed = watchlistSymbols.map((symbol) => {
@@ -305,14 +306,26 @@ export function buildDecisionMessages(
     };
   });
 
+  const userPayload: Record<string, unknown> = {
+    asOfIst,
+    wl: watchlistSymbols,
+    allowed,
+    pb: compactPlaybookForPrompt(playbook),
+    q: compactSnapshotsForPrompt(snapshots),
+  };
+  if (book === 'options' && news.length > 0) {
+    userPayload.news = compactNewsForPrompt(news);
+  }
+
   return [
     {
       role: 'system',
       content:
         book === 'options'
           ? 'NSE index-options desk, store-only. For every wl contract pick action only from that symbol opts. ' +
-            'pb[] is the bound greeks_iv book (delta band, IV/HV, option LTP, index SMA). Follow rec unless opts forbid it. ' +
-            'Do not BUY when rec is SKIP. SELL when rec is SELL (stop, target, dead delta, or DTE). ' +
+            'pb[] is the bound greeks_iv book (delta band, IV/HV, DTE, ATR, option LTP, index SMA, news risk). Follow rec unless opts forbid it. ' +
+            'Do not BUY when rec is SKIP. Do not BUY on high event risk; prefer SELL/HOLD/SKIP when news is elevated or signals conflict. ' +
+            'SELL when rec is SELL (stop, target, dead delta, DTE, IV crush, or event news). ' +
             'SKIP is valid. JSON only: {decisions:[{symbol,action,rationale}]}. One row per wl. Rationale ≤12 words. No live orders. /no_think'
           : 'NSE cash paper desk. For every wl symbol pick action only from that symbol opts. ' +
             'pb[] is the local playbook (trend SMA20/50, 20d RS vs NIFTYBEES, volume, ATR, 15m vs VWAP, +20/−10 overlay). ' +
@@ -321,13 +334,7 @@ export function buildDecisionMessages(
     },
     {
       role: 'user',
-      content: JSON.stringify({
-        asOfIst,
-        wl: watchlistSymbols,
-        allowed,
-        pb: compactPlaybookForPrompt(playbook),
-        q: compactSnapshotsForPrompt(snapshots),
-      }),
+      content: JSON.stringify(userPayload),
     },
   ];
 }

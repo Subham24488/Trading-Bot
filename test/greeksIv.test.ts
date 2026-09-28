@@ -91,13 +91,13 @@ describe('evaluateGreeksIvPlaybook', () => {
     expect(signal.bias).toBe('STAY');
   });
 
-  it('exits when premium is down 10%', () => {
+  it('exits when premium is down 25%', () => {
     const signal = evaluateGreeksIvPlaybook({
       symbol: 'NIFTY25SEP25000CE',
       side: 'CE',
       lastAction: 'BUY',
       allowed: ['HOLD', 'EXIT'],
-      lastPrice: 90,
+      lastPrice: 75,
       buyPrice: 100,
       indexDaily,
       spot,
@@ -141,11 +141,11 @@ describe('evaluateGreeksIvPlaybook', () => {
       indexDaily,
       spot,
       strike,
-      expiryYmd: '2026-10-06',
+      expiryYmd: '2026-09-21',
       asOfYmd: '2026-09-07',
       algorithm: 'greeks_iv_atm',
     });
-    if (greeks.absDelta !== null && greeks.absDelta >= 0.4 && greeks.absDelta <= 0.7 && (greeks.ivHv ?? 99) <= 1.15) {
+    if (greeks.absDelta !== null && greeks.absDelta >= 0.4 && greeks.absDelta <= 0.7 && (greeks.ivHv ?? 99) <= 1.1) {
       expect(signal.bias).toBe('ENTER');
       expect(signal.suggested).toBe('BUY');
     } else {

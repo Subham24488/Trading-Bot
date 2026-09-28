@@ -8,18 +8,108 @@ export const DEFAULT_GREEKS_IV_ALGORITHM: GreeksIvAlgorithmId = 'greeks_iv_atm';
 export const RISK_FREE_RATE = 0.065;
 export const IV_HV_SKIP_THRESHOLD = 1.4;
 
+/** Exit long premium when IV/HV expands above this (vol expansion against longs). */
+export const IV_HV_CRUSH_EXIT = 1.35;
+/** Exit before expiry gamma; DTE below this → LEAVE. */
+export const OPTIONS_EXIT_DTE_DAYS = 2;
+/** Max DTE for new long-premium entries (weekly/near-month liquidity). */
+export const OPTIONS_MAX_ENTRY_DTE_DAYS = 21;
+export const OPTIONS_MIN_ENTRY_DTE_ATM = 3;
+export const OPTIONS_MIN_ENTRY_DTE_OTM = 5;
+/** Options-specific premium stop / take-profit (vs cash ±10/20). */
+export const OPTIONS_STOP_LOSS_PCT = 25;
+export const OPTIONS_TAKE_PROFIT_PCT = 40;
+/** Dead directional exposure exit. */
+export const OPTIONS_DEAD_DELTA = 0.2;
+/** Decision-cycle index news lookback (calendar days). */
+export const OPTIONS_NEWS_LOOKBACK_DAYS = 2;
+
 export type GreeksIvVariant = {
   id: GreeksIvAlgorithmId;
   deltaMin: number;
   deltaMax: number;
   ivHvEnterMax: number;
+  minEntryDte: number;
 };
 
 export const GREEKS_IV_CATALOG: Record<GreeksIvAlgorithmId, GreeksIvVariant> = {
-  greeks_iv_atm: { id: 'greeks_iv_atm', deltaMin: 0.4, deltaMax: 0.7, ivHvEnterMax: 1.15 },
-  greeks_iv_otm: { id: 'greeks_iv_otm', deltaMin: 0.25, deltaMax: 0.4, ivHvEnterMax: 1.1 },
-  greeks_iv_skip: { id: 'greeks_iv_skip', deltaMin: 0, deltaMax: 0, ivHvEnterMax: 0 },
+  greeks_iv_atm: {
+    id: 'greeks_iv_atm',
+    deltaMin: 0.4,
+    deltaMax: 0.7,
+    ivHvEnterMax: 1.1,
+    minEntryDte: OPTIONS_MIN_ENTRY_DTE_ATM,
+  },
+  greeks_iv_otm: {
+    id: 'greeks_iv_otm',
+    deltaMin: 0.25,
+    deltaMax: 0.4,
+    ivHvEnterMax: 1.05,
+    minEntryDte: OPTIONS_MIN_ENTRY_DTE_OTM,
+  },
+  greeks_iv_skip: {
+    id: 'greeks_iv_skip',
+    deltaMin: 0,
+    deltaMax: 0,
+    ivHvEnterMax: 0,
+    minEntryDte: 0,
+  },
 };
+
+export type OptionNewsRiskLevel = 'none' | 'elevated' | 'high';
+
+export type OptionNewsRisk = {
+  level: OptionNewsRiskLevel;
+  reasons: string[];
+};
+
+const HIGH_NEWS_PATTERNS: RegExp[] = [
+  /\b(rbi|mpc|repo rate|fed|fomc|cpi|inflation|gdp|election|war|geopolit|crash|circuit|ban|sebi.?order|default|insolvency|terror|attack|emergency)\b/i,
+  /\b(black.?swan|flash.?crash|market.?halt|suspension)\b/i,
+];
+
+const ELEVATED_NEWS_PATTERNS: RegExp[] = [
+  /\b(expiry|weekly.?expiry|monthly.?expiry|budget|policy|rate.?decision|hawkish|dovish|volatility|vix|sell.?off|plunge|surge|gap.?up|gap.?down)\b/i,
+  /\b(fii|dii|heavy.?selling|heavy.?buying|global.?cues)\b/i,
+];
+
+/**
+ * Keyword risk for index option decisions. No NLP deps.
+ * high → block BUY / force EXIT when in position; elevated → block ENTER only.
+ */
+export function scoreOptionNewsRisk(
+  headlines: readonly { title: string }[],
+): OptionNewsRisk {
+  const reasons: string[] = [];
+  let highHits = 0;
+  let elevatedHits = 0;
+  for (const item of headlines) {
+    const title = item.title.trim();
+    if (!title) {
+      continue;
+    }
+    if (HIGH_NEWS_PATTERNS.some((pattern) => pattern.test(title))) {
+      highHits += 1;
+      if (reasons.length < 3) {
+        reasons.push(`high: ${title.slice(0, 80)}`);
+      }
+      continue;
+    }
+    if (ELEVATED_NEWS_PATTERNS.some((pattern) => pattern.test(title))) {
+      elevatedHits += 1;
+      if (reasons.length < 3) {
+        reasons.push(`elevated: ${title.slice(0, 80)}`);
+      }
+    }
+  }
+  if (highHits > 0) {
+    return { level: 'high', reasons };
+  }
+  if (elevatedHits > 0) {
+    return { level: 'elevated', reasons };
+  }
+  return { level: 'none', reasons: [] };
+}
 
 export type OptionContractMeta = {
   symbol: string;
@@ -251,6 +341,11 @@ export function greeksIvCatalogForPrompt() {
       deltaMin: row.deltaMin,
       deltaMax: row.deltaMax,
       ivHvEnterMax: row.ivHvEnterMax,
+      minEntryDte: row.minEntryDte,
     };
   });
+}
+
+export function minEntryDteForAlgorithm(algorithm: GreeksIvAlgorithmId): number {
+  return GREEKS_IV_CATALOG[algorithm].minEntryDte;
 }

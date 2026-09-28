@@ -32,7 +32,6 @@ import {
   type UniverseSuggestion,
 } from './schemas.js';
 import { formatIstTimestamp, latestActionsForSymbols, persistDecisions, writeUniverseFile } from './decisionStore.js';
-import type { NewsService } from '../news/NewsService.js';
 import { UNIVERSE_BAR_LOOKBACK_DAYS, UNIVERSE_MIN_BARS_FOR_MOMENTUM, addCalendarDays, computeFetchWindow, istYmd, ymdToUtcDate } from '../universe/dates.js';
 import { mergeKnowledge, readLatestKnowledge, writeKnowledgeFile } from '../universe/knowledgeStore.js';
 import { diversifyByCorrelation, screenUniverse, UNIVERSE_MAX_INCLUDES } from '../universe/universeScreen.js';
@@ -57,13 +56,17 @@ import {
 import {
   DEFAULT_GREEKS_IV_ALGORITHM,
   IV_HV_SKIP_THRESHOLD,
+  OPTIONS_NEWS_LOOKBACK_DAYS,
   computeOptionGreeks,
   isOptionPremium,
   parseGreeksIvAlgorithm,
+  scoreOptionNewsRisk,
   strikeFromOptionSymbol,
   type GreeksIvAlgorithmId,
   type OptionContractMeta,
+  type OptionNewsRisk,
 } from '../options/greeksIv.js';
+import type { NewsService, SymbolNews } from '../news/NewsService.js';
 import type { UniverseBook } from '../universe/types.js';
 
 export type LlmTradeAdvisorOptions = {
@@ -705,9 +708,9 @@ export class LlmTradeAdvisorService {
         const index = indexNameFromOptionSymbol(symbol);
         const spot = index ? (indexSpots[index] ?? null) : null;
         lastPriceBySymbol[symbol] = isOptionPremium(quoted, spot)
-          ? quoted
+          ? (quoted ?? null)
           : isOptionPremium(logged, spot)
-            ? logged
+            ? (logged ?? null)
             : null;
         this.lastQuotedPriceBySymbol[symbol] = lastPriceBySymbol[symbol];
       } else {
@@ -747,11 +750,13 @@ export class LlmTradeAdvisorService {
         instrument.instrumentToken,
       ]),
     );
+    const { news: decisionNews, newsByIndex } = await this.fetchDecisionIndexNews();
     const playbook = await this.buildPlaybookSignals({
       lastPriceBySymbol,
       priorBuyPriceBySymbol,
       allowedRows,
       indexSpots,
+      newsByIndex,
     });
     const messages = buildDecisionMessages(
       asOfIst,
@@ -760,6 +765,7 @@ export class LlmTradeAdvisorService {
       allowedRows,
       playbook,
       this.book,
+      decisionNews,
     );
     const completion = await this.completeWithRetry(messages, 'decision');
     const filtered = filterDecisionsToSymbols(decisionBatchSchema.parse(completion.parsed), symbols);
@@ -823,6 +829,7 @@ export class LlmTradeAdvisorService {
     lastPriceBySymbol: Record<string, number | null>;
     priorBuyPriceBySymbol: Record<string, string | null>;
     indexSpots?: Partial<Record<IndexOptionName, number>>;
+    newsByIndex?: Partial<Record<IndexOptionName, OptionNewsRisk>>;
     allowedRows: Array<{
       symbol: string;
       last: import('./schemas.js').LlmTradeActionName | null;
@@ -898,6 +905,7 @@ export class LlmTradeAdvisorService {
             expiryYmd,
             asOfYmd: today,
             algorithm,
+            newsRisk: index ? (input.newsByIndex?.[index] ?? null) : null,
           }),
         );
         continue;
@@ -957,6 +965,55 @@ export class LlmTradeAdvisorService {
     } catch (error: unknown) {
       this.logger.warn({ err: error }, 'Kite getQuotes failed for the decision cycle.');
       return {};
+    }
+  }
+
+  private async fetchDecisionIndexNews(): Promise<{
+    news: SymbolNews[];
+    newsByIndex: Partial<Record<IndexOptionName, OptionNewsRisk>>;
+  }> {
+    if (this.book !== 'options') {
+      return { news: [], newsByIndex: {} };
+    }
+    const indexes = new Set<IndexOptionName>();
+    for (const symbol of this.includedSymbols) {
+      const index = indexNameFromOptionSymbol(symbol);
+      if (index) {
+        indexes.add(index);
+      }
+    }
+    if (indexes.size === 0) {
+      return { news: [], newsByIndex: {} };
+    }
+    const underlyings = loadIndexUnderlyings().filter((row) =>
+      indexes.has(row.tradingsymbol as IndexOptionName),
+    );
+    const today = istYmd();
+    const fromYmd = addCalendarDays(today, -OPTIONS_NEWS_LOOKBACK_DAYS);
+    try {
+      const news = await this.news.fetchIndexNews(
+        underlyings.map((row) => ({ symbol: row.tradingsymbol, query: row.googleQuery })),
+        ymdToUtcDate(fromYmd),
+        ymdToUtcDate(today),
+      );
+      const newsByIndex: Partial<Record<IndexOptionName, OptionNewsRisk>> = {};
+      for (const entry of news) {
+        const name = entry.symbol.toUpperCase() as IndexOptionName;
+        newsByIndex[name] = scoreOptionNewsRisk(entry.items);
+      }
+      this.logger.info(
+        {
+          indexes: [...indexes],
+          levels: Object.fromEntries(
+            Object.entries(newsByIndex).map(([key, value]) => [key, value?.level ?? 'none']),
+          ),
+        },
+        'Scored index news risk for options decision cycle.',
+      );
+      return { news, newsByIndex };
+    } catch (error: unknown) {
+      this.logger.warn({ err: error }, 'Index news fetch failed for decision cycle; fail-open to none.');
+      return { news: [], newsByIndex: {} };
     }
   }
 
