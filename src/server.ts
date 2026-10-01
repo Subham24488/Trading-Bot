@@ -21,7 +21,7 @@ import { LlmTradeAdvisorService } from './llm/LlmTradeAdvisorService.js';
 import { NewsService } from './news/NewsService.js';
 import { getCatalogTradingsymbols } from './instruments/kiteInstruments.js';
 import { parseSessionStartBody } from './session/sessionStartSchema.js';
-import { universeBookBodySchema } from './llm/schemas.js';
+import { decisionIndexesBodySchema, universeBookBodySchema } from './llm/schemas.js';
 
 const application = Fastify({ logger: { level: config.logLevel } });
 application.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) => {
@@ -393,16 +393,16 @@ application.post(
   {
     schema: {
       tags: ['llm'],
-      summary: 'Start the BUY/HOLD/EXIT/SKIP decision loop (does not place orders)',
+      summary: 'Start live options decision loop (picks contract + BUY/HOLD/EXIT/SKIP each cycle; store-only)',
       security: [{ adminToken: [] }],
       body: {
         type: 'object',
-        required: ['instruments'],
         properties: {
-          instruments: {
+          indexes: {
             type: 'array',
             minItems: 1,
-            items: sessionInstrumentSchema,
+            maxItems: 3,
+            items: { type: 'string', enum: ['NIFTY', 'BANKNIFTY', 'FINNIFTY'] },
           },
         },
       },
@@ -412,12 +412,8 @@ application.post(
   async (request) => {
     await requireAdmin(request);
     try {
-      const body = parseSessionStartBody(request.body, {
-        nfoAllowlist: llmAdvisor
-          .getSessionStartPayload()
-          .instruments.filter((instrument) => instrument.exchange === 'NFO'),
-      });
-      return await llmAdvisor.startDecisionLoop(body.instruments);
+      const body = decisionIndexesBodySchema.parse(request.body ?? {});
+      return await llmAdvisor.startDecisionLoop(body.indexes);
     } catch (error: unknown) {
       if (error instanceof ZodError) {
         throw Object.assign(new Error(error.issues.map((issue) => issue.message).join('; ')), {

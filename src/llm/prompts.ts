@@ -4,6 +4,11 @@ import type { QuoteLogSnapshot } from './quoteLogReader.js';
 import { greeksIvCatalogForPrompt } from '../options/greeksIv.js';
 import { promptActionLabels, type LlmTradeActionName } from './schemas.js';
 import { compactPlaybookForPrompt, type PlaybookSignal } from './tradePlaybook.js';
+import {
+  compactCandlesForPrompt,
+  compactChainForPrompt,
+  type LiveOptionDecisionContext,
+} from './decisionContext.js';
 
 /** Keep completion small so input+output stays under typical 40k context. */
 export const UNIVERSE_MAX_OUTPUT_TOKENS = 700;
@@ -335,6 +340,47 @@ export function buildDecisionMessages(
     {
       role: 'user',
       content: JSON.stringify(userPayload),
+    },
+  ];
+}
+
+/** Live options desk: pick one NFO contract + action from fresh chain/candle/news context. */
+export function buildLiveOptionDecisionMessages(
+  context: LiveOptionDecisionContext,
+): Array<{ role: 'system' | 'user'; content: string }> {
+  const open = context.open;
+  return [
+    {
+      role: 'system',
+      content:
+        'NSE index-options desk, store-only. Each cycle pick exactly ONE decision. ' +
+        'Choose symbol from chain.rows[].s (or the open symbol when in a position). ' +
+        'Action must be one of opts. SELL means EXIT. Prefer SKIP when trends conflict, newsRisk is high, or edge is weak. ' +
+        'Do not open a second position. Respect minHoldMinutes and fee targetNetPnlPct. ' +
+        'Use candles (day/week/month trend + structure), chain OI/dOi/PCR/volume, and news. ' +
+        'JSON only: {decisions:[{symbol,action,rationale}]}. One row. Rationale ≤16 words. No live orders. /no_think',
+    },
+    {
+      role: 'user',
+      content: JSON.stringify({
+        asOfIst: context.asOfIst,
+        opts: promptActionLabels(context.allowed),
+        open: open
+          ? {
+              s: open.symbol,
+              buy: open.buyPrice,
+              heldMin: open.heldMinutes,
+            }
+          : null,
+        minHoldMinutes: context.minHoldMinutes,
+        targetNetPnlPct: context.targetNetPnlPct,
+        lookbackMin: context.candleLookbackMinutes,
+        fees: context.fees,
+        newsRisk: context.newsRiskByIndex,
+        news: context.newsHeadlines.slice(0, 12),
+        candles: context.candles.map(compactCandlesForPrompt),
+        chain: compactChainForPrompt(context.chain),
+      }),
     },
   ];
 }

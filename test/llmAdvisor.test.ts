@@ -372,29 +372,29 @@ describe('LlmTradeAdvisorService safety', () => {
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const advisor = new LlmTradeAdvisorService({
       llm: {} as never,
-      news: {} as never,
-      kite: { getQuotes: vi.fn().mockResolvedValue({}) } as never,
+      news: { fetchIndexNews: vi.fn().mockResolvedValue([]) } as never,
+      kite: {
+        getQuotes: vi.fn().mockResolvedValue({}),
+        getNfoIndexOptions: vi.fn().mockResolvedValue([]),
+        getMinuteCandles: vi.fn().mockResolvedValue([]),
+        getFifteenMinuteCandles: vi.fn().mockResolvedValue([]),
+        getDailyCandles: vi.fn().mockResolvedValue([]),
+      } as never,
       logger,
     });
 
     expect(advisor.getDecisionLoopStatus().running).toBe(false);
     expect(advisor.stop().running).toBe(false);
 
-    const started = await advisor.startDecisionLoop([
-      { instrumentToken: 738561, exchange: 'NSE', tradingsymbol: 'RELIANCE' },
-    ]);
+    const started = await advisor.startDecisionLoop(['NIFTY']);
     expect(started.running).toBe(true);
-    await expect(
-      advisor.startDecisionLoop([
-        { instrumentToken: 738561, exchange: 'NSE', tradingsymbol: 'RELIANCE' },
-      ]),
-    ).rejects.toThrow(/already running/);
+    await expect(advisor.startDecisionLoop(['NIFTY'])).rejects.toThrow(/already running/);
 
     advisor.stop();
     expect(advisor.isDecisionLoopRunning()).toBe(false);
   });
 
-  it('returns live NFO premium LTP on Decision Start status', async () => {
+  it('stores a live chain pick without requiring universe instruments', async () => {
     const { LlmTradeAdvisorService } = await import('../src/llm/LlmTradeAdvisorService.js');
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const getQuotes = vi.fn(async (keys: string[]) => {
@@ -402,8 +402,8 @@ describe('LlmTradeAdvisorService safety', () => {
       for (const key of keys) {
         out[key] = {
           lastPrice: key.includes('NFO:') ? 122.5 : 25_010,
-          volume: 1,
-          oi: 1,
+          volume: 100,
+          oi: 1_000,
         };
       }
       return out;
@@ -417,20 +417,30 @@ describe('LlmTradeAdvisorService safety', () => {
         }),
         getModel: () => 'test',
       } as never,
-      news: {} as never,
+      news: { fetchIndexNews: vi.fn().mockResolvedValue([]) } as never,
       kite: {
         getQuotes,
+        getNfoIndexOptions: vi.fn().mockResolvedValue([
+          {
+            instrumentToken: 11,
+            tradingsymbol: 'NIFTY25SEP25000CE',
+            name: 'NIFTY',
+            expiry: '2026-09-25',
+            strike: 25_000,
+            instrumentType: 'CE',
+          },
+        ]),
+        getMinuteCandles: vi.fn().mockResolvedValue([]),
+        getFifteenMinuteCandles: vi.fn().mockResolvedValue([]),
         getDailyCandles: vi.fn().mockResolvedValue([]),
       } as never,
       logger,
     });
 
-    const started = await advisor.startDecisionLoop([
-      { instrumentToken: 11, exchange: 'NFO', tradingsymbol: 'NIFTY25SEP25000CE' },
-    ]);
+    const started = await advisor.startDecisionLoop(['NIFTY']);
     expect(getQuotes).toHaveBeenCalled();
-    expect(started.instruments[0]?.currentPrice).toBe(122.5);
-    expect(started.instruments[0]?.currentPrice).not.toBe(25_010);
+    expect(started.running).toBe(true);
+    expect(started.book).toBe('options');
     advisor.stop();
   });
 });

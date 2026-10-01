@@ -169,3 +169,38 @@ export async function latestActionsForSymbols(
   );
   return Object.fromEntries(entries);
 }
+
+export type OpenPositionState = {
+  symbol: string;
+  action: LlmTradeAction;
+  buyPrice: string | null;
+  instrumentToken: number | null;
+  decidedAt: Date;
+  asOf: Date;
+};
+
+/** Most recent decision that left a long open (BUY/HOLD). EXIT/SKIP ⇒ flat. */
+export async function findLatestOpenPosition(): Promise<OpenPositionState | null> {
+  const row = await database.llmTradeDecision.findFirst({
+    orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
+    select: {
+      symbol: true,
+      action: true,
+      buyPrice: true,
+      instrumentToken: true,
+      decidedAt: true,
+      asOf: true,
+    },
+  });
+  if (!row || (row.action !== 'BUY' && row.action !== 'HOLD')) {
+    return null;
+  }
+  return {
+    symbol: row.symbol.toUpperCase(),
+    action: row.action,
+    buyPrice: formatStoredPrice(row.buyPrice),
+    instrumentToken: row.instrumentToken ?? null,
+    decidedAt: row.decidedAt,
+    asOf: row.asOf,
+  };
+}

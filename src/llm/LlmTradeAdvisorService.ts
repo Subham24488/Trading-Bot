@@ -6,41 +6,40 @@ import { config } from '../config.js';
 import type { SessionInstrument } from '../domain.js';
 import {
   getCatalogTradingsymbols,
-  findKiteInstrument,
   loadKiteInstruments,
   lookupSessionStartInstruments,
   type KiteInstrumentRef,
 } from '../instruments/kiteInstruments.js';
 import type { HuggingFaceClient } from './huggingfaceClient.js';
 import {
-  buildDecisionMessages,
+  buildLiveOptionDecisionMessages,
   buildOptionsUniverseMessages,
   buildUniverseMessages,
   DECISION_MAX_OUTPUT_TOKENS,
   UNIVERSE_MAX_OUTPUT_TOKENS,
 } from './prompts.js';
-import { filterSnapshotsToSymbols, lastPricesFromSnapshots, readRecentQuoteSnapshots } from './quoteLogReader.js';
 import {
   clampWatchlistToTop,
   dropIncludesNotPassing,
   decisionBatchSchema,
-  filterDecisionsToSymbols,
-  clampDecisionsToAllowed,
-  allowedActionsForLatest,
+  clampLiveOptionDecision,
   intersectWatchlistWithCatalog,
   universeSuggestionSchema,
   type UniverseSuggestion,
 } from './schemas.js';
-import { formatIstTimestamp, latestActionsForSymbols, persistDecisions, writeUniverseFile } from './decisionStore.js';
+import {
+  formatIstTimestamp,
+  findLatestOpenPosition,
+  persistDecisions,
+  writeUniverseFile,
+} from './decisionStore.js';
 import { UNIVERSE_BAR_LOOKBACK_DAYS, UNIVERSE_MIN_BARS_FOR_MOMENTUM, addCalendarDays, computeFetchWindow, istYmd, ymdToUtcDate } from '../universe/dates.js';
 import { mergeKnowledge, readLatestKnowledge, writeKnowledgeFile } from '../universe/knowledgeStore.js';
 import { diversifyByCorrelation, screenUniverse, UNIVERSE_MAX_INCLUDES } from '../universe/universeScreen.js';
 import type { DailyBar, IntradayBar } from '../universe/types.js';
-import { applyPlaybookClamp, evaluateGreeksIvPlaybook, evaluatePlaybook, type PlaybookSignal } from './tradePlaybook.js';
 import {
-  indexNameFromOptionSymbol,
+  INDEX_OPTION_NAMES,
   loadIndexUnderlyings,
-  optionSideFromSymbol,
   type IndexOptionName,
 } from '../instruments/kiteIndexUnderlyings.js';
 import {
@@ -56,18 +55,30 @@ import {
 import {
   DEFAULT_GREEKS_IV_ALGORITHM,
   IV_HV_SKIP_THRESHOLD,
-  OPTIONS_NEWS_LOOKBACK_DAYS,
+  OPTIONS_STOP_LOSS_PCT,
   computeOptionGreeks,
-  isOptionPremium,
   parseGreeksIvAlgorithm,
   scoreOptionNewsRisk,
-  strikeFromOptionSymbol,
   type GreeksIvAlgorithmId,
   type OptionContractMeta,
   type OptionNewsRisk,
 } from '../options/greeksIv.js';
-import type { NewsService, SymbolNews } from '../news/NewsService.js';
+import type { NewsService } from '../news/NewsService.js';
 import type { UniverseBook } from '../universe/types.js';
+import {
+  formatIstWallClock,
+  structureNotesFromBars,
+  trendFromCloses,
+  type ChainQuoteRow,
+  type ChainSnapshot,
+  type IndexCandlePack,
+  type LiveOptionDecisionContext,
+} from './decisionContext.js';
+import {
+  DEFAULT_INDEX_OPTION_LOT,
+  buyClearsFeeTarget,
+  estimateOptionsRoundTripCost,
+} from './optionTradeCosts.js';
 
 export type LlmTradeAdvisorOptions = {
   llm: HuggingFaceClient;
@@ -103,6 +114,8 @@ export class LlmTradeAdvisorService {
   private algorithmsBySymbol: Record<string, GreeksIvAlgorithmId> = {};
   private optionContracts: OptionContractMeta[] = [];
   private lastQuotedPriceBySymbol: Record<string, number | null> = {};
+  private decisionIndexes: IndexOptionName[] = [...INDEX_OPTION_NAMES];
+  private previousChainBySymbol: Record<string, { oi: number; volume: number }> = {};
 
   public constructor(options: LlmTradeAdvisorOptions) {
     this.llm = options.llm;
@@ -635,21 +648,32 @@ export class LlmTradeAdvisorService {
   }
 
   public async startDecisionLoop(
-    instruments: readonly SessionInstrument[],
+    indexes?: readonly IndexOptionName[],
   ): Promise<ReturnType<LlmTradeAdvisorService['getDecisionLoopStatus']>> {
     if (this.timer) {
       throw Object.assign(new Error('The LLM decision loop is already running.'), { statusCode: 400 });
     }
-    if (instruments.length === 0) {
-      throw Object.assign(new Error('At least one instrument is required to start the decision loop.'), {
-        statusCode: 400,
-      });
-    }
 
-    this.sessionStartPayload = { instruments: [...instruments] };
-    this.includedSymbols = instruments.map((instrument) => instrument.tradingsymbol);
-    this.book = instruments.some((instrument) => instrument.exchange === 'NFO') ? 'options' : 'equity';
-    this.lastQuotedPriceBySymbol = await this.fetchLiveLastPrices();
+    this.book = 'options';
+    this.decisionIndexes =
+      indexes && indexes.length > 0 ? [...indexes] : [...INDEX_OPTION_NAMES];
+    this.includedSymbols = [];
+    this.previousChainBySymbol = {};
+    const open = await findLatestOpenPosition();
+    if (open) {
+      this.includedSymbols = [open.symbol];
+      this.sessionStartPayload = {
+        instruments: [
+          {
+            instrumentToken: open.instrumentToken ?? 0,
+            exchange: 'NFO',
+            tradingsymbol: open.symbol,
+          },
+        ],
+      };
+    } else {
+      this.sessionStartPayload = { instruments: [] };
+    }
 
     const intervalMs = config.llm.decisionIntervalMinutes * 60_000;
     this.timer = setInterval(() => {
@@ -662,10 +686,10 @@ export class LlmTradeAdvisorService {
     this.logger.info(
       {
         intervalMinutes: config.llm.decisionIntervalMinutes,
-        symbols: this.includedSymbols,
-        book: this.book,
+        indexes: this.decisionIndexes,
+        openSymbol: open?.symbol ?? null,
       },
-      'Started LLM buy/hold/exit decision loop. Decisions are stored only; no broker orders.',
+      'Started live options decision loop (picks contract + action each cycle). Store-only.',
     );
 
     try {
@@ -686,335 +710,413 @@ export class LlmTradeAdvisorService {
   }
 
   public async runDecisionCycle(): Promise<number> {
-    if (this.includedSymbols.length === 0) {
-      this.logger.info('Skipping LLM decision cycle because no watchlist has been suggested yet.');
-      return 0;
-    }
-
-    const symbols = new Set(this.includedSymbols);
-    const snapshots = filterSnapshotsToSymbols(await readRecentQuoteSnapshots(), symbols);
-    const fromLog = lastPricesFromSnapshots(snapshots, this.includedSymbols);
-    const fromQuotes = await this.fetchLiveLastPrices();
-    this.lastQuotedPriceBySymbol = { ...fromQuotes };
-    const indexSpots = this.book === 'options' ? await this.fetchIndexSpots() : {};
-    const lastPriceBySymbol: Record<string, number | null> = {};
-    for (const symbol of this.includedSymbols) {
-      const listed = this.sessionStartPayload.instruments.find(
-        (instrument) => instrument.tradingsymbol === symbol,
-      );
-      const logged = fromLog[symbol];
-      const quoted = fromQuotes[symbol];
-      if (listed?.exchange === 'NFO') {
-        const index = indexNameFromOptionSymbol(symbol);
-        const spot = index ? (indexSpots[index] ?? null) : null;
-        lastPriceBySymbol[symbol] = isOptionPremium(quoted, spot)
-          ? (quoted ?? null)
-          : isOptionPremium(logged, spot)
-            ? (logged ?? null)
-            : null;
-        this.lastQuotedPriceBySymbol[symbol] = lastPriceBySymbol[symbol];
-      } else {
-        lastPriceBySymbol[symbol] =
-          quoted !== null && quoted !== undefined && Number.isFinite(quoted)
-            ? quoted
-            : logged ?? null;
-      }
-    }
-    const hasAnyPrice = this.includedSymbols.some((symbol) => {
-      const price = lastPriceBySymbol[symbol];
-      return price !== null && price !== undefined && Number.isFinite(price);
-    });
-    if (!hasAnyPrice) {
-      this.logger.info(
-        { symbols: this.includedSymbols, logPath: config.session.quoteLogPath },
-        'Skipping LLM decision cycle; no Kite quotes or JSONL last prices for the watchlist yet.',
-      );
-      return 0;
-    }
-
     const asOf = new Date();
     const asOfIst = formatIstTimestamp(asOf);
-    const latestBySymbol = await latestActionsForSymbols(this.includedSymbols);
-    const allowedRows = this.includedSymbols.map((symbol) => ({
-      symbol,
-      last: latestBySymbol[symbol]?.action ?? null,
-      allowed: allowedActionsForLatest(latestBySymbol[symbol]?.action ?? null),
-    }));
-    const allowedBySymbol = new Map(allowedRows.map((row) => [row.symbol, row.allowed]));
-    const priorBuyPriceBySymbol = Object.fromEntries(
-      this.includedSymbols.map((symbol) => [symbol, latestBySymbol[symbol]?.buyPrice ?? null]),
-    );
-    const tokenBySymbol = Object.fromEntries(
-      this.sessionStartPayload.instruments.map((instrument) => [
-        instrument.tradingsymbol,
-        instrument.instrumentToken,
-      ]),
-    );
-    const { news: decisionNews, newsByIndex } = await this.fetchDecisionIndexNews();
-    const playbook = await this.buildPlaybookSignals({
-      lastPriceBySymbol,
-      priorBuyPriceBySymbol,
-      allowedRows,
-      indexSpots,
-      newsByIndex,
-    });
-    const messages = buildDecisionMessages(
+    const openRow = await findLatestOpenPosition();
+    const openBuy =
+      openRow?.buyPrice !== null && openRow?.buyPrice !== undefined
+        ? Number(openRow.buyPrice)
+        : null;
+    const heldMinutes = openRow
+      ? Math.max(0, Math.floor((asOf.getTime() - openRow.decidedAt.getTime()) / 60_000))
+      : 0;
+    const allowed = openRow
+      ? (['HOLD', 'EXIT'] as const)
+      : (['BUY', 'SKIP'] as const);
+
+    const context = await this.buildLiveOptionContext({
+      asOf,
       asOfIst,
-      this.includedSymbols,
-      snapshots,
-      allowedRows,
-      playbook,
-      this.book,
-      decisionNews,
-    );
-    const completion = await this.completeWithRetry(messages, 'decision');
-    const filtered = filterDecisionsToSymbols(decisionBatchSchema.parse(completion.parsed), symbols);
-    const { batch: allowedBatch, dropped } = clampDecisionsToAllowed(filtered, allowedBySymbol);
-    if (dropped.length > 0) {
-      this.logger.warn(
-        { dropped },
-        'Dropped LLM decisions whose action was not in the allowed set for that symbol.',
-      );
-    }
-    const { batch, overrides } = applyPlaybookClamp(allowedBatch, playbook, allowedBySymbol);
-    if (overrides.length > 0) {
-      this.logger.warn({ overrides }, 'Overrode LLM actions that fought the candle playbook.');
+      open: openRow
+        ? {
+            symbol: openRow.symbol,
+            buyPrice: openBuy !== null && Number.isFinite(openBuy) ? openBuy : null,
+            heldMinutes,
+            instrumentToken: openRow.instrumentToken,
+          }
+        : null,
+      allowed: [...allowed],
+    });
+
+    if (context.chain.rows.length === 0 && !openRow) {
+      this.logger.info({ indexes: this.decisionIndexes }, 'Skipping decision cycle; empty option chain.');
+      return 0;
     }
 
-    const persistable = {
-      ...batch,
-      decisions: batch.decisions.filter((item) => {
-        const listed = this.sessionStartPayload.instruments.find(
-          (instrument) => instrument.tradingsymbol === item.symbol,
-        );
-        if (listed?.exchange !== 'NFO') {
-          return true;
-        }
-        return lastPriceBySymbol[item.symbol] !== null;
-      }),
-    };
-    const marketSnapshotBySymbol = Object.fromEntries(
-      persistable.decisions.map((item) => {
-        const signal = playbook.find((row) => row.symbol === item.symbol);
-        return [
-          item.symbol,
+    const messages = buildLiveOptionDecisionMessages(context);
+    const completion = await this.completeWithRetry(messages, 'decision');
+    const parsed = decisionBatchSchema.parse(completion.parsed);
+    const chainSymbols = new Set(context.chain.rows.map((row) => row.symbol));
+    if (openRow) {
+      chainSymbols.add(openRow.symbol);
+    }
+
+    let { batch, overrides } = clampLiveOptionDecision({
+      batch: parsed,
+      openSymbol: openRow?.symbol ?? null,
+      chainSymbols,
+      allowed: [...allowed],
+    });
+
+    const decision = batch.decisions[0];
+    if (!decision || decision.symbol === 'NONE') {
+      this.logger.info('Skipping persist; no usable LLM decision symbol.');
+      return 0;
+    }
+
+    const chainRow = context.chain.rows.find((row) => row.symbol === decision.symbol);
+    const ltp =
+      chainRow?.ltp ??
+      (decision.symbol === openRow?.symbol ? this.lastQuotedPriceBySymbol[decision.symbol] ?? null : null);
+
+    // Fee-aware BUY gate
+    if (decision.action === 'BUY' && ltp !== null && ltp > 0) {
+      const clears = buyClearsFeeTarget({
+        premium: ltp,
+        quantity: DEFAULT_INDEX_OPTION_LOT,
+        targetNetPnlPct: config.llm.targetNetPnlPct,
+      });
+      if (!clears) {
+        overrides = [
+          ...overrides,
+          { from: 'BUY', to: 'SKIP', reason: 'target net PnL does not clear estimated fees' },
+        ];
+        batch = {
+          ...batch,
+          decisions: [
+            {
+              ...decision,
+              action: 'SKIP',
+              rationale: `Fees block: ${decision.rationale}`.slice(0, 180),
+            },
+          ],
+        };
+      }
+    }
+
+    // Min-hold debounce: block EXIT unless high news or stop loss
+    const final = batch.decisions[0]!;
+    if (openRow && final.action === 'EXIT' && heldMinutes < config.llm.minHoldMinutes) {
+      const newsHigh = Object.values(context.newsRiskByIndex).some((risk) => risk?.level === 'high');
+      const entry = openBuy;
+      const stopHit =
+        entry !== null &&
+        ltp !== null &&
+        entry > 0 &&
+        ((ltp - entry) / entry) * 100 <= -OPTIONS_STOP_LOSS_PCT;
+      if (!newsHigh && !stopHit) {
+        overrides = [
+          ...overrides,
           {
-            algorithm: signal?.algorithm ?? this.algorithmsBySymbol[item.symbol] ?? null,
-            ltp: signal?.lastPrice ?? lastPriceBySymbol[item.symbol] ?? null,
-            spot: signal?.spot ?? null,
-            iv: signal?.iv ?? null,
-            delta: signal?.delta ?? null,
+            from: 'EXIT',
+            to: 'HOLD',
+            reason: `min hold ${heldMinutes}m < ${config.llm.minHoldMinutes}m`,
           },
         ];
-      }),
-    );
+        batch = {
+          ...batch,
+          decisions: [
+            {
+              ...final,
+              action: 'HOLD',
+              rationale: `Min hold: ${final.rationale}`.slice(0, 180),
+            },
+          ],
+        };
+      }
+    }
+
+    if (overrides.length > 0) {
+      this.logger.warn({ overrides }, 'Clamped live option decision.');
+    }
+
+    const storedDecision = batch.decisions[0]!;
+    const lastPriceBySymbol: Record<string, number | null> = {
+      [storedDecision.symbol]: ltp,
+    };
+    this.lastQuotedPriceBySymbol = { ...this.lastQuotedPriceBySymbol, ...lastPriceBySymbol };
+
+    const tokenBySymbol: Record<string, number | null> = {
+      [storedDecision.symbol]:
+        chainRow?.token ?? openRow?.instrumentToken ?? null,
+    };
+
+    const priorBuyPriceBySymbol: Record<string, string | null> = {
+      [storedDecision.symbol]: openRow?.buyPrice ?? null,
+    };
+
     const stored = await persistDecisions({
       asOf,
-      batch: persistable,
+      batch,
       lastPriceBySymbol,
       priorBuyPriceBySymbol,
       tokenBySymbol,
-      marketSnapshotBySymbol,
+      marketSnapshotBySymbol: {
+        [storedDecision.symbol]: {
+          pcr: context.chain.pcr,
+          newsRisk: context.newsRiskByIndex,
+          fees: context.fees,
+          heldMinutes,
+          ltp,
+        },
+      },
     });
 
+    this.applyDecisionState(storedDecision.action, storedDecision.symbol, tokenBySymbol[storedDecision.symbol] ?? null);
+
     this.logger.info(
-      { stored, symbols: batch.decisions.map((item) => `${item.symbol}:${item.action}`) },
-      'Stored LLM trade decisions in Postgres without executing them.',
+      {
+        stored,
+        symbol: storedDecision.symbol,
+        action: storedDecision.action,
+        indexes: this.decisionIndexes,
+      },
+      'Stored live LLM option decision without executing.',
     );
 
     return stored;
   }
 
-  private async buildPlaybookSignals(input: {
-    lastPriceBySymbol: Record<string, number | null>;
-    priorBuyPriceBySymbol: Record<string, string | null>;
-    indexSpots?: Partial<Record<IndexOptionName, number>>;
-    newsByIndex?: Partial<Record<IndexOptionName, OptionNewsRisk>>;
-    allowedRows: Array<{
-      symbol: string;
-      last: import('./schemas.js').LlmTradeActionName | null;
-      allowed: readonly import('./schemas.js').LlmTradeActionName[];
-    }>;
-  }): Promise<PlaybookSignal[]> {
+  private applyDecisionState(
+    action: string,
+    symbol: string,
+    token: number | null,
+  ): void {
+    if (action === 'BUY' || action === 'HOLD') {
+      this.includedSymbols = [symbol];
+      this.sessionStartPayload = {
+        instruments: [
+          {
+            instrumentToken: token && token > 0 ? token : 0,
+            exchange: 'NFO',
+            tradingsymbol: symbol,
+          },
+        ],
+      };
+      return;
+    }
+    if (action === 'EXIT') {
+      this.includedSymbols = [];
+      // Keep last instrument visible on status for operators.
+      return;
+    }
+    if (action === 'SKIP' && this.includedSymbols.length === 0) {
+      this.sessionStartPayload = { instruments: [] };
+    }
+  }
+
+  private async buildLiveOptionContext(input: {
+    asOf: Date;
+    asOfIst: string;
+    open: LiveOptionDecisionContext['open'];
+    allowed: LiveOptionDecisionContext['allowed'];
+  }): Promise<LiveOptionDecisionContext> {
+    const spots = await this.fetchIndexSpots();
+    const candles = await this.fetchIndexCandlePacks(this.decisionIndexes, spots);
+    const chain = await this.fetchLiveChainSnapshot(this.decisionIndexes, spots);
+    const { newsRiskByIndex, newsHeadlines } = await this.fetchLastHourIndexNews(this.decisionIndexes);
+
+    const samplePremium =
+      input.open?.buyPrice ??
+      chain.rows.find((row) => row.ltp !== null && row.ltp > 0)?.ltp ??
+      null;
+    const fees =
+      samplePremium !== null && samplePremium > 0
+        ? estimateOptionsRoundTripCost({
+            buyPremium: samplePremium,
+            sellPremium: samplePremium * (1 + config.llm.targetNetPnlPct / 100),
+            quantity: DEFAULT_INDEX_OPTION_LOT,
+          })
+        : null;
+
+    return {
+      asOfIst: input.asOfIst,
+      indexes: this.decisionIndexes,
+      candles,
+      chain,
+      newsRiskByIndex,
+      newsHeadlines,
+      open: input.open,
+      allowed: input.allowed,
+      fees,
+      targetNetPnlPct: config.llm.targetNetPnlPct,
+      minHoldMinutes: config.llm.minHoldMinutes,
+      candleLookbackMinutes: config.llm.candleLookbackMinutes,
+    };
+  }
+
+  private async fetchIndexCandlePacks(
+    indexes: readonly IndexOptionName[],
+    spots: Partial<Record<IndexOptionName, number>>,
+  ): Promise<IndexCandlePack[]> {
     const today = istYmd();
-    const fromYmd = addCalendarDays(today, -UNIVERSE_BAR_LOOKBACK_DAYS);
-    const hasNfo = this.sessionStartPayload.instruments.some((instrument) => instrument.exchange === 'NFO');
-    const hasNse = this.sessionStartPayload.instruments.some((instrument) => instrument.exchange !== 'NFO');
-
-    const knowledgeEquity = hasNse ? await readLatestKnowledge() : null;
-    const knowledgeOptions = hasNfo ? await readLatestKnowledge(undefined, 'options') : null;
-
-    let niftyDaily: DailyBar[] = knowledgeEquity?.symbols.NIFTYBEES?.bars ?? [];
-    if (hasNse && niftyDaily.length < 50) {
-      const niftyRef = findKiteInstrument('NIFTYBEES');
-      if (niftyRef) {
-        try {
-          niftyDaily = await this.kite.getDailyCandles(niftyRef.instrumentToken, fromYmd, today);
-        } catch (error: unknown) {
-          this.logger.warn({ err: error }, 'Kite daily historical for NIFTYBEES failed.');
-        }
-      }
-    }
-
-    const indexBars: Partial<Record<IndexOptionName, DailyBar[]>> = {};
-    if (hasNfo) {
-      for (const underlying of loadIndexUnderlyings()) {
-        const name = underlying.tradingsymbol as IndexOptionName;
-        let daily = knowledgeOptions?.symbols[name]?.bars ?? [];
-        if (daily.length < 50) {
-          try {
-            daily = await this.kite.getDailyCandles(underlying.instrumentToken, fromYmd, today);
-          } catch (error: unknown) {
-            this.logger.warn({ err: error, index: name }, 'Kite index daily historical failed for option playbook.');
-          }
-        }
-        indexBars[name] = daily;
-      }
-    }
-
-    const signals: PlaybookSignal[] = [];
-    for (const row of input.allowedRows) {
-      const listed = this.sessionStartPayload.instruments.find(
-        (instrument) => instrument.tradingsymbol === row.symbol,
-      );
-      const buyRaw = input.priorBuyPriceBySymbol[row.symbol];
-      const buyPrice = buyRaw === null || buyRaw === undefined ? null : Number(buyRaw);
-      const lastPrice = input.lastPriceBySymbol[row.symbol] ?? null;
-
-      if (listed?.exchange === 'NFO') {
-        const index = indexNameFromOptionSymbol(row.symbol);
-        const side = optionSideFromSymbol(row.symbol) ?? 'CE';
-        const indexDaily = index ? (indexBars[index] ?? []) : [];
-        const meta = this.optionContracts.find((contract) => contract.symbol === row.symbol);
-        const strike = meta?.strike ?? strikeFromOptionSymbol(row.symbol) ?? 0;
-        const expiryYmd = meta?.expiry ?? addCalendarDays(today, 30);
-        const algorithm =
-          this.algorithmsBySymbol[row.symbol] ?? meta?.algorithm ?? DEFAULT_GREEKS_IV_ALGORITHM;
-        const spot = index ? (input.indexSpots?.[index] ?? indexDaily.at(-1)?.c ?? null) : null;
-        signals.push(
-          evaluateGreeksIvPlaybook({
-            symbol: row.symbol,
-            side,
-            lastAction: row.last as import('./schemas.js').LlmTradeActionName | null,
-            allowed: row.allowed,
-            lastPrice,
-            buyPrice: buyPrice !== null && Number.isFinite(buyPrice) ? buyPrice : null,
-            indexDaily,
-            spot,
-            strike,
-            expiryYmd,
-            asOfYmd: today,
-            algorithm,
-            newsRisk: index ? (input.newsByIndex?.[index] ?? null) : null,
-          }),
-        );
-        continue;
-      }
-
-      const catalogRef = findKiteInstrument(row.symbol);
-      const token = listed?.instrumentToken ?? catalogRef?.instrumentToken;
-      let daily = knowledgeEquity?.symbols[row.symbol]?.bars ?? [];
-      if (daily.length < 50 && token) {
-        try {
-          daily = await this.kite.getDailyCandles(token, fromYmd, today);
-        } catch (error: unknown) {
-          this.logger.warn({ err: error, symbol: row.symbol }, 'Kite daily historical failed for playbook.');
-        }
-      }
-      let minutes15: IntradayBar[] = [];
-      if (token) {
-        try {
-          minutes15 = await this.kite.getFifteenMinuteCandles(token, today);
-        } catch (error: unknown) {
-          this.logger.warn({ err: error, symbol: row.symbol }, 'Kite 15-minute historical failed for playbook.');
-        }
-      }
-      signals.push(
-        evaluatePlaybook({
-          symbol: row.symbol,
-          lastAction: row.last as import('./schemas.js').LlmTradeActionName | null,
-          allowed: row.allowed,
-          lastPrice,
-          buyPrice: buyPrice !== null && Number.isFinite(buyPrice) ? buyPrice : null,
-          daily,
-          niftyDaily,
-          minutes15,
-        }),
-      );
-    }
-    return signals;
-  }
-
-  private async fetchLiveLastPrices(): Promise<Record<string, number | null>> {
-    const keys = this.sessionStartPayload.instruments.map(
-      (instrument) => `${instrument.exchange}:${instrument.tradingsymbol}`,
-    );
-    if (keys.length === 0) {
-      return {};
-    }
-    try {
-      const quotes = await this.kite.getQuotes(keys);
-      const out: Record<string, number | null> = {};
-      for (const instrument of this.sessionStartPayload.instruments) {
-        const quote =
-          quotes[`${instrument.exchange}:${instrument.tradingsymbol}`] ?? quotes[instrument.tradingsymbol];
-        out[instrument.tradingsymbol] =
-          quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : null;
-      }
-      return out;
-    } catch (error: unknown) {
-      this.logger.warn({ err: error }, 'Kite getQuotes failed for the decision cycle.');
-      return {};
-    }
-  }
-
-  private async fetchDecisionIndexNews(): Promise<{
-    news: SymbolNews[];
-    newsByIndex: Partial<Record<IndexOptionName, OptionNewsRisk>>;
-  }> {
-    if (this.book !== 'options') {
-      return { news: [], newsByIndex: {} };
-    }
-    const indexes = new Set<IndexOptionName>();
-    for (const symbol of this.includedSymbols) {
-      const index = indexNameFromOptionSymbol(symbol);
-      if (index) {
-        indexes.add(index);
-      }
-    }
-    if (indexes.size === 0) {
-      return { news: [], newsByIndex: {} };
-    }
     const underlyings = loadIndexUnderlyings().filter((row) =>
-      indexes.has(row.tradingsymbol as IndexOptionName),
+      indexes.includes(row.tradingsymbol as IndexOptionName),
     );
-    const today = istYmd();
-    const fromYmd = addCalendarDays(today, -OPTIONS_NEWS_LOOKBACK_DAYS);
+    const lookbackMinutes =
+      Number.isFinite(config.llm.candleLookbackMinutes) && config.llm.candleLookbackMinutes > 0
+        ? config.llm.candleLookbackMinutes
+        : 60;
+    const lookbackMs = lookbackMinutes * 60_000;
+    const now = Date.now();
+    const toIst = formatIstWallClock(new Date(now));
+    const fromIst = formatIstWallClock(new Date(now - lookbackMs));
+    const weekFrom = addCalendarDays(today, -7);
+    const monthFrom = addCalendarDays(today, -30);
+    const packs: IndexCandlePack[] = [];
+
+    for (const row of underlyings) {
+      const index = row.tradingsymbol as IndexOptionName;
+      let minute: IntradayBar[] = [];
+      let session15: IntradayBar[] = [];
+      let weekDaily: DailyBar[] = [];
+      let monthDaily: DailyBar[] = [];
+      try {
+        minute = await this.kite.getMinuteCandles(row.instrumentToken, fromIst, toIst);
+      } catch (error: unknown) {
+        this.logger.warn({ err: error, index }, 'Minute candles failed.');
+      }
+      try {
+        session15 = await this.kite.getFifteenMinuteCandles(row.instrumentToken, today);
+      } catch (error: unknown) {
+        this.logger.warn({ err: error, index }, 'Session 15m candles failed.');
+      }
+      try {
+        weekDaily = await this.kite.getDailyCandles(row.instrumentToken, weekFrom, today);
+      } catch (error: unknown) {
+        this.logger.warn({ err: error, index }, 'Week dailies failed.');
+      }
+      try {
+        monthDaily = await this.kite.getDailyCandles(row.instrumentToken, monthFrom, today);
+      } catch (error: unknown) {
+        this.logger.warn({ err: error, index }, 'Month dailies failed.');
+      }
+
+      const dayCloses = session15.map((bar) => bar.c);
+      const weekCloses = weekDaily.map((bar) => bar.c);
+      const monthCloses = monthDaily.map((bar) => bar.c);
+      packs.push({
+        index,
+        spot: spots[index] ?? null,
+        minute,
+        session15,
+        weekDaily,
+        monthDaily,
+        trend: {
+          day: trendFromCloses(dayCloses.length >= 3 ? dayCloses : minute.map((bar) => bar.c)),
+          week: trendFromCloses(weekCloses),
+          month: trendFromCloses(monthCloses),
+        },
+        structure: structureNotesFromBars(
+          session15.length >= 4 ? session15 : minute.length >= 4 ? minute : monthDaily,
+        ),
+      });
+    }
+    return packs;
+  }
+
+  private async fetchLiveChainSnapshot(
+    indexes: readonly IndexOptionName[],
+    spots: Partial<Record<IndexOptionName, number>>,
+  ): Promise<ChainSnapshot> {
+    let contracts: Awaited<ReturnType<KiteBroker['getNfoIndexOptions']>> = [];
+    try {
+      contracts = await this.kite.getNfoIndexOptions({
+        names: indexes,
+        spots,
+      });
+    } catch (error: unknown) {
+      this.logger.warn({ err: error }, 'NFO chain fetch failed for decision cycle.');
+      return { rows: [], pcr: null, ceOi: 0, peOi: 0 };
+    }
+
+    const keys = contracts.map((contract) => `NFO:${contract.tradingsymbol}`);
+    let quotes: Awaited<ReturnType<KiteBroker['getQuotes']>> = {};
+    if (keys.length > 0) {
+      try {
+        quotes = await this.kite.getQuotes(keys);
+      } catch (error: unknown) {
+        this.logger.warn({ err: error }, 'Option chain quotes failed.');
+      }
+    }
+
+    const rows: ChainQuoteRow[] = [];
+    let ceOi = 0;
+    let peOi = 0;
+    const nextPrev: Record<string, { oi: number; volume: number }> = {};
+
+    for (const contract of contracts) {
+      const quote =
+        quotes[`NFO:${contract.tradingsymbol}`] ??
+        quotes[`NFO:${contract.tradingsymbol}`.toUpperCase()] ??
+        quotes[contract.tradingsymbol];
+      const oi = quote?.oi ?? 0;
+      const volume = quote?.volume ?? 0;
+      const prev = this.previousChainBySymbol[contract.tradingsymbol];
+      const dOi = prev ? oi - prev.oi : null;
+      const dVolume = prev ? volume - prev.volume : null;
+      if (contract.instrumentType === 'CE') {
+        ceOi += oi;
+      } else {
+        peOi += oi;
+      }
+      nextPrev[contract.tradingsymbol] = { oi, volume };
+      rows.push({
+        symbol: contract.tradingsymbol,
+        index: contract.name,
+        side: contract.instrumentType,
+        strike: contract.strike,
+        expiry: contract.expiry,
+        token: contract.instrumentToken,
+        ltp: quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : null,
+        oi,
+        volume,
+        dOi,
+        dVolume,
+      });
+    }
+
+    this.previousChainBySymbol = nextPrev;
+    const pcr = ceOi > 0 ? Number((peOi / ceOi).toFixed(4)) : null;
+    return { rows, pcr, ceOi, peOi };
+  }
+
+  private async fetchLastHourIndexNews(indexes: readonly IndexOptionName[]): Promise<{
+    newsRiskByIndex: Partial<Record<IndexOptionName, OptionNewsRisk>>;
+    newsHeadlines: Array<{ s: string; t: string }>;
+  }> {
+    const underlyings = loadIndexUnderlyings().filter((row) =>
+      indexes.includes(row.tradingsymbol as IndexOptionName),
+    );
+    const to = new Date();
+    const from = new Date(to.getTime() - 2 * 60 * 60 * 1000);
+    const newsRiskByIndex: Partial<Record<IndexOptionName, OptionNewsRisk>> = {};
+    const newsHeadlines: Array<{ s: string; t: string }> = [];
     try {
       const news = await this.news.fetchIndexNews(
         underlyings.map((row) => ({ symbol: row.tradingsymbol, query: row.googleQuery })),
-        ymdToUtcDate(fromYmd),
-        ymdToUtcDate(today),
+        from,
+        to,
       );
-      const newsByIndex: Partial<Record<IndexOptionName, OptionNewsRisk>> = {};
+      const cutoff = Date.now() - 60 * 60 * 1000;
       for (const entry of news) {
         const name = entry.symbol.toUpperCase() as IndexOptionName;
-        newsByIndex[name] = scoreOptionNewsRisk(entry.items);
+        const recent = entry.items.filter((item) => {
+          if (!item.publishedAt) {
+            return true;
+          }
+          const parsed = Date.parse(item.publishedAt);
+          return Number.isFinite(parsed) ? parsed >= cutoff : true;
+        });
+        newsRiskByIndex[name] = scoreOptionNewsRisk(recent);
+        for (const item of recent.slice(0, 4)) {
+          newsHeadlines.push({ s: name, t: item.title.slice(0, 120) });
+        }
       }
-      this.logger.info(
-        {
-          indexes: [...indexes],
-          levels: Object.fromEntries(
-            Object.entries(newsByIndex).map(([key, value]) => [key, value?.level ?? 'none']),
-          ),
-        },
-        'Scored index news risk for options decision cycle.',
-      );
-      return { news, newsByIndex };
     } catch (error: unknown) {
-      this.logger.warn({ err: error }, 'Index news fetch failed for decision cycle; fail-open to none.');
-      return { news: [], newsByIndex: {} };
+      this.logger.warn({ err: error }, 'Last-hour index news failed; fail-open.');
     }
+    return { newsRiskByIndex, newsHeadlines };
   }
 
   private async fetchIndexSpots(): Promise<Partial<Record<IndexOptionName, number>>> {

@@ -6,6 +6,16 @@ export const universeBookBodySchema = z.object({
   book: z.enum(['equity', 'options']),
 });
 
+export const decisionIndexesBodySchema = z.object({
+  indexes: z
+    .array(z.enum(['NIFTY', 'BANKNIFTY', 'FINNIFTY']))
+    .min(1)
+    .max(3)
+    .optional(),
+});
+
+export type DecisionIndexesBody = z.infer<typeof decisionIndexesBodySchema>;
+
 export const greeksIvAlgorithmSchema = z.enum(GREEKS_IV_ALGORITHMS);
 export type GreeksIvAlgorithmName = z.infer<typeof greeksIvAlgorithmSchema>;
 
@@ -168,4 +178,85 @@ export function clampDecisionsToAllowed(
     kept.push(item);
   }
   return { batch: { ...batch, decisions: kept }, dropped };
+}
+
+/**
+ * Single-pick live options clamp: one open position, chain allowlist, flat vs in-position actions.
+ */
+export function clampLiveOptionDecision(input: {
+  batch: DecisionBatch;
+  openSymbol: string | null;
+  chainSymbols: ReadonlySet<string>;
+  allowed: readonly LlmTradeActionName[];
+}): {
+  batch: DecisionBatch;
+  overrides: Array<{ from: string; to: string; reason: string }>;
+} {
+  const overrides: Array<{ from: string; to: string; reason: string }> = [];
+  const first = input.batch.decisions[0];
+  if (!first) {
+    return {
+      batch: {
+        ...input.batch,
+        decisions: [
+          {
+            symbol: input.openSymbol ?? 'NONE',
+            action: input.openSymbol ? 'HOLD' : 'SKIP',
+            rationale: 'No LLM decision; defaulted.',
+          },
+        ],
+      },
+      overrides: [{ from: 'missing', to: input.openSymbol ? 'HOLD' : 'SKIP', reason: 'empty decisions' }],
+    };
+  }
+
+  let symbol = first.symbol;
+  let action = first.action;
+  let rationale = first.rationale;
+
+  if (input.openSymbol) {
+    if (symbol !== input.openSymbol) {
+      overrides.push({
+        from: `${symbol}:${action}`,
+        to: `${input.openSymbol}:${action === 'BUY' ? 'HOLD' : action}`,
+        reason: 'one-position: force open symbol',
+      });
+      symbol = input.openSymbol;
+    }
+    if (action === 'BUY' || action === 'SKIP') {
+      overrides.push({
+        from: action,
+        to: 'HOLD',
+        reason: 'one-position: flat actions blocked while open',
+      });
+      action = 'HOLD';
+      rationale = `Open position: ${rationale}`.slice(0, 180);
+    }
+    if (!input.allowed.includes(action)) {
+      action = 'HOLD';
+    }
+  } else {
+    if (action === 'HOLD' || action === 'EXIT') {
+      overrides.push({ from: action, to: 'SKIP', reason: 'flat: only BUY/SKIP' });
+      action = 'SKIP';
+      rationale = `Flat book: ${rationale}`.slice(0, 180);
+    }
+    if (action === 'BUY' && !input.chainSymbols.has(symbol)) {
+      overrides.push({ from: `BUY:${symbol}`, to: 'SKIP', reason: 'symbol not in live chain' });
+      action = 'SKIP';
+      rationale = `Symbol not in chain: ${rationale}`.slice(0, 180);
+      symbol = [...input.chainSymbols][0] ?? symbol;
+    }
+    if (!input.allowed.includes(action)) {
+      action = 'SKIP';
+    }
+  }
+
+  return {
+    batch: {
+      ...input.batch,
+      decisions: [{ symbol, action, rationale, confidence: first.confidence }],
+    },
+    overrides,
+  };
 }

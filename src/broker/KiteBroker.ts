@@ -488,9 +488,29 @@ export class KiteBroker implements BrokerAdapter {
     });
   }
 
+  /** Minute bars between IST wall-clock datetimes (`YYYY-MM-DD HH:mm:ss`). */
+  public async getMinuteCandles(
+    instrumentToken: number,
+    fromIst: string,
+    toIst: string,
+  ): Promise<IntradayBar[]> {
+    const rows = await this.fetchHistorical(instrumentToken, 'minute', fromIst, toIst);
+    return rows.map((row) => {
+      const date = row.date instanceof Date ? row.date : new Date(String(row.date));
+      return {
+        t: date.toISOString(),
+        o: row.open,
+        h: row.high,
+        l: row.low,
+        c: row.close,
+        v: row.volume,
+      };
+    });
+  }
+
   private async fetchHistorical(
     instrumentToken: number,
-    interval: 'day' | '15minute',
+    interval: 'day' | '15minute' | 'minute',
     from: string,
     to: string,
   ) {
