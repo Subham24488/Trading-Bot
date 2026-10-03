@@ -7,12 +7,13 @@ import { compactPlaybookForPrompt, type PlaybookSignal } from './tradePlaybook.j
 import {
   compactCandlesForPrompt,
   compactChainForPrompt,
+  compactTapeForPrompt,
   type LiveOptionDecisionContext,
 } from './decisionContext.js';
 
 /** Keep completion small so input+output stays under typical 40k context. */
 export const UNIVERSE_MAX_OUTPUT_TOKENS = 700;
-export const DECISION_MAX_OUTPUT_TOKENS = 400;
+export const DECISION_MAX_OUTPUT_TOKENS = 800;
 
 const MAX_NEWS_ROWS = 48;
 const MAX_HEADLINES_PER_SYMBOL = 3;
@@ -355,10 +356,13 @@ export function buildLiveOptionDecisionMessages(
       content:
         'NSE index-options desk, store-only. Each cycle pick exactly ONE decision. ' +
         'Choose symbol from chain.rows[].s (or the open symbol when in a position). ' +
-        'Action must be one of opts. SELL means EXIT. Prefer SKIP when trends conflict, newsRisk is high, or edge is weak. ' +
-        'Do not open a second position. Respect minHoldMinutes and fee targetNetPnlPct. ' +
-        'Use candles (day/week/month trend + structure), chain OI/dOi/PCR/volume, and news. ' +
-        'JSON only: {decisions:[{symbol,action,rationale}]}. One row. Rationale ≤16 words. No live orders. /no_think',
+        'Action must be one of opts. SELL means EXIT. Prefer SKIP/HOLD when tape.confluence < 2 or pattern is none. ' +
+        'Trend is context only — never pick CE vs PE from day/week/month trend alone; confirm with tape.pattern and last 1-3 candles. Same-day reversal is allowed. ' +
+        'Do not BUY on mixed swings only. Do not open a second position. Respect minHoldMinutes and fee targetNetPnlPct. ' +
+        'Never claim target achieved on a loss. Never claim news risk when news=none. ' +
+        'JSON only: {decisions:[{symbol,action,rationale}]}. One row. ' +
+        'rationale MUST be: trend=…; structure=…; pattern=…; candle1to3=…; chain=…; news=…; decision=…; why=… ' +
+        'No live orders. /no_think',
     },
     {
       role: 'user',
@@ -378,6 +382,7 @@ export function buildLiveOptionDecisionMessages(
         fees: context.fees,
         newsRisk: context.newsRiskByIndex,
         news: context.newsHeadlines.slice(0, 12),
+        tape: compactTapeForPrompt(context.tape),
         candles: context.candles.map(compactCandlesForPrompt),
         chain: compactChainForPrompt(context.chain),
       }),

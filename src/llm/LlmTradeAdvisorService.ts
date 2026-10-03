@@ -39,7 +39,9 @@ import { diversifyByCorrelation, screenUniverse, UNIVERSE_MAX_INCLUDES } from '.
 import type { DailyBar, IntradayBar } from '../universe/types.js';
 import {
   INDEX_OPTION_NAMES,
+  indexNameFromOptionSymbol,
   loadIndexUnderlyings,
+  optionSideFromSymbol,
   type IndexOptionName,
 } from '../instruments/kiteIndexUnderlyings.js';
 import {
@@ -65,8 +67,14 @@ import {
 } from '../options/greeksIv.js';
 import type { NewsService } from '../news/NewsService.js';
 import type { UniverseBook } from '../universe/types.js';
+import { isInsideMarketWindow } from '../services/MarketDataSessionService.js';
 import {
+  buildDecisionTape,
   formatIstWallClock,
+  formatStructuredRationale,
+  isNearOrAfterSessionClose,
+  isWeakTape,
+  sanitizeExitWhy,
   structureNotesFromBars,
   trendFromCloses,
   type ChainQuoteRow,
@@ -743,6 +751,37 @@ export class LlmTradeAdvisorService {
       return 0;
     }
 
+    const forceFlat = !isInsideMarketWindow(asOf) || isNearOrAfterSessionClose(asOf);
+    if (forceFlat && !openRow) {
+      const skipBatch = {
+        decisions: [
+          {
+            symbol: context.chain.rows[0]?.symbol ?? 'NONE',
+            action: 'SKIP' as const,
+            rationale: formatStructuredRationale({
+              tape: context.tape,
+              decision: 'SKIP',
+              why: 'session close or outside market window; no new overnight risk',
+            }),
+          },
+        ],
+      };
+      if (skipBatch.decisions[0]!.symbol === 'NONE') {
+        return 0;
+      }
+      const stored = await persistDecisions({
+        asOf,
+        batch: skipBatch,
+        lastPriceBySymbol: { [skipBatch.decisions[0]!.symbol]: context.chain.rows[0]?.ltp ?? null },
+        tokenBySymbol: { [skipBatch.decisions[0]!.symbol]: context.chain.rows[0]?.token ?? null },
+        marketSnapshotBySymbol: {
+          [skipBatch.decisions[0]!.symbol]: { tape: context.tape, sessionFlat: true },
+        },
+      });
+      this.logger.info({ stored }, 'Stored SKIP for session-flat / no overnight.');
+      return stored;
+    }
+
     const messages = buildLiveOptionDecisionMessages(context);
     const completion = await this.completeWithRetry(messages, 'decision');
     const parsed = decisionBatchSchema.parse(completion.parsed);
@@ -768,9 +807,47 @@ export class LlmTradeAdvisorService {
     const ltp =
       chainRow?.ltp ??
       (decision.symbol === openRow?.symbol ? this.lastQuotedPriceBySymbol[decision.symbol] ?? null : null);
+    const buySide = optionSideFromSymbol(decision.symbol);
+    const newsForIndex = (() => {
+      const index = indexNameFromOptionSymbol(decision.symbol) ?? context.tape.index;
+      return index ? (context.newsRiskByIndex[index]?.level ?? 'none') : context.tape.newsLevel;
+    })();
 
-    // Fee-aware BUY gate
-    if (decision.action === 'BUY' && ltp !== null && ltp > 0) {
+    if (forceFlat && openRow) {
+      overrides = [...overrides, { from: decision.action, to: 'EXIT', reason: 'session close; no overnight' }];
+      batch = {
+        ...batch,
+        decisions: [{ ...decision, action: 'EXIT', rationale: decision.rationale }],
+      };
+    }
+
+    let working = batch.decisions[0]!;
+
+    if (!openRow && working.action === 'BUY' && isWeakTape(context.tape)) {
+      overrides = [...overrides, { from: 'BUY', to: 'SKIP', reason: 'weak tape; confluence < 2 or mixed swings' }];
+      working = { ...working, action: 'SKIP' };
+    }
+
+    if (
+      !openRow &&
+      working.action === 'BUY' &&
+      context.tape.sideFromCandles &&
+      buySide &&
+      buySide !== context.tape.sideFromCandles
+    ) {
+      overrides = [
+        ...overrides,
+        { from: `BUY:${buySide}`, to: 'SKIP', reason: 'CE/PE disagrees with last 1-3 candle pattern' },
+      ];
+      working = { ...working, action: 'SKIP' };
+    }
+
+    if (!openRow && working.action === 'BUY' && newsForIndex === 'high') {
+      overrides = [...overrides, { from: 'BUY', to: 'SKIP', reason: 'high event news' }];
+      working = { ...working, action: 'SKIP' };
+    }
+
+    if (working.action === 'BUY' && ltp !== null && ltp > 0) {
       const clears = buyClearsFeeTarget({
         premium: ltp,
         quantity: DEFAULT_INDEX_OPTION_LOT,
@@ -781,29 +858,18 @@ export class LlmTradeAdvisorService {
           ...overrides,
           { from: 'BUY', to: 'SKIP', reason: 'target net PnL does not clear estimated fees' },
         ];
-        batch = {
-          ...batch,
-          decisions: [
-            {
-              ...decision,
-              action: 'SKIP',
-              rationale: `Fees block: ${decision.rationale}`.slice(0, 180),
-            },
-          ],
-        };
+        working = { ...working, action: 'SKIP' };
       }
     }
 
-    // Min-hold debounce: block EXIT unless high news or stop loss
-    const final = batch.decisions[0]!;
-    if (openRow && final.action === 'EXIT' && heldMinutes < config.llm.minHoldMinutes) {
-      const newsHigh = Object.values(context.newsRiskByIndex).some((risk) => risk?.level === 'high');
-      const entry = openBuy;
-      const stopHit =
-        entry !== null &&
-        ltp !== null &&
-        entry > 0 &&
-        ((ltp - entry) / entry) * 100 <= -OPTIONS_STOP_LOSS_PCT;
+    const pnlPct =
+      openBuy !== null && openBuy > 0 && ltp !== null && Number.isFinite(ltp)
+        ? ((ltp - openBuy) / openBuy) * 100
+        : null;
+    const stopHit = pnlPct !== null && pnlPct <= -OPTIONS_STOP_LOSS_PCT;
+
+    if (openRow && working.action === 'EXIT' && !forceFlat && heldMinutes < config.llm.minHoldMinutes) {
+      const newsHigh = newsForIndex === 'high';
       if (!newsHigh && !stopHit) {
         overrides = [
           ...overrides,
@@ -813,18 +879,38 @@ export class LlmTradeAdvisorService {
             reason: `min hold ${heldMinutes}m < ${config.llm.minHoldMinutes}m`,
           },
         ];
-        batch = {
-          ...batch,
-          decisions: [
-            {
-              ...final,
-              action: 'HOLD',
-              rationale: `Min hold: ${final.rationale}`.slice(0, 180),
-            },
-          ],
-        };
+        working = { ...working, action: 'HOLD' };
       }
     }
+
+    const llmWhy = working.rationale;
+    let why =
+      working.action === 'EXIT'
+        ? sanitizeExitWhy({
+            why: llmWhy,
+            pnlPct,
+            targetNetPnlPct: config.llm.targetNetPnlPct,
+            newsLevel: newsForIndex,
+          })
+        : working.action === 'SKIP' && isWeakTape(context.tape)
+          ? 'weak confluence; mixed swings or unconfirmed candles'
+          : llmWhy;
+    if (forceFlat && working.action === 'EXIT') {
+      why = 'session close; flatten same day';
+    }
+    if (stopHit && working.action === 'EXIT') {
+      why = `premium stop ${pnlPct?.toFixed(1)}%`;
+    }
+
+    working = {
+      ...working,
+      rationale: formatStructuredRationale({
+        tape: context.tape,
+        decision: working.action,
+        why,
+      }),
+    };
+    batch = { ...batch, decisions: [working] };
 
     if (overrides.length > 0) {
       this.logger.warn({ overrides }, 'Clamped live option decision.');
@@ -858,6 +944,8 @@ export class LlmTradeAdvisorService {
           fees: context.fees,
           heldMinutes,
           ltp,
+          tape: context.tape,
+          pnlPct,
         },
       },
     });
@@ -929,6 +1017,20 @@ export class LlmTradeAdvisorService {
           })
         : null;
 
+    const focusIndex =
+      (input.open?.symbol ? indexNameFromOptionSymbol(input.open.symbol) : null) ??
+      this.decisionIndexes[0] ??
+      null;
+    const pack = candles.find((row) => row.index === focusIndex) ?? candles[0];
+    const newsLevel = focusIndex ? newsRiskByIndex[focusIndex]?.level : undefined;
+    const preferredSide = input.open?.symbol ? optionSideFromSymbol(input.open.symbol) : null;
+    const tape = buildDecisionTape({
+      pack,
+      chain,
+      newsLevel,
+      preferredSide,
+    });
+
     return {
       asOfIst: input.asOfIst,
       indexes: this.decisionIndexes,
@@ -942,6 +1044,7 @@ export class LlmTradeAdvisorService {
       targetNetPnlPct: config.llm.targetNetPnlPct,
       minHoldMinutes: config.llm.minHoldMinutes,
       candleLookbackMinutes: config.llm.candleLookbackMinutes,
+      tape,
     };
   }
 

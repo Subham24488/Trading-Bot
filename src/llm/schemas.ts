@@ -68,7 +68,7 @@ export const decisionItemSchema = z.object({
   symbol: z.string().trim().min(1).transform((value) => value.toUpperCase()),
   action: rawActionSchema,
   confidence: z.number().min(0).max(1).optional(),
-  rationale: z.string().trim().min(1),
+  rationale: z.string().trim().min(1).max(4000),
 });
 
 export const decisionBatchSchema = z.object({
@@ -230,7 +230,7 @@ export function clampLiveOptionDecision(input: {
         reason: 'one-position: flat actions blocked while open',
       });
       action = 'HOLD';
-      rationale = `Open position: ${rationale}`.slice(0, 180);
+      rationale = `Open position: ${rationale}`;
     }
     if (!input.allowed.includes(action)) {
       action = 'HOLD';
@@ -239,12 +239,12 @@ export function clampLiveOptionDecision(input: {
     if (action === 'HOLD' || action === 'EXIT') {
       overrides.push({ from: action, to: 'SKIP', reason: 'flat: only BUY/SKIP' });
       action = 'SKIP';
-      rationale = `Flat book: ${rationale}`.slice(0, 180);
+      rationale = `Flat book: ${rationale}`;
     }
     if (action === 'BUY' && !input.chainSymbols.has(symbol)) {
       overrides.push({ from: `BUY:${symbol}`, to: 'SKIP', reason: 'symbol not in live chain' });
       action = 'SKIP';
-      rationale = `Symbol not in chain: ${rationale}`.slice(0, 180);
+      rationale = `Symbol not in chain: ${rationale}`;
       symbol = [...input.chainSymbols][0] ?? symbol;
     }
     if (!input.allowed.includes(action)) {
