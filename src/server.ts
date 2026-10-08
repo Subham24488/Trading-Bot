@@ -22,6 +22,8 @@ import { NewsService } from './news/NewsService.js';
 import { getCatalogTradingsymbols } from './instruments/kiteInstruments.js';
 import { parseSessionStartBody } from './session/sessionStartSchema.js';
 import { decisionIndexesBodySchema, universeBookBodySchema } from './llm/schemas.js';
+import { reviewTradingSessions } from './llm/sessionReview.js';
+import { applyDecisionUpdates } from './llm/appliedDecisionUpdates.js';
 
 const application = Fastify({ logger: { level: config.logLevel } });
 application.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) => {
@@ -474,6 +476,59 @@ application.get(
 //   await requireAdmin(request);
 //   return tradingService.runDailyCycle();
 // });
+
+application.post(
+  '/trading/session-review',
+  {
+    schema: {
+      tags: ['trading'],
+      summary: 'Review stored LLM decisions for a date range. Does not change the decision loop.',
+      security: [{ adminToken: [] }],
+      body: {
+        type: 'object',
+        required: ['startDate', 'endDate'],
+        properties: {
+          startDate: { type: 'string' },
+          endDate: { type: 'string' },
+        },
+      },
+    },
+  },
+  async (request) => {
+    await requireAdmin(request);
+    const body = request.body as { startDate?: unknown; endDate?: unknown };
+    if (typeof body?.startDate !== 'string' || typeof body?.endDate !== 'string') {
+      throw Object.assign(new Error('startDate and endDate are required.'), { statusCode: 400 });
+    }
+    return reviewTradingSessions(body.startDate, body.endDate);
+  },
+);
+
+application.post(
+  '/trading/apply-suggested-updates',
+  {
+    schema: {
+      tags: ['trading'],
+      summary: 'Turn on cited decision-gate fixes. Absent ids leave the live loop unchanged.',
+      security: [{ adminToken: [] }],
+      body: {
+        type: 'object',
+        required: ['ids'],
+        properties: {
+          ids: { type: 'array', minItems: 1, items: { type: 'string' } },
+        },
+      },
+    },
+  },
+  async (request) => {
+    await requireAdmin(request);
+    const body = request.body as { ids?: unknown };
+    if (!Array.isArray(body?.ids) || body.ids.some((id) => typeof id !== 'string')) {
+      throw Object.assign(new Error('ids must be a non-empty string array.'), { statusCode: 400 });
+    }
+    return applyDecisionUpdates(body.ids);
+  },
+);
 
 application.addHook('onClose', async () => {
   llmAdvisor.stop();
