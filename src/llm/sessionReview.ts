@@ -1,13 +1,21 @@
 import type { LlmTradeAction } from '@prisma/client';
 
 import { database } from '../database.js';
-import type { AppliedUpdateId } from './appliedDecisionUpdates.js';
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 
+type UpdateId = 'chain-dvol' | 'pattern-side' | 'exit-facts' | 'flat-1520';
+
+const PROMPT_LINES: Record<UpdateId, string> = {
+  'chain-dvol': 'chain-dvol: chainConfluence ok = PCR band OR signed dOI. Remove dVol>0.',
+  'pattern-side': 'pattern-side: isWeakTape true unless pattern!=none AND candle side==CE/PE.',
+  'exit-facts': 'exit-facts: EXIT why is only "premium stop"|"session close"|"structure flip" from pnl and clock.',
+  'flat-1520': 'flat-1520: weekday flat at 15:20 IST, not SESSION_END_HOUR-1.',
+};
+
 const SUGGESTIONS: Record<
-  AppliedUpdateId,
-  { id: AppliedUpdateId; what: string; why: string; expectedEffect: string; source: string }
+  UpdateId,
+  { id: UpdateId; what: string; why: string; expectedEffect: string; source: string }
 > = {
   'chain-dvol': {
     id: 'chain-dvol',
@@ -55,9 +63,18 @@ export type SessionReviewMistake = {
 export type SessionReviewResult = {
   sessionsReviewed: Array<{ date: string; decisionCount: number }>;
   mistakes: SessionReviewMistake[];
-  rootCauses: Array<{ id: AppliedUpdateId; where: string; detail: string }>;
-  suggestedUpdates: Array<(typeof SUGGESTIONS)[AppliedUpdateId]>;
+  rootCauses: Array<{ id: UpdateId; where: string; detail: string }>;
+  suggestedUpdates: Array<(typeof SUGGESTIONS)[UpdateId]>;
+  suggestedUpdatesPrompt: string;
 };
+
+function suggestedUpdatesPrompt(ids: readonly UpdateId[]): string {
+  if (ids.length === 0) {
+    return '';
+  }
+  const lines = ids.map((id) => PROMPT_LINES[id]);
+  return `Implement only these gates. Do not change other routes.\n${lines.join('\n')}\nReturn a minimal diff. No tests.`;
+}
 
 type ReviewRow = {
   decidedAt: Date;
@@ -188,7 +205,7 @@ export async function reviewTradingSessions(startDate: string, endDate: string):
     }
   }
 
-  const causeIds = new Set<AppliedUpdateId>();
+  const causeIds = new Set<UpdateId>();
   const mistakes: SessionReviewMistake[] = [];
 
   for (const row of rows) {
@@ -278,10 +295,12 @@ export async function reviewTradingSessions(startDate: string, endDate: string):
     return { id, where, detail: SUGGESTIONS[id].why };
   });
 
+  const suggestedUpdates = [...causeIds].map((id) => SUGGESTIONS[id]);
   return {
     sessionsReviewed: [...byDate.entries()].map(([date, decisionCount]) => ({ date, decisionCount })),
     mistakes,
     rootCauses,
-    suggestedUpdates: [...causeIds].map((id) => SUGGESTIONS[id]),
+    suggestedUpdates,
+    suggestedUpdatesPrompt: suggestedUpdatesPrompt([...causeIds]),
   };
 }

@@ -68,13 +68,11 @@ import {
 import type { NewsService } from '../news/NewsService.js';
 import type { UniverseBook } from '../universe/types.js';
 import { isInsideMarketWindow } from '../services/MarketDataSessionService.js';
-import { isUpdateApplied } from './appliedDecisionUpdates.js';
 import {
   buildDecisionTape,
   formatIstWallClock,
   formatStructuredRationale,
   isNearOrAfterSessionClose,
-  isWeekdayCashCloseFlat,
   isWeakTape,
   sanitizeExitWhy,
   structureNotesFromBars,
@@ -753,9 +751,7 @@ export class LlmTradeAdvisorService {
       return 0;
     }
 
-    const forceFlat =
-      !isInsideMarketWindow(asOf) ||
-      (isUpdateApplied('flat-1520') ? isWeekdayCashCloseFlat(asOf) : isNearOrAfterSessionClose(asOf));
+    const forceFlat = !isInsideMarketWindow(asOf) || isNearOrAfterSessionClose(asOf);
     if (forceFlat && !openRow) {
       const skipBatch = {
         decisions: [
@@ -827,7 +823,7 @@ export class LlmTradeAdvisorService {
 
     let working = batch.decisions[0]!;
 
-    if (!openRow && working.action === 'BUY' && isWeakTape(context.tape, buySide)) {
+    if (!openRow && working.action === 'BUY' && isWeakTape(context.tape)) {
       overrides = [...overrides, { from: 'BUY', to: 'SKIP', reason: 'weak tape; confluence < 2 or mixed swings' }];
       working = { ...working, action: 'SKIP' };
     }
@@ -888,31 +884,21 @@ export class LlmTradeAdvisorService {
     }
 
     const llmWhy = working.rationale;
-    let why: string;
-    if (working.action === 'EXIT' && isUpdateApplied('exit-facts')) {
-      if (forceFlat) {
-        why = 'session close';
-      } else if (stopHit || (pnlPct !== null && pnlPct < 0)) {
-        why = 'premium stop';
-      } else {
-        why = 'structure flip';
-      }
-    } else if (working.action === 'EXIT') {
-      why = sanitizeExitWhy({
-        why: llmWhy,
-        pnlPct,
-        targetNetPnlPct: config.llm.targetNetPnlPct,
-        newsLevel: newsForIndex,
-      });
-    } else if (working.action === 'SKIP' && isWeakTape(context.tape, buySide)) {
-      why = 'weak confluence; mixed swings or unconfirmed candles';
-    } else {
-      why = llmWhy;
-    }
-    if (!isUpdateApplied('exit-facts') && forceFlat && working.action === 'EXIT') {
+    let why =
+      working.action === 'EXIT'
+        ? sanitizeExitWhy({
+            why: llmWhy,
+            pnlPct,
+            targetNetPnlPct: config.llm.targetNetPnlPct,
+            newsLevel: newsForIndex,
+          })
+        : working.action === 'SKIP' && isWeakTape(context.tape)
+          ? 'weak confluence; mixed swings or unconfirmed candles'
+          : llmWhy;
+    if (forceFlat && working.action === 'EXIT') {
       why = 'session close; flatten same day';
     }
-    if (!isUpdateApplied('exit-facts') && stopHit && working.action === 'EXIT') {
+    if (stopHit && working.action === 'EXIT') {
       why = `premium stop ${pnlPct?.toFixed(1)}%`;
     }
 

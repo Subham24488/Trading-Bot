@@ -2,7 +2,6 @@ import type { DailyBar, IntradayBar } from '../universe/types.js';
 import type { IndexOptionName } from '../instruments/kiteIndexUnderlyings.js';
 import type { OptionNewsRisk } from '../options/greeksIv.js';
 import { config } from '../config.js';
-import { isUpdateApplied } from './appliedDecisionUpdates.js';
 import type { LlmTradeActionName } from './schemas.js';
 import type { OptionRoundTripCost } from './optionTradeCosts.js';
 
@@ -215,13 +214,11 @@ export function chainConfluence(
   const dVol = chain.rows.reduce((sum, row) => sum + (row.dVolume ?? 0), 0);
   const note = `pcr=${pcr ?? 'na'} dCeOi=${dCeOi} dPeOi=${dPeOi} dVol=${dVol}`;
   if (side === 'CE') {
-    const directional = (pcr !== null && pcr < 0.95) || (dCeOi > 0 && dPeOi <= 0);
-    const ok = directional || (!isUpdateApplied('chain-dvol') && dVol > 0);
+    const ok = (pcr !== null && pcr < 0.95) || (dCeOi > 0 && dPeOi <= 0) || dVol > 0;
     return { ok, note };
   }
   if (side === 'PE') {
-    const directional = (pcr !== null && pcr > 1.05) || (dPeOi > 0 && dCeOi <= 0);
-    const ok = directional || (!isUpdateApplied('chain-dvol') && dVol > 0);
+    const ok = (pcr !== null && pcr > 1.05) || (dPeOi > 0 && dCeOi <= 0) || dVol > 0;
     return { ok, note };
   }
   return { ok: false, note };
@@ -302,15 +299,7 @@ export function formatStructuredRationale(input: {
   return text.slice(0, RATIONALE_MAX_CHARS);
 }
 
-export function isWeakTape(tape: DecisionTape, contractSide?: OptionSide | null): boolean {
-  if (isUpdateApplied('pattern-side')) {
-    if (tape.pattern === 'none') {
-      return true;
-    }
-    if (!contractSide || tape.sideFromCandles !== contractSide) {
-      return true;
-    }
-  }
+export function isWeakTape(tape: DecisionTape): boolean {
   if (tape.confluence.score < 2) {
     return true;
   }
@@ -466,25 +455,6 @@ export function isNearOrAfterSessionClose(date: Date = new Date()): boolean {
     .find((part) => part.type === 'hour')?.value;
   const hour = Number(hourPart === '24' ? '0' : (hourPart ?? date.getUTCHours()));
   return hour >= config.session.endHour - 1;
-}
-
-/** Weekday IST clock at or after 15:20. Used only when flat-1520 is applied. */
-export function isWeekdayCashCloseFlat(date: Date = new Date()): boolean {
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Asia/Kolkata',
-    weekday: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).formatToParts(date);
-  const read = (type: string): string => parts.find((part) => part.type === type)?.value ?? '';
-  const weekday = read('weekday');
-  if (weekday === 'Sat' || weekday === 'Sun') {
-    return false;
-  }
-  const hour = Number(read('hour') === '24' ? '0' : read('hour'));
-  const minute = Number(read('minute') || '0');
-  return hour > 15 || (hour === 15 && minute >= 20);
 }
 
 /** Format Date as IST `YYYY-MM-DD HH:mm:ss` for Kite historical. */
