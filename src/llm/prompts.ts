@@ -13,7 +13,7 @@ import {
 
 /** Keep completion small so input+output stays under typical 40k context. */
 export const UNIVERSE_MAX_OUTPUT_TOKENS = 700;
-export const DECISION_MAX_OUTPUT_TOKENS = 800;
+export const DECISION_MAX_OUTPUT_TOKENS = 2048;
 
 const MAX_NEWS_ROWS = 48;
 const MAX_HEADLINES_PER_SYMBOL = 3;
@@ -360,8 +360,8 @@ export function buildLiveOptionDecisionMessages(
         'Trend is context only — never pick CE vs PE from day/week/month trend alone; confirm with tape.pattern and last 1-3 candles. Same-day reversal is allowed. ' +
         'Do not BUY on mixed swings only. Do not open a second position. Respect minHoldMinutes and fee targetNetPnlPct. ' +
         'Never claim target achieved on a loss. Never claim news risk when news=none. ' +
-        'JSON only: {decisions:[{symbol,action,rationale}]}. One row. ' +
-        'rationale MUST be: trend=…; structure=…; pattern=…; candle1to3=…; chain=…; news=…; decision=…; why=… ' +
+        'Emit the JSON object only: {decisions:[{symbol,action,rationale}]}. One row. ' +
+        'rationale MUST be under 500 characters: trend=…; structure=…; pattern=…; candle1to3=…; chain=…; news=…; decision=…; why=… ' +
         'No live orders. /no_think',
     },
     {

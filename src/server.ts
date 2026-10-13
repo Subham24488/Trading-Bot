@@ -16,6 +16,7 @@ import { MarketDataSessionService } from './services/MarketDataSessionService.js
 import { SessionControl } from './services/SessionControl.js';
 import { TradingControl } from './services/TradingControl.js';
 import { TradingService } from './services/TradingService.js';
+import { GroqClient } from './llm/groqClient.js';
 import { HuggingFaceClient } from './llm/huggingfaceClient.js';
 import { LlmTradeAdvisorService } from './llm/LlmTradeAdvisorService.js';
 import { NewsService } from './news/NewsService.js';
@@ -56,7 +57,7 @@ const sessionService = new MarketDataSessionService({
   sessionControl,
   logger: application.log,
 });
-const llmClient = new HuggingFaceClient();
+const llmClient = config.llmProvider === 'GQ' ? new GroqClient() : new HuggingFaceClient();
 const llmAdvisor = new LlmTradeAdvisorService({
   llm: llmClient,
   news: new NewsService(),
@@ -513,9 +514,12 @@ async function main(): Promise<void> {
   application.log.info('Bootstrapping Kite broker and WebSocket before listen.');
   await sessionService.connectAtBoot();
 
-  application.log.info({ model: config.huggingface.model }, 'Connecting Hugging Face LLM before listen.');
+  application.log.info(
+    { provider: config.llmProvider, model: llmClient.getModel() },
+    'Connecting LLM before listen.',
+  );
   await llmClient.connect();
-  application.log.info('Hugging Face LLM connected and ready.');
+  application.log.info({ provider: config.llmProvider }, 'LLM connected and ready.');
 
   await application.listen({ host: '0.0.0.0', port: config.port });
   application.log.info({ docs: `http://localhost:${config.port}/docs` }, 'Swagger UI available.');

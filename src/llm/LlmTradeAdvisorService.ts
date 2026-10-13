@@ -10,7 +10,7 @@ import {
   lookupSessionStartInstruments,
   type KiteInstrumentRef,
 } from '../instruments/kiteInstruments.js';
-import type { HuggingFaceClient } from './huggingfaceClient.js';
+import type { LlmChatClient } from './llmChatClient.js';
 import {
   buildLiveOptionDecisionMessages,
   buildOptionsUniverseMessages,
@@ -89,7 +89,7 @@ import {
 } from './optionTradeCosts.js';
 
 export type LlmTradeAdvisorOptions = {
-  llm: HuggingFaceClient;
+  llm: LlmChatClient;
   news: NewsService;
   kite: KiteBroker;
   logger: SessionLogger;
@@ -110,7 +110,7 @@ export type UniverseSuggestResult = {
 };
 
 export class LlmTradeAdvisorService {
-  private readonly llm: HuggingFaceClient;
+  private readonly llm: LlmChatClient;
   private readonly news: NewsService;
   private readonly kite: KiteBroker;
   private readonly logger: SessionLogger;
@@ -1307,8 +1307,12 @@ export class LlmTradeAdvisorService {
     try {
       return await this.llm.completeJson(messages, { maxTokens });
     } catch (error: unknown) {
-      this.logger.warn({ err: error, label }, 'First Hugging Face JSON completion failed; retrying once.');
-      return this.llm.completeJson(messages, { maxTokens });
+      const message = error instanceof Error ? error.message : String(error);
+      const tokenCut =
+        message.includes('json_validate_failed') || message.includes('max completion tokens');
+      const retryTokens = tokenCut ? 4096 : maxTokens;
+      this.logger.warn({ err: error, label, retryTokens }, 'LLM JSON completion failed; retrying once.');
+      return this.llm.completeJson(messages, { maxTokens: retryTokens });
     }
   }
 }
