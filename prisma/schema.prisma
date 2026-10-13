@@ -70,6 +70,7 @@ model LlmTradeDecision {
 
   @@index([decidedAt])
   @@index([symbol, decidedAt])
+  @@index([action, decidedAt])
 }
 
 enum TradingMode {

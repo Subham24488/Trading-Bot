@@ -306,7 +306,7 @@ export function isWeakTape(tape: DecisionTape): boolean {
   if (!tape.structureOk) {
     return true;
   }
-  if (tape.pattern === 'none' && !tape.confluence.chain) {
+  if (tape.pattern === 'none' || (tape.sideFromCandles !== 'CE' && tape.sideFromCandles !== 'PE')) {
     return true;
   }
   return false;

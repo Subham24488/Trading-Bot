@@ -63,7 +63,7 @@ export type SessionReviewMistake = {
 export type SessionReviewResult = {
   sessionsReviewed: Array<{ date: string; decisionCount: number }>;
   mistakes: SessionReviewMistake[];
-  rootCauses: Array<{ id: UpdateId; where: string; detail: string }>;
+  rootCauses: Array<{ id: UpdateId; where: string; detail: string; count: number }>;
   suggestedUpdates: Array<(typeof SUGGESTIONS)[UpdateId]>;
   suggestedUpdatesPrompt: string;
 };
@@ -126,30 +126,149 @@ function num(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function rationaleField(rationale: string, key: string): string {
-  const match = rationale.match(new RegExp(`(?:^|;)\\s*${key}=([^;]*)`, 'i'));
+const CAUSE_ORDER: UpdateId[] = ['chain-dvol', 'pattern-side', 'exit-facts', 'flat-1520'];
+const TOP_N = 2;
+
+const CAUSE_WHERE: Record<UpdateId, string> = {
+  'chain-dvol': 'decisionContext.chainConfluence',
+  'pattern-side': 'decisionContext.isWeakTape',
+  'exit-facts': 'decisionContext.sanitizeExitWhy',
+  'flat-1520': 'decisionContext.isNearOrAfterSessionClose',
+};
+
+const PAIR_SELECT = {
+  decidedAt: true,
+  symbol: true,
+  action: true,
+  rationale: true,
+  marketSnapshot: true,
+  buyPrice: true,
+  currentPrice: true,
+  sellPrice: true,
+} as const;
+
+type TapeEvidence = {
+  pattern: string | null;
+  sideFromCandles: string | null;
+  chainNote: string | null;
+  newsLevel: string | null;
+  chainOk: boolean | null;
+  structure: string[];
+};
+
+type ChainParts = { pcr: number | null; dCeOi: number; dPeOi: number; dVol: number };
+
+function tapeOf(snapshot: Record<string, unknown>): TapeEvidence | null {
+  const tape = asRecord(snapshot.tape);
+  if (Object.keys(tape).length === 0) {
+    return null;
+  }
+  const confluence = asRecord(tape.confluence);
+  const pattern = typeof tape.pattern === 'string' ? tape.pattern : null;
+  const sideFromCandles = typeof tape.sideFromCandles === 'string' ? tape.sideFromCandles : null;
+  const chainNote = typeof tape.chainNote === 'string' ? tape.chainNote : null;
+  const newsLevel = typeof tape.newsLevel === 'string' ? tape.newsLevel : null;
+  const chainOk = typeof confluence.chain === 'boolean' ? confluence.chain : null;
+  const structure = Array.isArray(tape.structure) ? tape.structure.filter((item) => typeof item === 'string') : [];
+  return { pattern, sideFromCandles, chainNote, newsLevel, chainOk, structure };
+}
+
+function contractSide(symbol: string): 'CE' | 'PE' | null {
+  if (symbol.endsWith('CE')) {
+    return 'CE';
+  }
+  if (symbol.endsWith('PE')) {
+    return 'PE';
+  }
+  return null;
+}
+
+function parseChainNote(note: string): ChainParts | null {
+  const match = note.match(
+    /pcr=(na|-?\d+(?:\.\d+)?)\s+dCeOi=(-?\d+(?:\.\d+)?)\s+dPeOi=(-?\d+(?:\.\d+)?)\s+dVol=(-?\d+(?:\.\d+)?)/,
+  );
+  if (!match) {
+    return null;
+  }
+  const pcr = match[1] === 'na' ? null : Number(match[1]);
+  const dCeOi = Number(match[2]);
+  const dPeOi = Number(match[3]);
+  const dVol = Number(match[4]);
+  if (![dCeOi, dPeOi, dVol].every(Number.isFinite) || (pcr !== null && !Number.isFinite(pcr))) {
+    return null;
+  }
+  return { pcr, dCeOi, dPeOi, dVol };
+}
+
+function directionalChain(side: 'CE' | 'PE', parts: ChainParts): boolean {
+  if (side === 'CE') {
+    return (parts.pcr !== null && parts.pcr < 0.95) || (parts.dCeOi > 0 && parts.dPeOi <= 0);
+  }
+  return (parts.pcr !== null && parts.pcr > 1.05) || (parts.dPeOi > 0 && parts.dCeOi <= 0);
+}
+
+function labeledWhy(rationale: string): string {
+  const match = rationale.match(/(?:^|;)\s*why=([^;]*)/i);
   return match?.[1]?.trim() ?? '';
 }
 
-function snapshotNews(snapshot: Record<string, unknown>): string {
-  const tape = asRecord(snapshot.tape);
-  if (typeof tape.newsLevel === 'string') {
-    return tape.newsLevel;
-  }
-  if (typeof tape.news === 'string') {
-    return tape.news;
-  }
-  const risk = snapshot.newsRisk;
-  if (risk && typeof risk === 'object') {
-    const levels = Object.values(risk as Record<string, { level?: string }>).map((row) => row?.level ?? 'none');
-    if (levels.includes('high')) {
-      return 'high';
+function canonicalExitWhy(why: string): boolean {
+  const text = why.trim().toLowerCase();
+  return text.startsWith('premium stop') || text.startsWith('session close') || text.startsWith('structure flip');
+}
+
+function istClock(date: Date): { weekday: string; hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const read = (type: string): string => parts.find((part) => part.type === type)?.value ?? '';
+  const hourRaw = read('hour');
+  return {
+    weekday: read('weekday'),
+    hour: Number(hourRaw === '24' ? '0' : hourRaw || '0'),
+    minute: Number(read('minute') || '0'),
+  };
+}
+
+function causesForPair(input: {
+  symbol: string;
+  buyTape: TapeEvidence | null;
+  exitTape: TapeEvidence | null;
+  exitWhy: string;
+  exitAt: Date;
+}): UpdateId[] {
+  const ids: UpdateId[] = [];
+  const side = contractSide(input.symbol);
+  const buy = input.buyTape;
+  if (buy && side && buy.chainOk === true && buy.chainNote) {
+    const parts = parseChainNote(buy.chainNote);
+    if (parts && parts.dVol > 0 && !directionalChain(side, parts)) {
+      ids.push('chain-dvol');
     }
-    if (levels.includes('elevated')) {
-      return 'elevated';
-    }
   }
-  return rationaleField('', 'news') || 'none';
+  if (buy && side && buy.pattern !== null && (buy.pattern === 'none' || buy.sideFromCandles !== side)) {
+    ids.push('pattern-side');
+  }
+  if (input.exitTape?.newsLevel === 'none' && input.exitWhy.length > 0 && !canonicalExitWhy(input.exitWhy)) {
+    ids.push('exit-facts');
+  }
+  const clock = istClock(input.exitAt);
+  const weekday = clock.weekday !== 'Sat' && clock.weekday !== 'Sun';
+  if (weekday && (clock.hour > 15 || (clock.hour === 15 && clock.minute >= 20))) {
+    ids.push('flat-1520');
+  }
+  return ids;
+}
+
+function rankCauses(counts: Map<UpdateId, number>, pairCount: number): UpdateId[] {
+  const minCount = pairCount >= 3 ? 2 : 1;
+  return CAUSE_ORDER.filter((id) => (counts.get(id) ?? 0) >= minCount)
+    .sort((left, right) => (counts.get(right) ?? 0) - (counts.get(left) ?? 0))
+    .slice(0, TOP_N);
 }
 
 export async function reviewTradingSessions(startDate: string, endDate: string): Promise<SessionReviewResult> {
@@ -157,16 +276,7 @@ export async function reviewTradingSessions(startDate: string, endDate: string):
   const rows = await database.llmTradeDecision.findMany({
     where: { decidedAt: { gte: from, lte: to } },
     orderBy: [{ decidedAt: 'asc' }, { asOf: 'asc' }],
-    select: {
-      decidedAt: true,
-      symbol: true,
-      action: true,
-      rationale: true,
-      marketSnapshot: true,
-      buyPrice: true,
-      currentPrice: true,
-      sellPrice: true,
-    },
+    select: PAIR_SELECT,
   });
 
   const byDate = new Map<string, number>();
@@ -175,132 +285,91 @@ export async function reviewTradingSessions(startDate: string, endDate: string):
     byDate.set(date, (byDate.get(date) ?? 0) + 1);
   }
 
-  const nextExitByBuy = new Map<ReviewRow, ReviewRow>();
   const openBuy = new Map<string, ReviewRow>();
+  const roundTrips: Array<{ buy: ReviewRow; exit: ReviewRow }> = [];
   for (const row of rows) {
     if (row.action === 'BUY') {
       openBuy.set(row.symbol, row);
     } else if (row.action === 'EXIT') {
       const buy = openBuy.get(row.symbol);
       if (buy) {
-        nextExitByBuy.set(buy, row);
+        roundTrips.push({ buy, exit: row });
         openBuy.delete(row.symbol);
       }
     }
   }
 
-  const losingSymbols = new Set<string>();
-  const lossBySymbol = new Map<string, { buy: number; exit: number; pnlPct: number }>();
-  for (const [buy, exit] of nextExitByBuy) {
-    const entry = num(buy.buyPrice) ?? num(buy.currentPrice);
-    const leave = num(exit.sellPrice) ?? num(exit.currentPrice);
+  const losses: Array<{ buy: ReviewRow; exit: ReviewRow; entry: number; leave: number; pnlPct: number }> = [];
+  for (const trip of roundTrips) {
+    const entry = num(trip.buy.buyPrice) ?? num(trip.buy.currentPrice);
+    const leave = num(trip.exit.sellPrice) ?? num(trip.exit.currentPrice);
     if (entry === null || leave === null || !(entry > 0)) {
       continue;
     }
     const pnlPct = ((leave - entry) / entry) * 100;
     if (pnlPct < 0) {
-      losingSymbols.add(buy.symbol);
-      lossBySymbol.set(`${buy.symbol}:${buy.decidedAt.toISOString()}`, { buy: entry, exit: leave, pnlPct });
-      lossBySymbol.set(exit.symbol, { buy: entry, exit: leave, pnlPct });
+      losses.push({ ...trip, entry, leave, pnlPct });
     }
   }
 
-  const causeIds = new Set<UpdateId>();
+  const counts = new Map<UpdateId, number>();
   const mistakes: SessionReviewMistake[] = [];
 
-  for (const row of rows) {
-    const snapshot = asRecord(row.marketSnapshot);
-    const tape = asRecord(snapshot.tape);
-    const structure = Array.isArray(tape.structure) ? tape.structure.map(String).join(',') : rationaleField(row.rationale, 'structure');
-    const pattern = typeof tape.pattern === 'string' ? tape.pattern : rationaleField(row.rationale, 'pattern');
-    const news = snapshotNews(snapshot) || rationaleField(row.rationale, 'news') || 'none';
-    const why = rationaleField(row.rationale, 'why') || row.rationale;
-    const chain = typeof tape.chainNote === 'string' ? tape.chainNote : rationaleField(row.rationale, 'chain');
-    const whyDecision = `action=${row.action}; structure=${structure || 'na'}; pattern=${pattern || 'na'}; chain=${chain || 'na'}; news=${news}; why=${why}`;
-
-    const paired = row.action === 'BUY' ? nextExitByBuy.get(row) : undefined;
-    const entry = num(row.buyPrice) ?? num(row.currentPrice);
-    const exitPrice = paired ? num(paired.sellPrice) ?? num(paired.currentPrice) : num(row.sellPrice) ?? num(row.currentPrice);
-    const pnlFromSnap = num(snapshot.pnlPct);
-    let lossCause = 'No realized loss on this row.';
-    let lost = false;
-    if (row.action === 'EXIT' && entry !== null && exitPrice !== null && entry > 0) {
-      const pnl = ((exitPrice - entry) / entry) * 100;
-      if (pnl < 0) {
-        lost = true;
-        lossCause = `BUY ${entry} → EXIT ${exitPrice} (${pnl.toFixed(1)}%)`;
-      }
-    } else if (row.action === 'BUY' && paired && entry !== null && exitPrice !== null && entry > 0) {
-      const pnl = ((exitPrice - entry) / entry) * 100;
-      if (pnl < 0) {
-        lost = true;
-        lossCause = `Round trip BUY ${entry} → EXIT ${exitPrice} (${pnl.toFixed(1)}%)`;
-      }
-    } else if ((row.action === 'HOLD' || row.action === 'SKIP') && losingSymbols.has(row.symbol)) {
-      const known = lossBySymbol.get(row.symbol);
-      if (known) {
-        lost = true;
-        lossCause = `Kept open on a losing round trip BUY ${known.buy} → EXIT ${known.exit} (${known.pnlPct.toFixed(1)}%)`;
-      }
-    } else if (pnlFromSnap !== null && pnlFromSnap < 0 && row.action === 'EXIT') {
-      lost = true;
-      lossCause = `Snapshot pnlPct ${pnlFromSnap.toFixed(1)}%`;
-    }
-
-    if (!lost) {
-      continue;
-    }
-    const evidence = `rationale=${row.rationale.slice(0, 500)}; snapshot=${JSON.stringify(snapshot).slice(0, 500)}`;
-    mistakes.push({
-      symbol: row.symbol,
-      action: row.action,
-      decidedAt: row.decidedAt.toISOString(),
-      evidence,
-      lossCause,
-      whyDecision,
+  for (const loss of losses) {
+    const buyTape = tapeOf(asRecord(loss.buy.marketSnapshot));
+    const exitTape = tapeOf(asRecord(loss.exit.marketSnapshot));
+    const exitWhy = labeledWhy(loss.exit.rationale);
+    const holds = rows.filter(
+      (row) =>
+        row.action === 'HOLD' &&
+        row.symbol === loss.buy.symbol &&
+        row.decidedAt.getTime() >= loss.buy.decidedAt.getTime() &&
+        row.decidedAt.getTime() <= loss.exit.decidedAt.getTime(),
+    ).length;
+    const fired = causesForPair({
+      symbol: loss.buy.symbol,
+      buyTape,
+      exitTape,
+      exitWhy,
+      exitAt: loss.exit.decidedAt,
     });
+    for (const id of fired) {
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
 
-    const mixed = /mixed swings/i.test(structure) || /mixed swings/i.test(row.rationale);
-    const chainBlob = `${chain} ${row.rationale}`;
-    const dVolOnly = /dVol=[1-9]/.test(chainBlob) && !/dPeOi=[1-9]|dCeOi=[1-9]/.test(chainBlob);
-    if ((row.action === 'BUY' || lost) && (mixed || dVolOnly || pattern === 'none' || pattern === '')) {
-      causeIds.add('chain-dvol');
-      causeIds.add('pattern-side');
-    }
-    const claimedTarget = /target achieved|take[- ]?profit|hit target/i.test(row.rationale);
-    const claimedNews = /news risk|event risk|headline risk/i.test(row.rationale);
-    if (row.action === 'EXIT' && lost && (claimedTarget || (claimedNews && news === 'none'))) {
-      causeIds.add('exit-facts');
-    }
-    const hourIst = new Intl.DateTimeFormat('en-GB', {
-      timeZone: 'Asia/Kolkata',
-      hour: 'numeric',
-      hour12: false,
-    }).format(row.decidedAt);
-    const hour = Number(hourIst === '24' ? '0' : hourIst);
-    if (lost && (row.action === 'HOLD' || row.action === 'BUY' || row.action === 'EXIT') && hour >= 15) {
-      causeIds.add('flat-1520');
-    }
+    const evidence = [
+      `pattern=${buyTape?.pattern ?? 'na'}`,
+      `sideFromCandles=${buyTape?.sideFromCandles ?? 'na'}`,
+      `chainNote=${buyTape?.chainNote ?? 'na'}`,
+      `confluence.chain=${buyTape === null || buyTape.chainOk === null ? 'na' : String(buyTape.chainOk)}`,
+      `structure=${buyTape?.structure.join(',') || 'na'}`,
+      `newsLevel=${exitTape?.newsLevel ?? 'na'}`,
+      `exitWhy=${exitWhy || 'na'}`,
+      `holds=${holds}`,
+    ].join('; ');
+    mistakes.push({
+      symbol: loss.buy.symbol,
+      action: 'BUY',
+      decidedAt: loss.buy.decidedAt.toISOString(),
+      evidence,
+      lossCause: `Round trip BUY ${loss.entry} → EXIT ${loss.leave} (${loss.pnlPct.toFixed(1)}%)`,
+      whyDecision: `action=BUY→EXIT; pattern=${buyTape?.pattern ?? 'na'}; chain=${buyTape?.chainNote ?? 'na'}; news=${exitTape?.newsLevel ?? 'na'}; why=${exitWhy || 'na'}`,
+    });
   }
 
-  const rootCauses = [...causeIds].map((id) => {
-    const where =
-      id === 'chain-dvol'
-        ? 'decisionContext.chainConfluence'
-        : id === 'pattern-side'
-          ? 'decisionContext.isWeakTape'
-          : id === 'exit-facts'
-            ? 'decisionContext.sanitizeExitWhy'
-            : 'decisionContext.isNearOrAfterSessionClose';
-    return { id, where, detail: SUGGESTIONS[id].why };
-  });
-
-  const suggestedUpdates = [...causeIds].map((id) => SUGGESTIONS[id]);
+  const ranked = rankCauses(counts, losses.length);
+  const rootCauses = ranked.map((id) => ({
+    id,
+    where: CAUSE_WHERE[id],
+    detail: `n=${counts.get(id) ?? 0}/${losses.length}. ${SUGGESTIONS[id].why}`,
+    count: counts.get(id) ?? 0,
+  }));
+  const suggestedUpdates = ranked.map((id) => SUGGESTIONS[id]);
   return {
     sessionsReviewed: [...byDate.entries()].map(([date, decisionCount]) => ({ date, decisionCount })),
     mistakes,
     rootCauses,
     suggestedUpdates,
-    suggestedUpdatesPrompt: suggestedUpdatesPrompt([...causeIds]),
+    suggestedUpdatesPrompt: suggestedUpdatesPrompt(ranked),
   };
 }
