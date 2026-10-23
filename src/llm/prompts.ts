@@ -1,19 +1,23 @@
+import { createHash } from 'node:crypto';
+
 import type { SymbolNews } from '../news/NewsService.js';
+import type { ContractCandidate } from '../strategy/contracts.js';
 import type { UniverseCandidate } from '../universe/types.js';
 import type { QuoteLogSnapshot } from './quoteLogReader.js';
 import { greeksIvCatalogForPrompt } from '../options/greeksIv.js';
 import { promptActionLabels, type LlmTradeActionName } from './schemas.js';
 import { compactPlaybookForPrompt, type PlaybookSignal } from './tradePlaybook.js';
-import {
-  compactCandlesForPrompt,
-  compactChainForPrompt,
-  compactTapeForPrompt,
-  type LiveOptionDecisionContext,
-} from './decisionContext.js';
 
-/** Keep completion small so input+output stays under typical 40k context. */
-export const UNIVERSE_MAX_OUTPUT_TOKENS = 700;
-export const DECISION_MAX_OUTPUT_TOKENS = 2048;
+/**
+ * Caps, not targets: reasoning models (gpt-oss) spend hidden reasoning tokens from this budget
+ * before writing JSON. Still small enough that input+output stays under typical 40k context.
+ */
+export const UNIVERSE_MAX_OUTPUT_TOKENS = 1500;
+export const CONTRACT_PICK_MAX_OUTPUT_TOKENS = 1024;
+
+export function hashPrompt(parts: unknown): string {
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
 
 const MAX_NEWS_ROWS = 48;
 const MAX_HEADLINES_PER_SYMBOL = 3;
@@ -42,10 +46,22 @@ export type CompactNewsRow = {
 };
 
 const KIND_PATTERNS: Array<{ kind: FilingKind; pattern: RegExp; weight: number }> = [
-  { kind: 'DEFAULT', pattern: /\b(default|insolvency|npa|downgrade|sebi.?order|ban)\b/i, weight: 12 },
-  { kind: 'MERGER', pattern: /\b(merger|amalgamat|acquire|acquisition|takeover|demerger)\b/i, weight: 11 },
+  {
+    kind: 'DEFAULT',
+    pattern: /\b(default|insolvency|npa|downgrade|sebi.?order|ban)\b/i,
+    weight: 12,
+  },
+  {
+    kind: 'MERGER',
+    pattern: /\b(merger|amalgamat|acquire|acquisition|takeover|demerger)\b/i,
+    weight: 11,
+  },
   { kind: 'BUYBACK', pattern: /\b(buy.?back|delisting)\b/i, weight: 10 },
-  { kind: 'RESULT', pattern: /\b(financial results?|quarterly|q[1-4]\b|earnings|profit|loss|audited)\b/i, weight: 10 },
+  {
+    kind: 'RESULT',
+    pattern: /\b(financial results?|quarterly|q[1-4]\b|earnings|profit|loss|audited)\b/i,
+    weight: 10,
+  },
   { kind: 'DIVIDEND', pattern: /\b(dividend|interim|bonus|split|record date)\b/i, weight: 9 },
   { kind: 'RAISE', pattern: /\b(qip|preferential|fund rais|rights issue|ncd|fccb)\b/i, weight: 8 },
   { kind: 'INSIDER', pattern: /\b(insider|sast|bulk.?deal|block.?deal|pledged?)\b/i, weight: 7 },
@@ -117,7 +133,11 @@ function payloadSize(rows: CompactNewsRow[]): number {
 function trimToBudget(rows: CompactNewsRow[]): CompactNewsRow[] {
   const next = [...rows];
   const dropIf = (predicate: (row: CompactNewsRow, index: number) => boolean) => {
-    for (let index = next.length - 1; index >= 0 && payloadSize(next) > MAX_UNIVERSE_USER_CHARS; index -= 1) {
+    for (
+      let index = next.length - 1;
+      index >= 0 && payloadSize(next) > MAX_UNIVERSE_USER_CHARS;
+      index -= 1
+    ) {
       if (predicate(next[index]!, index)) {
         next.splice(index, 1);
       }
@@ -125,14 +145,18 @@ function trimToBudget(rows: CompactNewsRow[]): CompactNewsRow[] {
   };
 
   dropIf((row) => row.src === 'g' && row.k === 'OTHER');
-  dropIf((row) => row.k === 'OTHER' && next.some((other) => other.s === row.s && other.k !== 'OTHER'));
+  dropIf(
+    (row) => row.k === 'OTHER' && next.some((other) => other.s === row.s && other.k !== 'OTHER'),
+  );
   dropIf((row) => {
     const forSymbol = next.filter((other) => other.s === row.s);
     return forSymbol.length > 1 && row.k === 'BOARD';
   });
 
   while (payloadSize(next) > MAX_UNIVERSE_USER_CHARS && next.length > 0) {
-    const ranked = [...next.entries()].sort((left, right) => itemScore(left[1].t, left[1].src) - itemScore(right[1].t, right[1].src));
+    const ranked = [...next.entries()].sort(
+      (left, right) => itemScore(left[1].t, left[1].src) - itemScore(right[1].t, right[1].src),
+    );
     const weakest = ranked[0];
     if (!weakest) {
       break;
@@ -168,7 +192,8 @@ export function compactNewsForPrompt(news: readonly SymbolNews[]): CompactNewsRo
   }
 
   const symbolsByStrength = [...perSymbol.entries()].sort((left, right) => {
-    const score = (rows: CompactNewsRow[]) => rows.reduce((sum, row) => sum + kindWeight(row.k) + (row.src === 'nse' ? 3 : 0), 0);
+    const score = (rows: CompactNewsRow[]) =>
+      rows.reduce((sum, row) => sum + kindWeight(row.k) + (row.src === 'nse' ? 3 : 0), 0);
     return score(right[1]) - score(left[1]);
   });
 
@@ -204,7 +229,9 @@ export function buildUniverseMessages(
   candidates: readonly UniverseCandidate[],
   preselected: readonly string[] = [],
 ): Array<{ role: 'system' | 'user'; content: string }> {
-  const allowed = candidates.filter((candidate) => candidate.pass).map((candidate) => candidate.symbol);
+  const allowed = candidates
+    .filter((candidate) => candidate.pass)
+    .map((candidate) => candidate.symbol);
   const compact = candidates.map((candidate) => ({
     s: candidate.symbol,
     pass: candidate.pass,
@@ -241,9 +268,14 @@ export function buildOptionsUniverseMessages(
   asOfIst: string,
   candidates: readonly UniverseCandidate[],
   preselected: readonly string[] = [],
-  greeksBySymbol: Record<string, { delta: number | null; iv: number | null; ivHv: number | null }> = {},
+  greeksBySymbol: Record<
+    string,
+    { delta: number | null; iv: number | null; ivHv: number | null }
+  > = {},
 ): Array<{ role: 'system' | 'user'; content: string }> {
-  const allowed = candidates.filter((candidate) => candidate.pass).map((candidate) => candidate.symbol);
+  const allowed = candidates
+    .filter((candidate) => candidate.pass)
+    .map((candidate) => candidate.symbol);
   const compact = candidates.map((candidate) => {
     const greeks = greeksBySymbol[candidate.symbol];
     return {
@@ -345,46 +377,50 @@ export function buildDecisionMessages(
   ];
 }
 
-/** Live options desk: pick one NFO contract + action from fresh chain/candle/news context. */
-export function buildLiveOptionDecisionMessages(
-  context: LiveOptionDecisionContext,
-): Array<{ role: 'system' | 'user'; content: string }> {
-  const open = context.open;
+/**
+ * Strike selection only. The rules have already decided to buy, the index and the side;
+ * the model sees nothing but the pre-filtered candidates (no headlines, no free text).
+ */
+export function buildContractPickMessages(input: {
+  index: string;
+  side: 'CE' | 'PE';
+  score: number;
+  minutesToSquareOff: number;
+  candidates: readonly ContractCandidate[];
+}): Array<{ role: 'system' | 'user'; content: string }> {
+  const kind = input.side === 'CE' ? 'call' : 'put';
   return [
     {
       role: 'system',
       content:
-        'NSE index-options desk, store-only. Each cycle pick exactly ONE decision. ' +
-        'Choose symbol from chain.rows[].s (or the open symbol when in a position). ' +
-        'Action must be one of opts. SELL means EXIT. Prefer SKIP/HOLD when tape.confluence < 2 or pattern is none. ' +
-        'Trend is context only — never pick CE vs PE from day/week/month trend alone; confirm with tape.pattern and last 1-3 candles. Same-day reversal is allowed. ' +
-        'Do not BUY on mixed swings only. Do not open a second position. Respect minHoldMinutes and fee targetNetPnlPct. ' +
-        'Never claim target achieved on a loss. Never claim news risk when news=none. ' +
-        'Emit the JSON object only: {decisions:[{symbol,action,rationale}]}. One row. ' +
-        'rationale MUST be under 500 characters: trend=…; structure=…; pattern=…; candle1to3=…; chain=…; news=…; decision=…; why=… ' +
-        'No live orders. /no_think',
+        `You pick ONE NSE index option for an intraday ${kind} buy on ${input.index}. ` +
+        'The decision to buy and the direction are already final; do not question them. ' +
+        'Choose only a symbol from candidates[]. Prefer a tight bid-ask spread, deep open interest and volume, ' +
+        'delta near 0.5, a lower ivToHv (cheaper option), and a premium that can realistically move before the forced exit ' +
+        `in ${input.minutesToSquareOff} minutes. ` +
+        'Reply with JSON only: {"symbol": string, "reason": string}. reason: one plain-English sentence under 25 words. /no_think',
     },
     {
       role: 'user',
       content: JSON.stringify({
-        asOfIst: context.asOfIst,
-        opts: promptActionLabels(context.allowed),
-        open: open
-          ? {
-              s: open.symbol,
-              buy: open.buyPrice,
-              heldMin: open.heldMinutes,
-            }
-          : null,
-        minHoldMinutes: context.minHoldMinutes,
-        targetNetPnlPct: context.targetNetPnlPct,
-        lookbackMin: context.candleLookbackMinutes,
-        fees: context.fees,
-        newsRisk: context.newsRiskByIndex,
-        news: context.newsHeadlines.slice(0, 12),
-        tape: compactTapeForPrompt(context.tape),
-        candles: context.candles.map(compactCandlesForPrompt),
-        chain: compactChainForPrompt(context.chain),
+        index: input.index,
+        side: input.side,
+        signalScore: input.score,
+        minutesToSquareOff: input.minutesToSquareOff,
+        candidates: input.candidates.map((candidate) => ({
+          s: candidate.symbol,
+          strike: candidate.strike,
+          moneyness: candidate.moneyness,
+          ask: candidate.ask,
+          spreadPct: candidate.spreadPct,
+          oi: candidate.oi,
+          volume: candidate.volume,
+          delta: candidate.delta,
+          ivToHv: candidate.ivToHv,
+          lotSize: candidate.lotSize,
+          feeInr: candidate.feeInr,
+          rank: candidate.rank,
+        })),
       }),
     },
   ];

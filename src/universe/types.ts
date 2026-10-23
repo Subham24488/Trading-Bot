@@ -16,6 +16,8 @@ export type IntradayBar = {
   l: number;
   c: number;
   v: number;
+  /** Open interest at the bar close (futures/options only, when requested). */
+  oi?: number;
 };
 
 export type FeatureSnapshot = {

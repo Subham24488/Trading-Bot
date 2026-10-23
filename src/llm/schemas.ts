@@ -41,7 +41,11 @@ const rawActionSchema = z
   .pipe(llmTradeActionSchema);
 
 export const watchlistItemSchema = z.object({
-  symbol: z.string().trim().min(1).transform((value) => value.toUpperCase()),
+  symbol: z
+    .string()
+    .trim()
+    .min(1)
+    .transform((value) => value.toUpperCase()),
   include: z.boolean(),
   rationale: z.string().trim().min(1),
   rank: z.number().int().min(1).max(1).optional(),
@@ -55,7 +59,11 @@ export const universeSuggestionSchema = z.object({
   exclude: z
     .array(
       z.object({
-        symbol: z.string().trim().min(1).transform((value) => value.toUpperCase()),
+        symbol: z
+          .string()
+          .trim()
+          .min(1)
+          .transform((value) => value.toUpperCase()),
         reason: z.string().trim().min(1),
       }),
     )
@@ -65,7 +73,11 @@ export const universeSuggestionSchema = z.object({
 export type UniverseSuggestion = z.infer<typeof universeSuggestionSchema>;
 
 export const decisionItemSchema = z.object({
-  symbol: z.string().trim().min(1).transform((value) => value.toUpperCase()),
+  symbol: z
+    .string()
+    .trim()
+    .min(1)
+    .transform((value) => value.toUpperCase()),
   action: rawActionSchema,
   confidence: z.number().min(0).max(1).optional(),
   rationale: z.string().trim().min(1).max(4000),
@@ -97,7 +109,10 @@ export function intersectWatchlistWithCatalog(
   };
 }
 
-export function clampWatchlistToTop(suggestion: UniverseSuggestion, maxInclude = 1): UniverseSuggestion {
+export function clampWatchlistToTop(
+  suggestion: UniverseSuggestion,
+  maxInclude = 1,
+): UniverseSuggestion {
   const included = suggestion.watchlist.filter((item) => item.include);
   const dropped = included.slice(maxInclude).map((item) => ({
     symbol: item.symbol,
@@ -120,7 +135,9 @@ export function dropIncludesNotPassing(
   suggestion: UniverseSuggestion,
   passingSymbols: ReadonlySet<string>,
 ): UniverseSuggestion {
-  const kept = suggestion.watchlist.filter((item) => !item.include || passingSymbols.has(item.symbol));
+  const kept = suggestion.watchlist.filter(
+    (item) => !item.include || passingSymbols.has(item.symbol),
+  );
   const dropped = suggestion.watchlist
     .filter((item) => item.include && !passingSymbols.has(item.symbol))
     .map((item) => ({
@@ -180,83 +197,14 @@ export function clampDecisionsToAllowed(
   return { batch: { ...batch, decisions: kept }, dropped };
 }
 
-/**
- * Single-pick live options clamp: one open position, chain allowlist, flat vs in-position actions.
- */
-export function clampLiveOptionDecision(input: {
-  batch: DecisionBatch;
-  openSymbol: string | null;
-  chainSymbols: ReadonlySet<string>;
-  allowed: readonly LlmTradeActionName[];
-}): {
-  batch: DecisionBatch;
-  overrides: Array<{ from: string; to: string; reason: string }>;
-} {
-  const overrides: Array<{ from: string; to: string; reason: string }> = [];
-  const first = input.batch.decisions[0];
-  if (!first) {
-    return {
-      batch: {
-        ...input.batch,
-        decisions: [
-          {
-            symbol: input.openSymbol ?? 'NONE',
-            action: input.openSymbol ? 'HOLD' : 'SKIP',
-            rationale: 'No LLM decision; defaulted.',
-          },
-        ],
-      },
-      overrides: [{ from: 'missing', to: input.openSymbol ? 'HOLD' : 'SKIP', reason: 'empty decisions' }],
-    };
-  }
+/** The LLM's only job in the decision loop: name one contract from the candidate list. */
+export const contractPickSchema = z.object({
+  symbol: z
+    .string()
+    .trim()
+    .min(1)
+    .transform((value) => value.toUpperCase()),
+  reason: z.string().trim().min(1).max(400),
+});
 
-  let symbol = first.symbol;
-  let action = first.action;
-  let rationale = first.rationale;
-
-  if (input.openSymbol) {
-    if (symbol !== input.openSymbol) {
-      overrides.push({
-        from: `${symbol}:${action}`,
-        to: `${input.openSymbol}:${action === 'BUY' ? 'HOLD' : action}`,
-        reason: 'one-position: force open symbol',
-      });
-      symbol = input.openSymbol;
-    }
-    if (action === 'BUY' || action === 'SKIP') {
-      overrides.push({
-        from: action,
-        to: 'HOLD',
-        reason: 'one-position: flat actions blocked while open',
-      });
-      action = 'HOLD';
-      rationale = `Open position: ${rationale}`;
-    }
-    if (!input.allowed.includes(action)) {
-      action = 'HOLD';
-    }
-  } else {
-    if (action === 'HOLD' || action === 'EXIT') {
-      overrides.push({ from: action, to: 'SKIP', reason: 'flat: only BUY/SKIP' });
-      action = 'SKIP';
-      rationale = `Flat book: ${rationale}`;
-    }
-    if (action === 'BUY' && !input.chainSymbols.has(symbol)) {
-      overrides.push({ from: `BUY:${symbol}`, to: 'SKIP', reason: 'symbol not in live chain' });
-      action = 'SKIP';
-      rationale = `Symbol not in chain: ${rationale}`;
-      symbol = [...input.chainSymbols][0] ?? symbol;
-    }
-    if (!input.allowed.includes(action)) {
-      action = 'SKIP';
-    }
-  }
-
-  return {
-    batch: {
-      ...input.batch,
-      decisions: [{ symbol, action, rationale, confidence: first.confidence }],
-    },
-    overrides,
-  };
-}
+export type ContractPick = z.infer<typeof contractPickSchema>;

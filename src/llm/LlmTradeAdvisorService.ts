@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 import type { KiteBroker } from '../broker/KiteBroker.js';
@@ -10,33 +11,47 @@ import {
   lookupSessionStartInstruments,
   type KiteInstrumentRef,
 } from '../instruments/kiteInstruments.js';
-import type { LlmChatClient } from './llmChatClient.js';
+import { completeJsonWithRetry, type LlmChatClient } from './llmChatClient.js';
 import {
-  buildLiveOptionDecisionMessages,
   buildOptionsUniverseMessages,
   buildUniverseMessages,
-  DECISION_MAX_OUTPUT_TOKENS,
   UNIVERSE_MAX_OUTPUT_TOKENS,
 } from './prompts.js';
 import {
   clampWatchlistToTop,
   dropIncludesNotPassing,
-  decisionBatchSchema,
-  clampLiveOptionDecision,
   intersectWatchlistWithCatalog,
   universeSuggestionSchema,
   type UniverseSuggestion,
 } from './schemas.js';
 import {
+  findDecisionsSince,
+  findOpenTrade,
   formatIstTimestamp,
-  findLatestOpenPosition,
   persistDecisions,
   writeUniverseFile,
+  type DecisionMeta,
+  type OpenTradeRecord,
 } from './decisionStore.js';
-import { UNIVERSE_BAR_LOOKBACK_DAYS, UNIVERSE_MIN_BARS_FOR_MOMENTUM, addCalendarDays, computeFetchWindow, istYmd, ymdToUtcDate } from '../universe/dates.js';
-import { mergeKnowledge, readLatestKnowledge, writeKnowledgeFile } from '../universe/knowledgeStore.js';
-import { diversifyByCorrelation, screenUniverse, UNIVERSE_MAX_INCLUDES } from '../universe/universeScreen.js';
-import type { DailyBar, IntradayBar } from '../universe/types.js';
+import {
+  UNIVERSE_BAR_LOOKBACK_DAYS,
+  UNIVERSE_MIN_BARS_FOR_MOMENTUM,
+  addCalendarDays,
+  computeFetchWindow,
+  istYmd,
+  ymdToUtcDate,
+} from '../universe/dates.js';
+import {
+  mergeKnowledge,
+  readLatestKnowledge,
+  writeKnowledgeFile,
+} from '../universe/knowledgeStore.js';
+import {
+  diversifyByCorrelation,
+  screenUniverse,
+  UNIVERSE_MAX_INCLUDES,
+} from '../universe/universeScreen.js';
+import type { DailyBar } from '../universe/types.js';
 import {
   INDEX_OPTION_NAMES,
   indexNameFromOptionSymbol,
@@ -57,43 +72,107 @@ import {
 import {
   DEFAULT_GREEKS_IV_ALGORITHM,
   IV_HV_SKIP_THRESHOLD,
-  OPTIONS_STOP_LOSS_PCT,
   computeOptionGreeks,
   parseGreeksIvAlgorithm,
-  scoreOptionNewsRisk,
+  strikeFromOptionSymbol,
   type GreeksIvAlgorithmId,
   type OptionContractMeta,
-  type OptionNewsRisk,
 } from '../options/greeksIv.js';
 import type { NewsService } from '../news/NewsService.js';
 import type { UniverseBook } from '../universe/types.js';
-import { isInsideMarketWindow } from '../services/MarketDataSessionService.js';
+import type { MarketQuote } from '../broker/KiteBroker.js';
+import { LiveMarketFeed, type MarketView } from '../services/LiveMarketFeed.js';
+import { istClock, istDayStart, minutesBetween, msUntilNextCycle } from '../strategy/clock.js';
 import {
-  buildDecisionTape,
-  formatIstWallClock,
-  formatStructuredRationale,
-  isNearOrAfterSessionClose,
-  isWeakTape,
-  sanitizeExitWhy,
-  structureNotesFromBars,
-  trendFromCloses,
-  type ChainQuoteRow,
-  type ChainSnapshot,
-  type IndexCandlePack,
-  type LiveOptionDecisionContext,
-} from './decisionContext.js';
+  buildCandidates,
+  type CandidateRejection,
+  type ContractCandidate,
+} from '../strategy/contracts.js';
 import {
-  DEFAULT_INDEX_OPTION_LOT,
-  buyClearsFeeTarget,
-  estimateOptionsRoundTripCost,
-} from './optionTradeCosts.js';
+  checkPositionExit,
+  decideEntry,
+  summarizeDay,
+  type DayRow,
+  type ExitReason,
+  type GateId,
+  type Leaning,
+  type OpenPosition,
+} from '../strategy/decisionEngine.js';
+import { pctChange } from '../strategy/indicators.js';
+import {
+  paramsVersion,
+  strategyParams,
+  tunableValues,
+  type StrategyParams,
+} from '../strategy/params.js';
+import {
+  describeBuy,
+  describeExit,
+  describeHold,
+  describeSkip,
+  describeUnrestorableExit,
+} from '../strategy/rationale.js';
+import { readIndex, SIGNAL_NAMES, type IndexReading } from '../strategy/signals.js';
+import {
+  parseDecisionSnapshot,
+  SNAPSHOT_SCHEMA,
+  type DecisionSnapshot,
+} from '../strategy/snapshot.js';
+import { pickContract, type ContractPickResult } from './contractPicker.js';
+import { estimateOptionsRoundTripCost } from './optionTradeCosts.js';
+
+/** Read-only Kite access; order placement is deliberately not part of this type. */
+export type MarketDataBroker = Pick<
+  KiteBroker,
+  | 'getQuotes'
+  | 'getNfoIndexOptions'
+  | 'getDailyCandles'
+  | 'getDayInstruments'
+  | 'getFiveMinuteCandles'
+>;
 
 export type LlmTradeAdvisorOptions = {
   llm: LlmChatClient;
   news: NewsService;
-  kite: KiteBroker;
+  kite: MarketDataBroker;
   logger: SessionLogger;
 };
+
+/** Stops are checked this often between cycles, so a fast move is sold close to its level. */
+const MONITOR_INTERVAL_MS = 15_000;
+
+/** The single open trade; `tuuid` ties its BUY, HOLDs and EXIT rows together. */
+type OpenTrade = OpenPosition & { tuuid: string };
+
+const EMPTY_BACKDROP: DecisionSnapshot['market'] = {
+  vixPct: null,
+  usdInrPct: null,
+  crudePct: null,
+  gapPct: null,
+  advancersPct: null,
+  headlineTone: 0,
+};
+
+function round(value: number | null, digits = 2): number | null {
+  return value === null || !Number.isFinite(value) ? null : Number(value.toFixed(digits));
+}
+
+/** Stops compare against the bid (what a sell would get), falling back to the last trade. */
+function exitCheckPrice(quote: MarketQuote | null, lastPrice: number | null): number | null {
+  return quote?.bid && quote.bid > 0 ? quote.bid : lastPrice;
+}
+
+function summarizeRejections(rejected: readonly CandidateRejection[]): string {
+  if (rejected.length === 0) {
+    return 'No option near the current price was available.';
+  }
+  const counts = new Map<string, number>();
+  for (const rejection of rejected) {
+    counts.set(rejection.reason, (counts.get(rejection.reason) ?? 0) + 1);
+  }
+  const reasons = [...counts.entries()].map(([reason, count]) => `${reason} (${count})`);
+  return `Checked ${rejected.length} options near the current price: ${reasons.join('; ')}.`;
+}
 
 export type UniverseSuggestResult = {
   filePath: string;
@@ -112,9 +191,19 @@ export type UniverseSuggestResult = {
 export class LlmTradeAdvisorService {
   private readonly llm: LlmChatClient;
   private readonly news: NewsService;
-  private readonly kite: KiteBroker;
+  private readonly kite: MarketDataBroker;
   private readonly logger: SessionLogger;
-  private timer: NodeJS.Timeout | undefined;
+  private readonly feed: LiveMarketFeed;
+  private readonly params: StrategyParams;
+  private running = false;
+  private loopGeneration = 0;
+  private cycleTimer: NodeJS.Timeout | undefined;
+  private monitorTimer: NodeJS.Timeout | undefined;
+  /** Serialises the 15-minute cycle and the 1-minute monitor. */
+  private queue: Promise<void> = Promise.resolve();
+  private queued = 0;
+  /** At most one open trade: while set, cycles only HOLD or EXIT it and never BUY. */
+  private position: OpenTrade | null = null;
   private includedSymbols: string[] = [];
   private sessionStartPayload: { instruments: SessionInstrument[] } = { instruments: [] };
   private watchlistFile: string | null = null;
@@ -123,13 +212,23 @@ export class LlmTradeAdvisorService {
   private optionContracts: OptionContractMeta[] = [];
   private lastQuotedPriceBySymbol: Record<string, number | null> = {};
   private decisionIndexes: IndexOptionName[] = [...INDEX_OPTION_NAMES];
-  private previousChainBySymbol: Record<string, { oi: number; volume: number }> = {};
+  /** Today's rows for the daily limits: read from the DB once a day, then updated in memory. */
+  private dayRows: { ymd: string; rows: DayRow[] } | null = null;
 
   public constructor(options: LlmTradeAdvisorOptions) {
     this.llm = options.llm;
     this.news = options.news;
     this.kite = options.kite;
     this.logger = options.logger;
+    this.feed = new LiveMarketFeed({
+      kite: options.kite,
+      news: options.news,
+      logger: options.logger,
+    });
+    this.params = strategyParams({
+      minHoldMinutes: config.llm.minHoldMinutes,
+      targetNetPnlPct: config.llm.targetNetPnlPct,
+    });
   }
 
   public getIncludedSymbols(): readonly string[] {
@@ -240,7 +339,9 @@ export class LlmTradeAdvisorService {
 
     const { candidates, preselected } = screenUniverse(knowledge.symbols);
     const candidateSymbols = candidates.map((candidate) => candidate.symbol);
-    const passing = new Set(candidates.filter((candidate) => candidate.pass).map((candidate) => candidate.symbol));
+    const passing = new Set(
+      candidates.filter((candidate) => candidate.pass).map((candidate) => candidate.symbol),
+    );
     const messages = buildUniverseMessages(
       asOfIst,
       candidates,
@@ -261,11 +362,18 @@ export class LlmTradeAdvisorService {
       .filter((item) => item.include)
       .map((item) => candidates.find((candidate) => candidate.symbol === item.symbol))
       .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate));
-    const diversified = diversifyByCorrelation(includedCandidates, knowledge.symbols, UNIVERSE_MAX_INCLUDES);
+    const diversified = diversifyByCorrelation(
+      includedCandidates,
+      knowledge.symbols,
+      UNIVERSE_MAX_INCLUDES,
+    );
     const diversifiedSymbols = new Set(diversified.map((candidate) => candidate.symbol));
     const cloneDropped = parsed.watchlist
       .filter((item) => item.include && !diversifiedSymbols.has(item.symbol))
-      .map((item) => ({ symbol: item.symbol, reason: 'Dropped as a 20d-return clone of a higher-ranked pick.' }));
+      .map((item) => ({
+        symbol: item.symbol,
+        reason: 'Dropped as a 20d-return clone of a higher-ranked pick.',
+      }));
     const suggestion = {
       ...parsed,
       watchlist: diversified.map((candidate, index) => {
@@ -277,7 +385,10 @@ export class LlmTradeAdvisorService {
     const includedSymbols = suggestion.watchlist
       .filter((item) => item.include)
       .map((item) => item.symbol);
-    const { instruments, unmappedSymbols } = lookupSessionStartInstruments(includedSymbols, catalog);
+    const { instruments, unmappedSymbols } = lookupSessionStartInstruments(
+      includedSymbols,
+      catalog,
+    );
 
     const sessionStartPayload = { instruments };
     const filePath = await writeUniverseFile({
@@ -455,7 +566,10 @@ export class LlmTradeAdvisorService {
     }
 
     const biases = underlyings.map((row) =>
-      indexOptionBias(row.tradingsymbol as IndexOptionName, knowledge.symbols[row.tradingsymbol]?.bars ?? []),
+      indexOptionBias(
+        row.tradingsymbol as IndexOptionName,
+        knowledge.symbols[row.tradingsymbol]?.bars ?? [],
+      ),
     );
     const indexFeatures = Object.fromEntries(
       underlyings.map((row) => [
@@ -473,9 +587,9 @@ export class LlmTradeAdvisorService {
         },
       ]),
     );
-    const steps = Object.fromEntries(underlyings.map((row) => [row.tradingsymbol, row.strikeStep])) as Partial<
-      Record<IndexOptionName, number>
-    >;
+    const steps = Object.fromEntries(
+      underlyings.map((row) => [row.tradingsymbol, row.strikeStep]),
+    ) as Partial<Record<IndexOptionName, number>>;
     const screened = screenIndexOptions({
       contracts: chain,
       quotes: optionQuotes,
@@ -493,7 +607,11 @@ export class LlmTradeAdvisorService {
         chainCount: chain.length,
         screenedCount: screened.length,
         passingCount: passingRows.length,
-        biases: biases.map((bias) => ({ index: bias.index, side: bias.side, reasons: bias.failReasons })),
+        biases: biases.map((bias) => ({
+          index: bias.index,
+          side: bias.side,
+          reasons: bias.failReasons,
+        })),
       },
       'Index-options local screen finished.',
     );
@@ -501,9 +619,15 @@ export class LlmTradeAdvisorService {
     const passing = new Set(passingRows.map((row) => row.symbol));
     const rowBySymbol = new Map(screened.map((row) => [row.symbol, row]));
     const indexDailyByName = Object.fromEntries(
-      underlyings.map((row) => [row.tradingsymbol, knowledge.symbols[row.tradingsymbol]?.bars ?? []]),
+      underlyings.map((row) => [
+        row.tradingsymbol,
+        knowledge.symbols[row.tradingsymbol]?.bars ?? [],
+      ]),
     );
-    const greeksBySymbol: Record<string, { delta: number | null; iv: number | null; ivHv: number | null }> = {};
+    const greeksBySymbol: Record<
+      string,
+      { delta: number | null; iv: number | null; ivHv: number | null }
+    > = {};
     for (const row of passingRows) {
       const snapshot = computeOptionGreeks({
         premium: row.ltp,
@@ -526,7 +650,10 @@ export class LlmTradeAdvisorService {
     const allowedSymbols = new Set(passingRows.map((row) => row.symbol));
     const parsed = clampWatchlistToTop(
       dropIncludesNotPassing(
-        intersectWatchlistWithCatalog(universeSuggestionSchema.parse(completion.parsed), allowedSymbols),
+        intersectWatchlistWithCatalog(
+          universeSuggestionSchema.parse(completion.parsed),
+          allowedSymbols,
+        ),
         passing,
       ),
       OPTIONS_MAX_INCLUDES,
@@ -553,7 +680,10 @@ export class LlmTradeAdvisorService {
           algorithm = 'greeks_iv_skip';
         }
         if (!item?.algorithm) {
-          this.logger.info({ symbol: row.symbol, algorithm }, 'Options universe defaulted algorithm.');
+          this.logger.info(
+            { symbol: row.symbol, algorithm },
+            'Options universe defaulted algorithm.',
+          );
         }
         return {
           symbol: row.symbol,
@@ -567,7 +697,10 @@ export class LlmTradeAdvisorService {
         ...parsed.exclude,
         ...parsed.watchlist
           .filter((item) => item.include && !keptSet.has(item.symbol))
-          .map((item) => ({ symbol: item.symbol, reason: 'Dropped by per-index cap or local screen.' })),
+          .map((item) => ({
+            symbol: item.symbol,
+            reason: 'Dropped by per-index cap or local screen.',
+          })),
       ],
     };
     const instruments = toSessionInstruments(keptRows);
@@ -637,7 +770,7 @@ export class LlmTradeAdvisorService {
   }
 
   public isDecisionLoopRunning(): boolean {
-    return this.timer !== undefined;
+    return this.running;
   }
 
   public getDecisionLoopStatus() {
@@ -652,324 +785,795 @@ export class LlmTradeAdvisorService {
       })),
       watchlistFile: this.watchlistFile,
       book: this.book,
+      tuuid: this.position?.tuuid ?? null,
     };
   }
 
+  /**
+   * Rules decide BUY/HOLD/EXIT/SKIP every cycle (aligned to the clock); the LLM only picks
+   * the strike for a BUY. An open position is also checked every minute. Store-only.
+   */
   public async startDecisionLoop(
     indexes?: readonly IndexOptionName[],
   ): Promise<ReturnType<LlmTradeAdvisorService['getDecisionLoopStatus']>> {
-    if (this.timer) {
-      throw Object.assign(new Error('The LLM decision loop is already running.'), { statusCode: 400 });
+    if (this.running) {
+      throw Object.assign(new Error('The LLM decision loop is already running.'), {
+        statusCode: 400,
+      });
     }
 
     this.book = 'options';
-    this.decisionIndexes =
-      indexes && indexes.length > 0 ? [...indexes] : [...INDEX_OPTION_NAMES];
+    this.decisionIndexes = indexes && indexes.length > 0 ? [...indexes] : [...INDEX_OPTION_NAMES];
     this.includedSymbols = [];
-    this.previousChainBySymbol = {};
-    const open = await findLatestOpenPosition();
-    if (open) {
-      this.includedSymbols = [open.symbol];
-      this.sessionStartPayload = {
-        instruments: [
-          {
-            instrumentToken: open.instrumentToken ?? 0,
-            exchange: 'NFO',
-            tradingsymbol: open.symbol,
-          },
-        ],
-      };
-    } else {
-      this.sessionStartPayload = { instruments: [] };
+    this.sessionStartPayload = { instruments: [] };
+    this.dayRows = null;
+    this.running = true;
+    this.loopGeneration += 1;
+    const generation = this.loopGeneration;
+    try {
+      await this.runExclusive(() => this.restoreOpenPosition());
+      await this.runExclusive(() => this.runDecisionCycle());
+    } catch (error: unknown) {
+      this.stop();
+      throw error;
     }
 
-    const intervalMs = config.llm.decisionIntervalMinutes * 60_000;
-    this.timer = setInterval(() => {
-      void this.runDecisionCycle().catch((error: unknown) => {
-        this.logger.error({ err: error }, 'LLM decision cycle failed.');
-      });
-    }, intervalMs);
-    this.timer.unref?.();
+    this.scheduleNextCycle(generation);
+    this.monitorTimer = setInterval(() => {
+      void this.monitorTick();
+    }, MONITOR_INTERVAL_MS);
+    this.monitorTimer.unref?.();
 
     this.logger.info(
       {
         intervalMinutes: config.llm.decisionIntervalMinutes,
         indexes: this.decisionIndexes,
-        openSymbol: open?.symbol ?? null,
+        openSymbol: this.position?.symbol ?? null,
+        paramsVersion: paramsVersion(this.params),
       },
-      'Started live options decision loop (picks contract + action each cycle). Store-only.',
+      'Started rules-based options decision loop (LLM picks the strike only). Store-only.',
     );
-
-    try {
-      await this.runDecisionCycle();
-    } catch (error: unknown) {
-      this.stop();
-      throw error;
-    }
     return this.getDecisionLoopStatus();
   }
 
   public stop(): ReturnType<LlmTradeAdvisorService['getDecisionLoopStatus']> {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
+    this.running = false;
+    if (this.cycleTimer) {
+      clearTimeout(this.cycleTimer);
+      this.cycleTimer = undefined;
+    }
+    if (this.monitorTimer) {
+      clearInterval(this.monitorTimer);
+      this.monitorTimer = undefined;
     }
     return this.getDecisionLoopStatus();
   }
 
-  public async runDecisionCycle(): Promise<number> {
-    const asOf = new Date();
-    const asOfIst = formatIstTimestamp(asOf);
-    const openRow = await findLatestOpenPosition();
-    const openBuy =
-      openRow?.buyPrice !== null && openRow?.buyPrice !== undefined
-        ? Number(openRow.buyPrice)
-        : null;
-    const heldMinutes = openRow
-      ? Math.max(0, Math.floor((asOf.getTime() - openRow.decidedAt.getTime()) / 60_000))
-      : 0;
-    const allowed = openRow
-      ? (['HOLD', 'EXIT'] as const)
-      : (['BUY', 'SKIP'] as const);
-
-    const context = await this.buildLiveOptionContext({
-      asOf,
-      asOfIst,
-      open: openRow
-        ? {
-            symbol: openRow.symbol,
-            buyPrice: openBuy !== null && Number.isFinite(openBuy) ? openBuy : null,
-            heldMinutes,
-            instrumentToken: openRow.instrumentToken,
-          }
-        : null,
-      allowed: [...allowed],
+  private runExclusive<T>(task: () => Promise<T>): Promise<T> {
+    this.queued += 1;
+    const run = this.queue.then(task).finally(() => {
+      this.queued -= 1;
     });
-
-    if (context.chain.rows.length === 0 && !openRow) {
-      this.logger.info({ indexes: this.decisionIndexes }, 'Skipping decision cycle; empty option chain.');
-      return 0;
-    }
-
-    const forceFlat = !isInsideMarketWindow(asOf) || isNearOrAfterSessionClose(asOf);
-    if (forceFlat && !openRow) {
-      const skipBatch = {
-        decisions: [
-          {
-            symbol: context.chain.rows[0]?.symbol ?? 'NONE',
-            action: 'SKIP' as const,
-            rationale: formatStructuredRationale({
-              tape: context.tape,
-              decision: 'SKIP',
-              why: 'session close or outside market window; no new overnight risk',
-            }),
-          },
-        ],
-      };
-      if (skipBatch.decisions[0]!.symbol === 'NONE') {
-        return 0;
-      }
-      const stored = await persistDecisions({
-        asOf,
-        batch: skipBatch,
-        lastPriceBySymbol: { [skipBatch.decisions[0]!.symbol]: context.chain.rows[0]?.ltp ?? null },
-        tokenBySymbol: { [skipBatch.decisions[0]!.symbol]: context.chain.rows[0]?.token ?? null },
-        marketSnapshotBySymbol: {
-          [skipBatch.decisions[0]!.symbol]: { tape: context.tape, sessionFlat: true },
-        },
-      });
-      this.logger.info({ stored }, 'Stored SKIP for session-flat / no overnight.');
-      return stored;
-    }
-
-    const messages = buildLiveOptionDecisionMessages(context);
-    const completion = await this.completeWithRetry(messages, 'decision');
-    const parsed = decisionBatchSchema.parse(completion.parsed);
-    const chainSymbols = new Set(context.chain.rows.map((row) => row.symbol));
-    if (openRow) {
-      chainSymbols.add(openRow.symbol);
-    }
-
-    let { batch, overrides } = clampLiveOptionDecision({
-      batch: parsed,
-      openSymbol: openRow?.symbol ?? null,
-      chainSymbols,
-      allowed: [...allowed],
-    });
-
-    const decision = batch.decisions[0];
-    if (!decision || decision.symbol === 'NONE') {
-      this.logger.info('Skipping persist; no usable LLM decision symbol.');
-      return 0;
-    }
-
-    const chainRow = context.chain.rows.find((row) => row.symbol === decision.symbol);
-    const ltp =
-      chainRow?.ltp ??
-      (decision.symbol === openRow?.symbol ? this.lastQuotedPriceBySymbol[decision.symbol] ?? null : null);
-    const buySide = optionSideFromSymbol(decision.symbol);
-    const newsForIndex = (() => {
-      const index = indexNameFromOptionSymbol(decision.symbol) ?? context.tape.index;
-      return index ? (context.newsRiskByIndex[index]?.level ?? 'none') : context.tape.newsLevel;
-    })();
-
-    if (forceFlat && openRow) {
-      overrides = [...overrides, { from: decision.action, to: 'EXIT', reason: 'session close; no overnight' }];
-      batch = {
-        ...batch,
-        decisions: [{ ...decision, action: 'EXIT', rationale: decision.rationale }],
-      };
-    }
-
-    let working = batch.decisions[0]!;
-
-    if (!openRow && working.action === 'BUY' && isWeakTape(context.tape)) {
-      overrides = [...overrides, { from: 'BUY', to: 'SKIP', reason: 'weak tape; confluence < 2 or mixed swings' }];
-      working = { ...working, action: 'SKIP' };
-    }
-
-    if (
-      !openRow &&
-      working.action === 'BUY' &&
-      context.tape.sideFromCandles &&
-      buySide &&
-      buySide !== context.tape.sideFromCandles
-    ) {
-      overrides = [
-        ...overrides,
-        { from: `BUY:${buySide}`, to: 'SKIP', reason: 'CE/PE disagrees with last 1-3 candle pattern' },
-      ];
-      working = { ...working, action: 'SKIP' };
-    }
-
-    if (!openRow && working.action === 'BUY' && newsForIndex === 'high') {
-      overrides = [...overrides, { from: 'BUY', to: 'SKIP', reason: 'high event news' }];
-      working = { ...working, action: 'SKIP' };
-    }
-
-    if (working.action === 'BUY' && ltp !== null && ltp > 0) {
-      const clears = buyClearsFeeTarget({
-        premium: ltp,
-        quantity: DEFAULT_INDEX_OPTION_LOT,
-        targetNetPnlPct: config.llm.targetNetPnlPct,
-      });
-      if (!clears) {
-        overrides = [
-          ...overrides,
-          { from: 'BUY', to: 'SKIP', reason: 'target net PnL does not clear estimated fees' },
-        ];
-        working = { ...working, action: 'SKIP' };
-      }
-    }
-
-    const pnlPct =
-      openBuy !== null && openBuy > 0 && ltp !== null && Number.isFinite(ltp)
-        ? ((ltp - openBuy) / openBuy) * 100
-        : null;
-    const stopHit = pnlPct !== null && pnlPct <= -OPTIONS_STOP_LOSS_PCT;
-
-    if (openRow && working.action === 'EXIT' && !forceFlat && heldMinutes < config.llm.minHoldMinutes) {
-      const newsHigh = newsForIndex === 'high';
-      if (!newsHigh && !stopHit) {
-        overrides = [
-          ...overrides,
-          {
-            from: 'EXIT',
-            to: 'HOLD',
-            reason: `min hold ${heldMinutes}m < ${config.llm.minHoldMinutes}m`,
-          },
-        ];
-        working = { ...working, action: 'HOLD' };
-      }
-    }
-
-    const llmWhy = working.rationale;
-    let why =
-      working.action === 'EXIT'
-        ? sanitizeExitWhy({
-            why: llmWhy,
-            pnlPct,
-            targetNetPnlPct: config.llm.targetNetPnlPct,
-            newsLevel: newsForIndex,
-          })
-        : working.action === 'SKIP' && isWeakTape(context.tape)
-          ? 'weak confluence; mixed swings or unconfirmed candles'
-          : llmWhy;
-    if (forceFlat && working.action === 'EXIT') {
-      why = 'session close; flatten same day';
-    }
-    if (stopHit && working.action === 'EXIT') {
-      why = `premium stop ${pnlPct?.toFixed(1)}%`;
-    }
-
-    working = {
-      ...working,
-      rationale: formatStructuredRationale({
-        tape: context.tape,
-        decision: working.action,
-        why,
-      }),
-    };
-    batch = { ...batch, decisions: [working] };
-
-    if (overrides.length > 0) {
-      this.logger.warn({ overrides }, 'Clamped live option decision.');
-    }
-
-    const storedDecision = batch.decisions[0]!;
-    const lastPriceBySymbol: Record<string, number | null> = {
-      [storedDecision.symbol]: ltp,
-    };
-    this.lastQuotedPriceBySymbol = { ...this.lastQuotedPriceBySymbol, ...lastPriceBySymbol };
-
-    const tokenBySymbol: Record<string, number | null> = {
-      [storedDecision.symbol]:
-        chainRow?.token ?? openRow?.instrumentToken ?? null,
-    };
-
-    const priorBuyPriceBySymbol: Record<string, string | null> = {
-      [storedDecision.symbol]: openRow?.buyPrice ?? null,
-    };
-
-    const stored = await persistDecisions({
-      asOf,
-      batch,
-      lastPriceBySymbol,
-      priorBuyPriceBySymbol,
-      tokenBySymbol,
-      marketSnapshotBySymbol: {
-        [storedDecision.symbol]: {
-          pcr: context.chain.pcr,
-          newsRisk: context.newsRiskByIndex,
-          fees: context.fees,
-          heldMinutes,
-          ltp,
-          tape: context.tape,
-          pnlPct,
-        },
-      },
-    });
-
-    this.applyDecisionState(storedDecision.action, storedDecision.symbol, tokenBySymbol[storedDecision.symbol] ?? null);
-
-    this.logger.info(
-      {
-        stored,
-        symbol: storedDecision.symbol,
-        action: storedDecision.action,
-        indexes: this.decisionIndexes,
-      },
-      'Stored live LLM option decision without executing.',
+    this.queue = run.then(
+      () => undefined,
+      () => undefined,
     );
+    return run;
+  }
 
+  /** `generation` stops a cycle from a stopped-and-restarted loop scheduling a second timer. */
+  private scheduleNextCycle(generation: number): void {
+    if (!this.running || generation !== this.loopGeneration) {
+      return;
+    }
+    const delay = msUntilNextCycle(new Date(), config.llm.decisionIntervalMinutes);
+    this.cycleTimer = setTimeout(() => {
+      void this.runExclusive(() => this.runDecisionCycle())
+        .catch((error: unknown) => {
+          this.logger.error({ err: error }, 'Decision cycle failed.');
+        })
+        .finally(() => this.scheduleNextCycle(generation));
+    }, delay);
+    this.cycleTimer.unref?.();
+  }
+
+  private async monitorTick(): Promise<void> {
+    if (!this.running || !this.position || this.queued > 0) {
+      return;
+    }
+    try {
+      await this.runExclusive(() => this.checkOpenPositionNow('monitor'));
+    } catch (error: unknown) {
+      this.logger.error({ err: error }, 'Position monitor check failed.');
+    }
+  }
+
+  /** One decision cycle. Returns the number of rows stored (0 when nothing to decide). */
+  public async runDecisionCycle(): Promise<number> {
+    const now = new Date();
+    const clock = istClock(now);
+    const open = this.position;
+    const outsideDecisionHours =
+      !clock.isWeekday ||
+      clock.minute < this.params.entryStartMinute ||
+      clock.minute > this.params.squareOffMinute;
+    if (!open && outsideDecisionHours) {
+      return 0;
+    }
+
+    // An open trade is the only thing analysed until it is sold: its index alone, HOLD or EXIT.
+    const indexes = open ? [open.index] : this.decisionIndexes;
+    const view = await this.feed.load(indexes, now, {
+      extraSymbols: open ? [open.symbol] : [],
+      newsLookbackMinutes: this.params.newsLookbackMinutes,
+    });
+    if (!open && !view.isTradingDay) {
+      this.logger.info(
+        { dataGaps: view.dataGaps },
+        'No market data for today yet; nothing stored.',
+      );
+      return 0;
+    }
+    const readings = view.indexes.map((data) => readIndex(data, view.backdrop, this.params, now));
+    return open
+      ? this.reviewOpenPosition(open, view, readings, now)
+      : this.lookForEntry(view, readings, now);
+  }
+
+  private async lookForEntry(
+    view: MarketView,
+    readings: IndexReading[],
+    now: Date,
+  ): Promise<number> {
+    const day = summarizeDay(await this.todayRows(now), now);
+    const entry = decideEntry({ now, readings, day, vixPct: view.backdrop.vixPct }, this.params);
+    if (entry.action === 'SKIP') {
+      return this.storeSkip({
+        view,
+        readings,
+        now,
+        blockedBy: entry.blockedBy,
+        leaning: entry.leaning,
+        reading: entry.reading,
+      });
+    }
+
+    const data = view.indexes.find((item) => item.index === entry.index);
+    const { candidates, rejected } =
+      data && data.spot !== null
+        ? buildCandidates(
+            {
+              chain: data.chain,
+              index: entry.index,
+              side: entry.side,
+              spot: data.spot,
+              step: data.step,
+              todayYmd: view.todayYmd,
+              indexDaily: view.indexDaily[entry.index] ?? [],
+            },
+            this.params,
+          )
+        : { candidates: [], rejected: [] };
+    if (candidates.length === 0) {
+      return this.storeSkip({
+        view,
+        readings,
+        now,
+        blockedBy: ['no-liquid-contract'],
+        leaning: { index: entry.index, side: entry.side, score: entry.score },
+        reading: entry.reading,
+        detail: summarizeRejections(rejected),
+      });
+    }
+
+    const pick = await pickContract(
+      this.llm,
+      {
+        index: entry.index,
+        side: entry.side,
+        score: entry.score,
+        minutesToSquareOff: this.params.squareOffMinute - istClock(now).minute,
+        candidates,
+      },
+      this.logger,
+    );
+    return this.storeBuy({ view, readings, now, reading: entry.reading, pick, candidates });
+  }
+
+  private async todayRows(now: Date): Promise<DayRow[]> {
+    const ymd = istClock(now).ymd;
+    if (this.dayRows?.ymd !== ymd) {
+      const stored = await findDecisionsSince(istDayStart(now));
+      this.dayRows = {
+        ymd,
+        rows: stored.map((row) => ({
+          ...row,
+          trigger: parseDecisionSnapshot(row.marketSnapshot)?.trigger ?? null,
+        })),
+      };
+    }
+    return this.dayRows.rows;
+  }
+
+  /** Keeps the in-memory day rows in step with a stored BUY or EXIT. */
+  private recordDayRow(row: DayRow): void {
+    if (this.dayRows?.ymd === istClock(row.decidedAt).ymd) {
+      this.dayRows.rows.push(row);
+    }
+  }
+
+  private async reviewOpenPosition(
+    position: OpenTrade,
+    view: MarketView,
+    readings: IndexReading[],
+    now: Date,
+  ): Promise<number> {
+    const quote = view.extraQuotes[position.symbol] ?? null;
+    const price = this.trackPrice(position, quote);
+    const reading = readings.find((item) => item.index === position.index) ?? null;
+    const check = checkPositionExit(
+      {
+        now,
+        position,
+        price: exitCheckPrice(quote, price),
+        spot: view.spots[position.index] ?? null,
+        reading,
+      },
+      this.params,
+    );
+    if (check.action === 'EXIT') {
+      return this.storeExit({
+        position,
+        quote,
+        reason: check.reason,
+        now,
+        trigger: 'cycle',
+        spots: view.spots,
+        view,
+        readings,
+      });
+    }
+    const netPnlInr = this.netPnlInr(position, price);
+    const rationale = describeHold({ position, price, netPnlInr, reading, params: this.params });
+    const stored = await persistDecisions({
+      asOf: now,
+      batch: { decisions: [{ symbol: position.symbol, action: 'HOLD', rationale }] },
+      lastPriceBySymbol: { [position.symbol]: price },
+      priorBuyPriceBySymbol: { [position.symbol]: position.entryPrice.toFixed(4) },
+      tokenBySymbol: { [position.symbol]: position.token },
+      tuuidBySymbol: { [position.symbol]: position.tuuid },
+      marketSnapshotBySymbol: {
+        [position.symbol]: this.snapshot({
+          now,
+          trigger: 'cycle',
+          spots: view.spots,
+          view,
+          readings,
+          blockedBy: [],
+          leaning: null,
+          position: this.positionSnapshot(position, now, price),
+        }),
+      },
+    });
+    this.applyDecisionState('HOLD', position.symbol, position.token);
     return stored;
   }
 
-  private applyDecisionState(
-    action: string,
-    symbol: string,
-    token: number | null,
-  ): void {
+  /** Minute check (and start-up check) of the open position: stops, trailing, time, 15:15. */
+  private async checkOpenPositionNow(trigger: 'monitor' | 'startup'): Promise<void> {
+    const position = this.position;
+    if (!position) {
+      return;
+    }
+    const now = new Date();
+    let quote: MarketQuote | null = null;
+    let spots: Partial<Record<IndexOptionName, number>> = {};
+    try {
+      ({ quote, spots } = await this.feed.quotePosition(position.symbol));
+    } catch (error: unknown) {
+      this.logger.warn({ err: error, symbol: position.symbol }, 'Position quote failed.');
+    }
+    const price = this.trackPrice(position, quote);
+    const check = checkPositionExit(
+      {
+        now,
+        position,
+        price: exitCheckPrice(quote, price),
+        spot: spots[position.index] ?? null,
+      },
+      this.params,
+    );
+    if (check.action === 'EXIT') {
+      await this.storeExit({ position, quote, reason: check.reason, now, trigger, spots });
+    }
+  }
+
+  /** Rebuilds the open position from the DB on start; closes it at once if it is from an earlier day. */
+  private async restoreOpenPosition(): Promise<void> {
+    this.position = null;
+    const trade = await findOpenTrade();
+    if (!trade) {
+      return;
+    }
+    const index = indexNameFromOptionSymbol(trade.symbol);
+    const side = optionSideFromSymbol(trade.symbol);
+    const buySnapshot = parseDecisionSnapshot(trade.buySnapshot);
+    const bought = buySnapshot?.position;
+    const latest = parseDecisionSnapshot(trade.latestSnapshot)?.position;
+    const entryPrice = trade.buyPrice ?? bought?.entryPrice ?? trade.holdPrices[0] ?? null;
+    if (!index || !side || entryPrice === null || !(entryPrice > 0)) {
+      await this.closeUnrestorableTrade(trade);
+      return;
+    }
+    const seenPrices = [entryPrice, ...trade.holdPrices];
+    this.position = {
+      tuuid: trade.tuuid ?? randomUUID(),
+      symbol: trade.symbol,
+      index,
+      side,
+      strike: bought?.strike ?? strikeFromOptionSymbol(trade.symbol),
+      expiry: bought?.expiry ?? null,
+      token: trade.instrumentToken,
+      entryPrice,
+      enteredAt: trade.enteredAt,
+      peakPrice: Math.max(...seenPrices, latest?.peakPrice ?? entryPrice),
+      troughPrice: Math.min(...seenPrices, latest?.troughPrice ?? entryPrice),
+      lotSize: bought?.lotSize ?? null,
+      entryDelta: bought?.entryDelta ?? null,
+      entrySpot: buySnapshot?.spots[index] ?? null,
+    };
+    this.applyDecisionState('HOLD', trade.symbol, trade.instrumentToken);
+    if (istClock(trade.enteredAt).ymd < istClock(new Date()).ymd) {
+      await this.checkOpenPositionNow('startup');
+    }
+  }
+
+  /**
+   * Stores a SELL for an open trade that cannot be rebuilt (e.g. a leftover stock BUY or a row
+   * with no entry price), so the one-open-trade rule holds and the loop can trade again.
+   */
+  private async closeUnrestorableTrade(trade: OpenTradeRecord): Promise<void> {
+    const now = new Date();
+    const tuuid = trade.tuuid ?? randomUUID();
+    const rationale = describeUnrestorableExit({
+      symbol: trade.symbol,
+      exitPrice: trade.lastPrice,
+      buyPrice: trade.buyPrice,
+    });
+    await persistDecisions({
+      asOf: now,
+      batch: { decisions: [{ symbol: trade.symbol, action: 'EXIT', rationale }] },
+      lastPriceBySymbol: { [trade.symbol]: trade.lastPrice },
+      priorBuyPriceBySymbol: { [trade.symbol]: trade.buyPrice?.toFixed(4) ?? null },
+      tokenBySymbol: { [trade.symbol]: trade.instrumentToken },
+      tuuidBySymbol: { [trade.symbol]: tuuid },
+      marketSnapshotBySymbol: {
+        [trade.symbol]: this.snapshot({
+          now,
+          trigger: 'startup',
+          spots: {},
+          view: null,
+          readings: [],
+          blockedBy: [],
+          leaning: null,
+          exit: { reason: 'unrestorable', priceSource: 'last-known' },
+        }),
+      },
+    });
+    this.recordDayRow({
+      action: 'EXIT',
+      decidedAt: now,
+      buyPrice: trade.buyPrice,
+      sellPrice: trade.lastPrice,
+      trigger: 'startup',
+    });
+    this.applyDecisionState('EXIT', trade.symbol, trade.instrumentToken);
+    this.logger.warn(
+      { symbol: trade.symbol, tuuid, exitPrice: trade.lastPrice },
+      'Open trade could not be restored; stored a SELL for it so only one trade is ever open.',
+    );
+  }
+
+  private async storeBuy(input: {
+    view: MarketView;
+    readings: IndexReading[];
+    now: Date;
+    reading: IndexReading;
+    pick: ContractPickResult;
+    candidates: ContractCandidate[];
+  }): Promise<number> {
+    if (this.position) {
+      throw new Error(
+        `A trade is already open (${this.position.symbol}, tuuid ${this.position.tuuid}); BUY refused.`,
+      );
+    }
+    const { candidate, pickedBy, note, llm } = input.pick;
+    const fillPrice = candidate.ask;
+    const position: OpenTrade = {
+      tuuid: randomUUID(),
+      symbol: candidate.symbol,
+      index: candidate.index,
+      side: candidate.side,
+      strike: candidate.strike,
+      expiry: candidate.expiry,
+      token: candidate.token,
+      entryPrice: fillPrice,
+      enteredAt: input.now,
+      peakPrice: fillPrice,
+      troughPrice: fillPrice,
+      lotSize: candidate.lotSize,
+      entryDelta: candidate.delta,
+      entrySpot: input.view.spots[candidate.index] ?? input.reading.spot ?? null,
+    };
+    const rationale = describeBuy({
+      now: input.now,
+      candidate,
+      fillPrice,
+      reading: input.reading,
+      pickedBy,
+      candidateCount: input.candidates.length,
+      params: this.params,
+    });
+    const meta: DecisionMeta = {
+      confidence: Math.abs(input.reading.score) / SIGNAL_NAMES.length,
+      ...(llm
+        ? { model: llm.model, promptHash: llm.promptHash, rawCompletion: llm.rawCompletion }
+        : {}),
+    };
+    const stored = await persistDecisions({
+      asOf: input.now,
+      batch: { decisions: [{ symbol: candidate.symbol, action: 'BUY', rationale }] },
+      lastPriceBySymbol: { [candidate.symbol]: fillPrice },
+      tokenBySymbol: { [candidate.symbol]: candidate.token },
+      tuuidBySymbol: { [candidate.symbol]: position.tuuid },
+      metaBySymbol: { [candidate.symbol]: meta },
+      marketSnapshotBySymbol: {
+        [candidate.symbol]: this.snapshot({
+          now: input.now,
+          trigger: 'cycle',
+          spots: input.view.spots,
+          view: input.view,
+          readings: input.readings,
+          blockedBy: [],
+          leaning: null,
+          entry: {
+            index: candidate.index,
+            side: candidate.side,
+            score: input.reading.score,
+            chosen: candidate.symbol,
+            pickedBy,
+            pickerNote: note,
+            candidates: input.candidates.map((item) => ({
+              symbol: item.symbol,
+              strike: item.strike,
+              ask: item.ask,
+              spreadPct: item.spreadPct,
+              delta: item.delta,
+              ivToHv: item.ivToHv,
+              rank: item.rank,
+            })),
+          },
+          position: this.positionSnapshot(position, input.now, candidate.ltp),
+          fees: { totalInr: candidate.feeInr, lotSize: candidate.lotSize },
+        }),
+      },
+    });
+    this.position = position;
+    this.recordDayRow({
+      action: 'BUY',
+      decidedAt: input.now,
+      buyPrice: fillPrice,
+      sellPrice: null,
+      trigger: 'cycle',
+    });
+    this.lastQuotedPriceBySymbol[candidate.symbol] = candidate.ltp;
+    this.applyDecisionState('BUY', candidate.symbol, candidate.token);
+    this.logger.info(
+      {
+        symbol: candidate.symbol,
+        tuuid: position.tuuid,
+        fillPrice,
+        pickedBy,
+        score: input.reading.score,
+      },
+      'Stored rules-based BUY without executing.',
+    );
+    return stored;
+  }
+
+  private async storeSkip(input: {
+    view: MarketView;
+    readings: IndexReading[];
+    now: Date;
+    blockedBy: GateId[];
+    leaning: Leaning | null;
+    reading: IndexReading | null;
+    detail?: string;
+  }): Promise<number> {
+    if (this.position) {
+      throw new Error(
+        `A trade is open (${this.position.symbol}, tuuid ${this.position.tuuid}); only HOLD or EXIT are allowed.`,
+      );
+    }
+    const shadow = input.leaning ? this.shadowContract(input.view, input.leaning) : null;
+    const index =
+      input.leaning?.index ?? input.reading?.index ?? this.decisionIndexes[0] ?? 'NIFTY';
+    const data = input.view.indexes.find((item) => item.index === index);
+    // A SKIP is not a trade, so it is stored under the index futures contract, never an option;
+    // the option it would have bought stays in the snapshot's `leaning`.
+    const row = data?.futures
+      ? { symbol: data.futures.symbol, price: data.futuresPrice, token: data.futures.token }
+      : {
+          symbol: shadow?.symbol ?? index,
+          price: shadow?.premium ?? null,
+          token: shadow?.token ?? null,
+        };
+    const { symbol } = row;
+    const rationale = describeSkip({
+      now: input.now,
+      blockedBy: input.blockedBy,
+      leaning: input.leaning,
+      reading: input.reading,
+      params: this.params,
+      ...(input.detail ? { detail: input.detail } : {}),
+    });
+    const stored = await persistDecisions({
+      asOf: input.now,
+      batch: { decisions: [{ symbol, action: 'SKIP', rationale }] },
+      lastPriceBySymbol: { [symbol]: row.price },
+      tokenBySymbol: { [symbol]: row.token },
+      marketSnapshotBySymbol: {
+        [symbol]: this.snapshot({
+          now: input.now,
+          trigger: 'cycle',
+          spots: input.view.spots,
+          view: input.view,
+          readings: input.readings,
+          blockedBy: input.blockedBy,
+          leaning: input.leaning
+            ? {
+                ...input.leaning,
+                symbol: shadow?.symbol ?? null,
+                premium: shadow?.premium ?? null,
+                delta: shadow?.delta ?? null,
+              }
+            : null,
+        }),
+      },
+    });
+    this.applyDecisionState('SKIP', symbol, null);
+    return stored;
+  }
+
+  private async storeExit(input: {
+    position: OpenTrade;
+    quote: MarketQuote | null;
+    reason: ExitReason;
+    now: Date;
+    trigger: DecisionSnapshot['trigger'];
+    spots: Partial<Record<IndexOptionName, number>>;
+    view?: MarketView;
+    readings?: IndexReading[];
+  }): Promise<number> {
+    const { position } = input;
+    const last = input.quote?.lastPrice && input.quote.lastPrice > 0 ? input.quote.lastPrice : null;
+    const bid = input.quote?.bid ?? null;
+    const exitPrice = bid ?? last ?? this.lastQuotedPriceBySymbol[position.symbol] ?? null;
+    const priceSource = bid !== null ? 'bid' : last !== null ? 'last-trade' : 'last-known';
+    const netPnlInr = this.netPnlInr(position, exitPrice);
+    const rationale = describeExit({
+      now: input.now,
+      position,
+      exitPrice,
+      reason: input.reason,
+      netPnlInr,
+      params: this.params,
+    });
+    const stored = await persistDecisions({
+      asOf: input.now,
+      batch: { decisions: [{ symbol: position.symbol, action: 'EXIT', rationale }] },
+      lastPriceBySymbol: { [position.symbol]: exitPrice },
+      priorBuyPriceBySymbol: { [position.symbol]: position.entryPrice.toFixed(4) },
+      tokenBySymbol: { [position.symbol]: position.token },
+      tuuidBySymbol: { [position.symbol]: position.tuuid },
+      marketSnapshotBySymbol: {
+        [position.symbol]: this.snapshot({
+          now: input.now,
+          trigger: input.trigger,
+          spots: input.spots,
+          view: input.view ?? null,
+          readings: input.readings ?? [],
+          blockedBy: [],
+          leaning: null,
+          position: this.positionSnapshot(position, input.now, last ?? exitPrice),
+          exit: { reason: input.reason, priceSource },
+          ...(position.lotSize
+            ? {
+                fees: {
+                  totalInr:
+                    exitPrice === null
+                      ? 0
+                      : estimateOptionsRoundTripCost({
+                          buyPremium: position.entryPrice,
+                          sellPremium: exitPrice,
+                          quantity: position.lotSize,
+                        }).totalInr,
+                  lotSize: position.lotSize,
+                },
+              }
+            : {}),
+        }),
+      },
+    });
+    this.position = null;
+    this.recordDayRow({
+      action: 'EXIT',
+      decidedAt: input.now,
+      buyPrice: position.entryPrice,
+      sellPrice: exitPrice,
+      trigger: input.trigger,
+    });
+    this.applyDecisionState('EXIT', position.symbol, position.token);
+    this.logger.info(
+      {
+        symbol: position.symbol,
+        tuuid: position.tuuid,
+        reason: input.reason,
+        exitPrice,
+        priceSource,
+        trigger: input.trigger,
+      },
+      'Stored rules-based EXIT without executing.',
+    );
+    return stored;
+  }
+
+  /** Updates the last price and the best/worst premium seen; returns the usable price. */
+  private trackPrice(position: OpenPosition, quote: MarketQuote | null): number | null {
+    const price = quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : null;
+    if (price !== null) {
+      position.peakPrice = Math.max(position.peakPrice, price);
+      position.troughPrice = Math.min(position.troughPrice, price);
+      this.lastQuotedPriceBySymbol[position.symbol] = price;
+    }
+    return price;
+  }
+
+  private netPnlInr(position: OpenPosition, price: number | null): number | null {
+    if (position.lotSize === null || price === null) {
+      return null;
+    }
+    const costs = estimateOptionsRoundTripCost({
+      buyPremium: position.entryPrice,
+      sellPremium: price,
+      quantity: position.lotSize,
+    });
+    return round((price - position.entryPrice) * position.lotSize - costs.totalInr);
+  }
+
+  /** The contract a SKIP would have bought, so the review can estimate what was missed. */
+  private shadowContract(
+    view: MarketView,
+    leaning: Leaning,
+  ): { symbol: string; premium: number | null; delta: number | null; token: number } | null {
+    const data = view.indexes.find((item) => item.index === leaning.index);
+    if (!data || data.spot === null) {
+      return null;
+    }
+    const spot = data.spot;
+    const { candidates } = buildCandidates(
+      {
+        chain: data.chain,
+        index: leaning.index,
+        side: leaning.side,
+        spot,
+        step: data.step,
+        todayYmd: view.todayYmd,
+        indexDaily: view.indexDaily[leaning.index] ?? [],
+      },
+      this.params,
+    );
+    const best = candidates[0];
+    if (best) {
+      return { symbol: best.symbol, premium: best.ask, delta: best.delta, token: best.token };
+    }
+    const nearest = data.chain
+      .filter((row) => row.side === leaning.side && row.ltp !== null)
+      .sort((left, right) => Math.abs(left.strike - spot) - Math.abs(right.strike - spot))[0];
+    return nearest
+      ? {
+          symbol: nearest.symbol,
+          premium: nearest.ask ?? nearest.ltp,
+          delta: null,
+          token: nearest.token,
+        }
+      : null;
+  }
+
+  private positionSnapshot(
+    position: OpenPosition,
+    now: Date,
+    lastPrice: number | null,
+  ): NonNullable<DecisionSnapshot['position']> {
+    return {
+      symbol: position.symbol,
+      index: position.index,
+      side: position.side,
+      strike: position.strike,
+      expiry: position.expiry,
+      lotSize: position.lotSize,
+      entryPrice: position.entryPrice,
+      enteredAt: position.enteredAt.toISOString(),
+      heldMinutes: minutesBetween(position.enteredAt, now),
+      lastPrice,
+      pnlPct: round(pctChange(position.entryPrice, lastPrice)),
+      netPnlInr: this.netPnlInr(position, lastPrice),
+      peakPrice: position.peakPrice,
+      troughPrice: position.troughPrice,
+      entryDelta: position.entryDelta,
+    };
+  }
+
+  private snapshot(input: {
+    now: Date;
+    trigger: DecisionSnapshot['trigger'];
+    spots: Partial<Record<IndexOptionName, number>>;
+    view: MarketView | null;
+    readings: readonly IndexReading[];
+    blockedBy: readonly GateId[];
+    leaning: DecisionSnapshot['leaning'];
+    entry?: NonNullable<DecisionSnapshot['entry']>;
+    position?: NonNullable<DecisionSnapshot['position']>;
+    exit?: NonNullable<DecisionSnapshot['exit']>;
+    fees?: NonNullable<DecisionSnapshot['fees']>;
+  }): DecisionSnapshot {
+    const backdrop = input.view?.backdrop;
+    return {
+      schema: SNAPSHOT_SCHEMA,
+      paramsVersion: paramsVersion(this.params),
+      tunables: tunableValues(this.params),
+      trigger: input.trigger,
+      asOfIst: formatIstTimestamp(input.now),
+      spots: Object.fromEntries(
+        Object.entries(input.spots).filter(
+          (entry): entry is [string, number] => entry[1] !== undefined,
+        ),
+      ),
+      readings: input.readings.map((reading) => ({
+        index: reading.index,
+        score: reading.score,
+        votes: reading.votes,
+        rsi: round(reading.rsi, 1),
+        futuresPrice: reading.futuresPrice,
+        vwap: round(reading.vwap),
+        callWall: reading.callWall,
+        putWall: reading.putWall,
+        pcr: reading.pcr,
+        expiryToday: reading.expiryToday,
+      })),
+      market: backdrop
+        ? {
+            vixPct: round(backdrop.vixPct),
+            usdInrPct: round(backdrop.usdInrPct, 3),
+            crudePct: round(backdrop.crudePct),
+            gapPct: round(backdrop.gapPct),
+            advancersPct: round(backdrop.advancersPct, 1),
+            headlineTone: backdrop.headlineTone,
+          }
+        : EMPTY_BACKDROP,
+      news: input.view?.news ?? {},
+      headlines: input.view?.headlines ?? [],
+      blockedBy: [...input.blockedBy],
+      leaning: input.leaning,
+      ...(input.entry ? { entry: input.entry } : {}),
+      ...(input.position ? { position: input.position } : {}),
+      ...(input.exit ? { exit: input.exit } : {}),
+      ...(input.fees ? { fees: input.fees } : {}),
+      dataGaps: input.view?.dataGaps ?? [],
+    };
+  }
+
+  private applyDecisionState(action: string, symbol: string, token: number | null): void {
     if (action === 'BUY' || action === 'HOLD') {
       this.includedSymbols = [symbol];
       this.sessionStartPayload = {
@@ -990,260 +1594,6 @@ export class LlmTradeAdvisorService {
     }
     if (action === 'SKIP' && this.includedSymbols.length === 0) {
       this.sessionStartPayload = { instruments: [] };
-    }
-  }
-
-  private async buildLiveOptionContext(input: {
-    asOf: Date;
-    asOfIst: string;
-    open: LiveOptionDecisionContext['open'];
-    allowed: LiveOptionDecisionContext['allowed'];
-  }): Promise<LiveOptionDecisionContext> {
-    const spots = await this.fetchIndexSpots();
-    const candles = await this.fetchIndexCandlePacks(this.decisionIndexes, spots);
-    const chain = await this.fetchLiveChainSnapshot(this.decisionIndexes, spots);
-    const { newsRiskByIndex, newsHeadlines } = await this.fetchLastHourIndexNews(this.decisionIndexes);
-
-    const samplePremium =
-      input.open?.buyPrice ??
-      chain.rows.find((row) => row.ltp !== null && row.ltp > 0)?.ltp ??
-      null;
-    const fees =
-      samplePremium !== null && samplePremium > 0
-        ? estimateOptionsRoundTripCost({
-            buyPremium: samplePremium,
-            sellPremium: samplePremium * (1 + config.llm.targetNetPnlPct / 100),
-            quantity: DEFAULT_INDEX_OPTION_LOT,
-          })
-        : null;
-
-    const focusIndex =
-      (input.open?.symbol ? indexNameFromOptionSymbol(input.open.symbol) : null) ??
-      this.decisionIndexes[0] ??
-      null;
-    const pack = candles.find((row) => row.index === focusIndex) ?? candles[0];
-    const newsLevel = focusIndex ? newsRiskByIndex[focusIndex]?.level : undefined;
-    const preferredSide = input.open?.symbol ? optionSideFromSymbol(input.open.symbol) : null;
-    const tape = buildDecisionTape({
-      pack,
-      chain,
-      newsLevel,
-      preferredSide,
-    });
-
-    return {
-      asOfIst: input.asOfIst,
-      indexes: this.decisionIndexes,
-      candles,
-      chain,
-      newsRiskByIndex,
-      newsHeadlines,
-      open: input.open,
-      allowed: input.allowed,
-      fees,
-      targetNetPnlPct: config.llm.targetNetPnlPct,
-      minHoldMinutes: config.llm.minHoldMinutes,
-      candleLookbackMinutes: config.llm.candleLookbackMinutes,
-      tape,
-    };
-  }
-
-  private async fetchIndexCandlePacks(
-    indexes: readonly IndexOptionName[],
-    spots: Partial<Record<IndexOptionName, number>>,
-  ): Promise<IndexCandlePack[]> {
-    const today = istYmd();
-    const underlyings = loadIndexUnderlyings().filter((row) =>
-      indexes.includes(row.tradingsymbol as IndexOptionName),
-    );
-    const lookbackMinutes =
-      Number.isFinite(config.llm.candleLookbackMinutes) && config.llm.candleLookbackMinutes > 0
-        ? config.llm.candleLookbackMinutes
-        : 60;
-    const lookbackMs = lookbackMinutes * 60_000;
-    const now = Date.now();
-    const toIst = formatIstWallClock(new Date(now));
-    const fromIst = formatIstWallClock(new Date(now - lookbackMs));
-    const weekFrom = addCalendarDays(today, -7);
-    const monthFrom = addCalendarDays(today, -30);
-    const packs: IndexCandlePack[] = [];
-
-    for (const row of underlyings) {
-      const index = row.tradingsymbol as IndexOptionName;
-      let minute: IntradayBar[] = [];
-      let session15: IntradayBar[] = [];
-      let weekDaily: DailyBar[] = [];
-      let monthDaily: DailyBar[] = [];
-      try {
-        minute = await this.kite.getMinuteCandles(row.instrumentToken, fromIst, toIst);
-      } catch (error: unknown) {
-        this.logger.warn({ err: error, index }, 'Minute candles failed.');
-      }
-      try {
-        session15 = await this.kite.getFifteenMinuteCandles(row.instrumentToken, today);
-      } catch (error: unknown) {
-        this.logger.warn({ err: error, index }, 'Session 15m candles failed.');
-      }
-      try {
-        weekDaily = await this.kite.getDailyCandles(row.instrumentToken, weekFrom, today);
-      } catch (error: unknown) {
-        this.logger.warn({ err: error, index }, 'Week dailies failed.');
-      }
-      try {
-        monthDaily = await this.kite.getDailyCandles(row.instrumentToken, monthFrom, today);
-      } catch (error: unknown) {
-        this.logger.warn({ err: error, index }, 'Month dailies failed.');
-      }
-
-      const dayCloses = session15.map((bar) => bar.c);
-      const weekCloses = weekDaily.map((bar) => bar.c);
-      const monthCloses = monthDaily.map((bar) => bar.c);
-      packs.push({
-        index,
-        spot: spots[index] ?? null,
-        minute,
-        session15,
-        weekDaily,
-        monthDaily,
-        trend: {
-          day: trendFromCloses(dayCloses.length >= 3 ? dayCloses : minute.map((bar) => bar.c)),
-          week: trendFromCloses(weekCloses),
-          month: trendFromCloses(monthCloses),
-        },
-        structure: structureNotesFromBars(
-          session15.length >= 4 ? session15 : minute.length >= 4 ? minute : monthDaily,
-        ),
-      });
-    }
-    return packs;
-  }
-
-  private async fetchLiveChainSnapshot(
-    indexes: readonly IndexOptionName[],
-    spots: Partial<Record<IndexOptionName, number>>,
-  ): Promise<ChainSnapshot> {
-    let contracts: Awaited<ReturnType<KiteBroker['getNfoIndexOptions']>> = [];
-    try {
-      contracts = await this.kite.getNfoIndexOptions({
-        names: indexes,
-        spots,
-      });
-    } catch (error: unknown) {
-      this.logger.warn({ err: error }, 'NFO chain fetch failed for decision cycle.');
-      return { rows: [], pcr: null, ceOi: 0, peOi: 0 };
-    }
-
-    const keys = contracts.map((contract) => `NFO:${contract.tradingsymbol}`);
-    let quotes: Awaited<ReturnType<KiteBroker['getQuotes']>> = {};
-    if (keys.length > 0) {
-      try {
-        quotes = await this.kite.getQuotes(keys);
-      } catch (error: unknown) {
-        this.logger.warn({ err: error }, 'Option chain quotes failed.');
-      }
-    }
-
-    const rows: ChainQuoteRow[] = [];
-    let ceOi = 0;
-    let peOi = 0;
-    const nextPrev: Record<string, { oi: number; volume: number }> = {};
-
-    for (const contract of contracts) {
-      const quote =
-        quotes[`NFO:${contract.tradingsymbol}`] ??
-        quotes[`NFO:${contract.tradingsymbol}`.toUpperCase()] ??
-        quotes[contract.tradingsymbol];
-      const oi = quote?.oi ?? 0;
-      const volume = quote?.volume ?? 0;
-      const prev = this.previousChainBySymbol[contract.tradingsymbol];
-      const dOi = prev ? oi - prev.oi : null;
-      const dVolume = prev ? volume - prev.volume : null;
-      if (contract.instrumentType === 'CE') {
-        ceOi += oi;
-      } else {
-        peOi += oi;
-      }
-      nextPrev[contract.tradingsymbol] = { oi, volume };
-      rows.push({
-        symbol: contract.tradingsymbol,
-        index: contract.name,
-        side: contract.instrumentType,
-        strike: contract.strike,
-        expiry: contract.expiry,
-        token: contract.instrumentToken,
-        ltp: quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : null,
-        oi,
-        volume,
-        dOi,
-        dVolume,
-      });
-    }
-
-    this.previousChainBySymbol = nextPrev;
-    const pcr = ceOi > 0 ? Number((peOi / ceOi).toFixed(4)) : null;
-    return { rows, pcr, ceOi, peOi };
-  }
-
-  private async fetchLastHourIndexNews(indexes: readonly IndexOptionName[]): Promise<{
-    newsRiskByIndex: Partial<Record<IndexOptionName, OptionNewsRisk>>;
-    newsHeadlines: Array<{ s: string; t: string }>;
-  }> {
-    const underlyings = loadIndexUnderlyings().filter((row) =>
-      indexes.includes(row.tradingsymbol as IndexOptionName),
-    );
-    const to = new Date();
-    const from = new Date(to.getTime() - 2 * 60 * 60 * 1000);
-    const newsRiskByIndex: Partial<Record<IndexOptionName, OptionNewsRisk>> = {};
-    const newsHeadlines: Array<{ s: string; t: string }> = [];
-    try {
-      const news = await this.news.fetchIndexNews(
-        underlyings.map((row) => ({ symbol: row.tradingsymbol, query: row.googleQuery })),
-        from,
-        to,
-      );
-      const cutoff = Date.now() - 60 * 60 * 1000;
-      for (const entry of news) {
-        const name = entry.symbol.toUpperCase() as IndexOptionName;
-        const recent = entry.items.filter((item) => {
-          if (!item.publishedAt) {
-            return true;
-          }
-          const parsed = Date.parse(item.publishedAt);
-          return Number.isFinite(parsed) ? parsed >= cutoff : true;
-        });
-        newsRiskByIndex[name] = scoreOptionNewsRisk(recent);
-        for (const item of recent.slice(0, 4)) {
-          newsHeadlines.push({ s: name, t: item.title.slice(0, 120) });
-        }
-      }
-    } catch (error: unknown) {
-      this.logger.warn({ err: error }, 'Last-hour index news failed; fail-open.');
-    }
-    return { newsRiskByIndex, newsHeadlines };
-  }
-
-  private async fetchIndexSpots(): Promise<Partial<Record<IndexOptionName, number>>> {
-    const underlyings = loadIndexUnderlyings();
-    const keys = underlyings.map((row) => `${row.exchange}:${row.kiteQuoteSymbol}`);
-    if (keys.length === 0) {
-      return {};
-    }
-    try {
-      const quotes = await this.kite.getQuotes(keys);
-      const spots: Partial<Record<IndexOptionName, number>> = {};
-      for (const row of underlyings) {
-        const quote =
-          quotes[`${row.exchange}:${row.kiteQuoteSymbol}`] ??
-          quotes[`${row.exchange}:${row.kiteQuoteSymbol}`.toUpperCase()] ??
-          quotes[row.kiteQuoteSymbol];
-        if (quote?.lastPrice && quote.lastPrice > 0) {
-          spots[row.tradingsymbol as IndexOptionName] = quote.lastPrice;
-        }
-      }
-      return spots;
-    } catch (error: unknown) {
-      this.logger.warn({ err: error }, 'Kite getQuotes failed for index spots.');
-      return {};
     }
   }
 
@@ -1301,18 +1651,8 @@ export class LlmTradeAdvisorService {
 
   private async completeWithRetry(
     messages: Array<{ role: 'system' | 'user'; content: string }>,
-    label: 'universe' | 'decision',
+    label: 'universe',
   ) {
-    const maxTokens = label === 'universe' ? UNIVERSE_MAX_OUTPUT_TOKENS : DECISION_MAX_OUTPUT_TOKENS;
-    try {
-      return await this.llm.completeJson(messages, { maxTokens });
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      const tokenCut =
-        message.includes('json_validate_failed') || message.includes('max completion tokens');
-      const retryTokens = tokenCut ? 4096 : maxTokens;
-      this.logger.warn({ err: error, label, retryTokens }, 'LLM JSON completion failed; retrying once.');
-      return this.llm.completeJson(messages, { maxTokens: retryTokens });
-    }
+    return completeJsonWithRetry(this.llm, messages, UNIVERSE_MAX_OUTPUT_TOKENS, this.logger, label);
   }
 }

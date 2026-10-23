@@ -21,14 +21,16 @@ import { INDEX_OPTION_NAMES, loadIndexUnderlyings } from '../instruments/kiteInd
 import {
   filterNearestWeeklyAtmBand,
   parseNfoIndexOptions,
+  type KiteRawInstrument,
   type NfoOptionContract,
-  type NfoRawInstrument,
 } from '../options/nfoChain.js';
 import type { DailyBar, IntradayBar } from '../universe/types.js';
 import { istYmd } from '../universe/dates.js';
 import type { BrokerAdapter } from './BrokerAdapter.js';
 
 const HISTORICAL_MIN_INTERVAL_MS = 350;
+/** Kite allows one quote request per second. */
+const QUOTE_MIN_INTERVAL_MS = 1_100;
 
 const DEFAULT_SESSION_FILE = path.resolve('.kite-session.json');
 
@@ -44,7 +46,48 @@ export type KiteQuote = {
   last_price: number;
   volume?: number;
   oi?: number;
+  open_interest?: number;
+  average_price?: number;
+  ohlc?: { open?: number; high?: number; low?: number; close?: number };
+  depth?: {
+    buy?: Array<{ price?: number; quantity?: number }>;
+    sell?: Array<{ price?: number; quantity?: number }>;
+  };
 };
+
+/** Normalised quote. Optional extras are null when Kite did not send them. */
+export type MarketQuote = {
+  lastPrice: number | null;
+  volume: number;
+  oi: number;
+  open: number | null;
+  prevClose: number | null;
+  /** Day's volume-weighted average price (Kite `average_price`). */
+  vwap: number | null;
+  bid: number | null;
+  ask: number | null;
+};
+
+export type InstrumentExchange = 'NFO' | 'CDS' | 'MCX';
+
+function positiveOrNull(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function toMarketQuote(record: KiteQuote): MarketQuote {
+  const last = Number(record.last_price ?? record.ohlc?.close);
+  return {
+    lastPrice: Number.isFinite(last) ? last : null,
+    volume: Number(record.volume ?? 0) || 0,
+    oi: Number(record.oi ?? record.open_interest ?? 0) || 0,
+    open: positiveOrNull(record.ohlc?.open),
+    prevClose: positiveOrNull(record.ohlc?.close),
+    vwap: positiveOrNull(record.average_price),
+    bid: positiveOrNull(record.depth?.buy?.[0]?.price),
+    ask: positiveOrNull(record.depth?.sell?.[0]?.price),
+  };
+}
 
 export type KiteClient = Pick<
   Connect,
@@ -132,8 +175,13 @@ export class KiteBroker implements BrokerAdapter {
   private accessToken: string | null = null;
   private readonly submittedOrderIds = new Set<string>();
   private nseInstrumentCache: Awaited<ReturnType<KiteClient['getInstruments']>> | undefined;
-  private nfoInstrumentCache: { day: string; rows: Awaited<ReturnType<KiteClient['getInstruments']>> } | undefined;
+  private readonly dayInstrumentCache = new Map<
+    InstrumentExchange,
+    { day: string; rows: KiteRawInstrument[] }
+  >();
   private lastHistoricalMs = 0;
+  private lastQuoteMs = 0;
+  private quoteTurn: Promise<void> = Promise.resolve();
 
   public constructor(options: KiteBrokerOptions = {}) {
     const apiKey = normalizeToken(options.apiKey ?? config.kite.apiKey);
@@ -308,7 +356,9 @@ export class KiteBroker implements BrokerAdapter {
     const resolved = new Map<string, SessionInstrument>();
 
     for (const row of this.nseInstrumentCache) {
-      const tradingsymbol = String(row.tradingsymbol ?? '').trim().toUpperCase();
+      const tradingsymbol = String(row.tradingsymbol ?? '')
+        .trim()
+        .toUpperCase();
       if (!wanted.has(tradingsymbol) || resolved.has(tradingsymbol)) {
         continue;
       }
@@ -333,24 +383,16 @@ export class KiteBroker implements BrokerAdapter {
     return [...resolved.values()];
   }
 
-  public async getQuotes(keys: readonly string[]): Promise<
-    Record<string, { lastPrice: number | null; volume: number; oi: number }>
-  > {
+  public async getQuotes(keys: readonly string[]): Promise<Record<string, MarketQuote>> {
     await this.ensureAccessToken();
     if (keys.length === 0) {
       return {};
     }
+    await this.throttleQuotes();
     const raw = await this.client.getQuote([...keys]);
-    const out: Record<string, { lastPrice: number | null; volume: number; oi: number }> = {};
+    const out: Record<string, MarketQuote> = {};
     for (const [key, quote] of Object.entries(raw)) {
-      const record = quote as KiteQuote & { ohlc?: { close?: number }; open_interest?: number };
-      const last = Number(record.last_price ?? record.ohlc?.close);
-      const oi = Number(record.oi ?? record.open_interest ?? 0) || 0;
-      const mapped = {
-        lastPrice: Number.isFinite(last) ? last : null,
-        volume: Number(record.volume ?? 0) || 0,
-        oi,
-      };
+      const mapped = toMarketQuote(quote);
       out[key] = mapped;
       out[key.toUpperCase()] = mapped;
     }
@@ -364,9 +406,8 @@ export class KiteBroker implements BrokerAdapter {
   }): Promise<NfoOptionContract[]> {
     const names = input.names ?? INDEX_OPTION_NAMES;
     const asOfYmd = input.asOfYmd ?? istYmd();
-    const rows = await this.loadNfoInstruments(asOfYmd);
-    const list = Array.isArray(rows) ? rows : [];
-    const contracts = parseNfoIndexOptions(list as NfoRawInstrument[], names);
+    const rows = await this.getDayInstruments('NFO', asOfYmd);
+    const contracts = parseNfoIndexOptions(rows, names);
     const steps = Object.fromEntries(
       loadIndexUnderlyings()
         .filter((row) => names.includes(row.tradingsymbol as IndexOptionName))
@@ -375,14 +416,34 @@ export class KiteBroker implements BrokerAdapter {
     return filterNearestWeeklyAtmBand(contracts, input.spots, steps, asOfYmd);
   }
 
-  private async loadNfoInstruments(asOfYmd: string): Promise<Awaited<ReturnType<KiteClient['getInstruments']>>> {
+  /** Full instrument dump for one derivatives exchange, fetched once per IST day. */
+  public async getDayInstruments(
+    exchange: InstrumentExchange,
+    asOfYmd: string = istYmd(),
+  ): Promise<KiteRawInstrument[]> {
     await this.ensureAccessToken();
-    if (this.nfoInstrumentCache?.day === asOfYmd) {
-      return this.nfoInstrumentCache.rows;
+    const cached = this.dayInstrumentCache.get(exchange);
+    if (cached?.day === asOfYmd) {
+      return cached.rows;
     }
-    const rows = await this.client.getInstruments('NFO');
-    this.nfoInstrumentCache = { day: asOfYmd, rows };
+    const fetched = await this.client.getInstruments(exchange);
+    const rows = (Array.isArray(fetched) ? fetched : []) as KiteRawInstrument[];
+    this.dayInstrumentCache.set(exchange, { day: asOfYmd, rows });
     return rows;
+  }
+
+  private async throttleQuotes(): Promise<void> {
+    const turn = this.quoteTurn.then(async () => {
+      const wait = this.lastQuoteMs + QUOTE_MIN_INTERVAL_MS - Date.now();
+      if (wait > 0) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, wait);
+        });
+      }
+      this.lastQuoteMs = Date.now();
+    });
+    this.quoteTurn = turn;
+    return turn;
   }
 
   public async getPortfolio(): Promise<PortfolioSnapshot> {
@@ -464,39 +525,26 @@ export class KiteBroker implements BrokerAdapter {
     });
   }
 
-  /** NSE cash session 15-minute bars for one IST calendar day (09:15–15:30). */
-  public async getFifteenMinuteCandles(
-    instrumentToken: number,
-    sessionYmd: string,
-  ): Promise<IntradayBar[]> {
-    const rows = await this.fetchHistorical(
-      instrumentToken,
-      '15minute',
-      `${sessionYmd} 09:15:00`,
-      `${sessionYmd} 15:30:00`,
-    );
-    return rows.map((row) => {
-      const date = row.date instanceof Date ? row.date : new Date(String(row.date));
-      return {
-        t: date.toISOString(),
-        o: row.open,
-        h: row.high,
-        l: row.low,
-        c: row.close,
-        v: row.volume,
-      };
-    });
-  }
-
-  /** Minute bars between IST wall-clock datetimes (`YYYY-MM-DD HH:mm:ss`). */
-  public async getMinuteCandles(
+  /**
+   * 5-minute bars between IST wall-clock datetimes (`YYYY-MM-DD HH:mm:ss`).
+   * The last bar may still be forming; callers drop it themselves.
+   */
+  public async getFiveMinuteCandles(
     instrumentToken: number,
     fromIst: string,
     toIst: string,
+    options: { includeOi?: boolean } = {},
   ): Promise<IntradayBar[]> {
-    const rows = await this.fetchHistorical(instrumentToken, 'minute', fromIst, toIst);
+    const rows = await this.fetchHistorical(
+      instrumentToken,
+      '5minute',
+      fromIst,
+      toIst,
+      options.includeOi ?? false,
+    );
     return rows.map((row) => {
       const date = row.date instanceof Date ? row.date : new Date(String(row.date));
+      const oi = Number(row.oi);
       return {
         t: date.toISOString(),
         o: row.open,
@@ -504,19 +552,21 @@ export class KiteBroker implements BrokerAdapter {
         l: row.low,
         c: row.close,
         v: row.volume,
+        ...(Number.isFinite(oi) && row.oi !== undefined ? { oi } : {}),
       };
     });
   }
 
   private async fetchHistorical(
     instrumentToken: number,
-    interval: 'day' | '15minute' | 'minute',
+    interval: 'day' | '5minute',
     from: string,
     to: string,
+    includeOi = false,
   ) {
     await this.ensureAccessToken();
     await this.throttleHistorical();
-    return this.client.getHistoricalData(instrumentToken, interval, from, to, false, false);
+    return this.client.getHistoricalData(instrumentToken, interval, from, to, false, includeOi);
   }
 
   public async placeLimitOrder(order: IntendedOrder): Promise<BrokerOrderResult> {

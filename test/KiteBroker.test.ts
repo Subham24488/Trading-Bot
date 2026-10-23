@@ -350,7 +350,7 @@ describe('KiteBroker', () => {
     expect(client.placeOrder).not.toHaveBeenCalled();
   });
 
-  it('maps Kite 15-minute historical candles without placing orders', async () => {
+  it('maps Kite 5-minute candles with open interest without placing orders', async () => {
     const client = createMockClient({
       getHistoricalData: vi.fn().mockResolvedValue([
         {
@@ -360,6 +360,7 @@ describe('KiteBroker', () => {
           low: 9,
           close: 10.2,
           volume: 50_000,
+          oi: 1_200_000,
         },
       ]),
     });
@@ -369,7 +370,11 @@ describe('KiteBroker', () => {
       client,
     });
 
-    await expect(broker.getFifteenMinuteCandles(738561, '2026-08-24')).resolves.toEqual([
+    await expect(
+      broker.getFiveMinuteCandles(9001, '2026-08-24 09:15:00', '2026-08-24 10:30:00', {
+        includeOi: true,
+      }),
+    ).resolves.toEqual([
       {
         t: new Date('2026-08-24T09:15:00.000+05:30').toISOString(),
         o: 10,
@@ -377,17 +382,54 @@ describe('KiteBroker', () => {
         l: 9,
         c: 10.2,
         v: 50_000,
+        oi: 1_200_000,
       },
     ]);
     expect(client.getHistoricalData).toHaveBeenCalledWith(
-      738561,
-      '15minute',
+      9001,
+      '5minute',
       '2026-08-24 09:15:00',
-      '2026-08-24 15:30:00',
+      '2026-08-24 10:30:00',
       false,
-      false,
+      true,
     );
     expect(client.placeOrder).not.toHaveBeenCalled();
+  });
+
+  it('maps quote depth, day average price and previous close', async () => {
+    const client = createMockClient({
+      getQuote: vi.fn().mockResolvedValue({
+        'NFO:NIFTY26OCT25000CE': {
+          last_price: 120.5,
+          volume: 40_000,
+          oi: 2_000_000,
+          average_price: 118.25,
+          ohlc: { open: 110, high: 125, low: 105, close: 112 },
+          depth: {
+            buy: [{ price: 120.4, quantity: 650 }],
+            sell: [{ price: 120.6, quantity: 325 }],
+          },
+        },
+      }),
+    });
+    const broker = new KiteBroker({
+      apiKey: 'test-api-key',
+      accessToken: 'test-access-token',
+      client,
+    });
+
+    const quotes = await broker.getQuotes(['NFO:NIFTY26OCT25000CE']);
+
+    expect(quotes['NFO:NIFTY26OCT25000CE']).toEqual({
+      lastPrice: 120.5,
+      volume: 40_000,
+      oi: 2_000_000,
+      open: 110,
+      prevClose: 112,
+      vwap: 118.25,
+      bid: 120.4,
+      ask: 120.6,
+    });
   });
 
   it('screens nearest weekly ATM NFO index options without placing orders', async () => {

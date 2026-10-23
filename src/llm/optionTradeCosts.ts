@@ -5,14 +5,12 @@
 
 /** Fixed brokerage per order leg (discount broker style cap). */
 export const OPTIONS_BROKERAGE_PER_ORDER = 20;
-/** STT on options sell (premium notional), approx. */
-export const OPTIONS_STT_SELL_RATE = 0.001;
+/** STT on options sell (premium notional); 0.15% from 1 Apr 2026 (Union Budget 2026). */
+export const OPTIONS_STT_SELL_RATE = 0.0015;
 /** Exchange + clearing + SEBI combined on premium notional, both sides. */
 export const OPTIONS_EXCHANGE_RATE = 0.00053;
 /** GST on (brokerage + exchange fees). */
 export const OPTIONS_GST_RATE = 0.18;
-/** Default lot size hint when unknown (NIFTY-style). */
-export const DEFAULT_INDEX_OPTION_LOT = 25;
 
 export type OptionRoundTripCost = {
   brokerageInr: number;

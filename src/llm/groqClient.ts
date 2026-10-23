@@ -8,8 +8,14 @@ export type GroqClientOptions = {
   model?: string;
   timeoutMs?: number;
   maxTokens?: number;
+  reasoningEffort?: 'low' | 'medium' | 'high';
   fetchImpl?: typeof fetch;
 };
+
+/** gpt-oss reasons before answering; other Groq models may reject `reasoning_effort`. */
+function supportsReasoningEffort(model: string): boolean {
+  return model.startsWith('openai/gpt-oss');
+}
 
 type ChatCompletionResponse = {
   choices?: Array<{
@@ -40,6 +46,7 @@ export class GroqClient {
   private readonly model: string;
   private readonly timeoutMs: number;
   private readonly maxTokens: number;
+  private readonly reasoningEffort: 'low' | 'medium' | 'high';
   private readonly fetchImpl: typeof fetch;
   private connected = false;
 
@@ -49,6 +56,7 @@ export class GroqClient {
     this.model = options.model ?? config.groq.model;
     this.timeoutMs = options.timeoutMs ?? config.groq.timeoutMs;
     this.maxTokens = options.maxTokens ?? config.groq.maxTokens;
+    this.reasoningEffort = options.reasoningEffort ?? config.groq.reasoningEffort;
     this.fetchImpl = options.fetchImpl ?? fetch;
 
     if (!this.apiKey) {
@@ -96,6 +104,7 @@ export class GroqClient {
         temperature: 0,
         stream: false,
         response_format: { type: 'json_object' },
+        ...(supportsReasoningEffort(this.model) ? { reasoning_effort: this.reasoningEffort } : {}),
       }),
     });
 

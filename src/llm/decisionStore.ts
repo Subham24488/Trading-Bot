@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -55,11 +54,15 @@ export async function writeUniverseFile(payload: StoredUniverseFile): Promise<st
   return filePath;
 }
 
-export function hashPrompt(parts: unknown): string {
-  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
-}
-
 export const LLM_EXECUTION_BLOCKED_REASON = 'LLM decisions are never sent to the broker.';
+
+/** Optional audit fields: rule score as confidence, and the LLM call behind a strike pick. */
+export type DecisionMeta = {
+  confidence?: number;
+  model?: string;
+  promptHash?: string;
+  rawCompletion?: string;
+};
 
 export type DecisionRowInput = {
   asOf: Date;
@@ -68,6 +71,9 @@ export type DecisionRowInput = {
   priorBuyPriceBySymbol?: Record<string, string | null>;
   tokenBySymbol?: Record<string, number | null>;
   marketSnapshotBySymbol?: Record<string, Record<string, unknown>>;
+  metaBySymbol?: Record<string, DecisionMeta>;
+  /** Trade id for BUY/HOLD/EXIT rows; never written on SKIP. */
+  tuuidBySymbol?: Record<string, string>;
 };
 
 export function pricesForDecision(
@@ -104,6 +110,8 @@ export async function persistDecisions(input: DecisionRowInput): Promise<number>
     );
     const current = input.lastPriceBySymbol?.[decision.symbol];
     const token = input.tokenBySymbol?.[decision.symbol];
+    const meta = input.metaBySymbol?.[decision.symbol];
+    const tuuid = decision.action === 'SKIP' ? undefined : input.tuuidBySymbol?.[decision.symbol];
     const currentPrice =
       current !== null && current !== undefined && Number.isFinite(current)
         ? current.toFixed(4)
@@ -115,8 +123,12 @@ export async function persistDecisions(input: DecisionRowInput): Promise<number>
       rationale: decision.rationale,
       executed: false as const,
       executionBlockedReason: LLM_EXECUTION_BLOCKED_REASON,
-      promptHash: '',
-      rawCompletion: '',
+      promptHash: meta?.promptHash ?? '',
+      rawCompletion: meta?.rawCompletion ?? '',
+      ...(meta?.model ? { model: meta.model } : {}),
+      ...(meta?.confidence !== undefined && Number.isFinite(meta.confidence)
+        ? { confidence: meta.confidence.toFixed(4) }
+        : {}),
       marketSnapshot: input.marketSnapshotBySymbol?.[decision.symbol] ?? {},
       ...(token !== null && token !== undefined && Number.isInteger(token) && token > 0
         ? { instrumentToken: token }
@@ -124,6 +136,7 @@ export async function persistDecisions(input: DecisionRowInput): Promise<number>
       ...(prices.buyPrice === null ? {} : { buyPrice: prices.buyPrice }),
       ...(currentPrice === null ? {} : { currentPrice }),
       ...(prices.sellPrice === null ? {} : { sellPrice: prices.sellPrice }),
+      ...(tuuid ? { tuuid } : {}),
     };
   });
 
@@ -170,37 +183,107 @@ export async function latestActionsForSymbols(
   return Object.fromEntries(entries);
 }
 
-export type OpenPositionState = {
+function storedNumber(value: unknown): number | null {
+  if (value == null) {
+    return null;
+  }
+  const numeric = typeof value === 'number' ? value : Number(String(value));
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+export type OpenTradeRecord = {
   symbol: string;
-  action: LlmTradeAction;
-  buyPrice: string | null;
   instrumentToken: number | null;
-  decidedAt: Date;
-  asOf: Date;
+  buyPrice: number | null;
+  /** When the position was bought (BUY row `asOf`), not the latest HOLD. */
+  enteredAt: Date;
+  buySnapshot: unknown;
+  latestSnapshot: unknown;
+  holdPrices: number[];
+  /** Price on the latest BUY/HOLD row. */
+  lastPrice: number | null;
+  /** Null for trades opened before the column existed. */
+  tuuid: string | null;
 };
 
-/** Most recent decision that left a long open (BUY/HOLD). EXIT/SKIP ⇒ flat. */
-export async function findLatestOpenPosition(): Promise<OpenPositionState | null> {
-  const row = await database.llmTradeDecision.findFirst({
+/** The position left open by the latest BUY/HOLD row (EXIT/SKIP ⇒ flat), with its entry row. */
+export async function findOpenTrade(): Promise<OpenTradeRecord | null> {
+  const latest = await database.llmTradeDecision.findFirst({
     orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
     select: {
       symbol: true,
       action: true,
-      buyPrice: true,
       instrumentToken: true,
+      marketSnapshot: true,
       decidedAt: true,
-      asOf: true,
+      currentPrice: true,
+      tuuid: true,
     },
   });
-  if (!row || (row.action !== 'BUY' && row.action !== 'HOLD')) {
+  if (!latest || (latest.action !== 'BUY' && latest.action !== 'HOLD')) {
     return null;
   }
+  const entry = await database.llmTradeDecision.findFirst({
+    where: { symbol: latest.symbol, action: 'BUY', decidedAt: { lte: latest.decidedAt } },
+    orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
+    select: {
+      asOf: true,
+      decidedAt: true,
+      buyPrice: true,
+      instrumentToken: true,
+      marketSnapshot: true,
+      tuuid: true,
+    },
+  });
+  const holds = await database.llmTradeDecision.findMany({
+    where: {
+      symbol: latest.symbol,
+      action: 'HOLD',
+      decidedAt: { gte: entry?.decidedAt ?? latest.decidedAt },
+    },
+    orderBy: [{ decidedAt: 'asc' }],
+    select: { currentPrice: true },
+  });
   return {
-    symbol: row.symbol.toUpperCase(),
-    action: row.action,
-    buyPrice: formatStoredPrice(row.buyPrice),
-    instrumentToken: row.instrumentToken ?? null,
-    decidedAt: row.decidedAt,
-    asOf: row.asOf,
+    symbol: latest.symbol.toUpperCase(),
+    instrumentToken: latest.instrumentToken ?? entry?.instrumentToken ?? null,
+    buyPrice: storedNumber(entry?.buyPrice),
+    enteredAt: entry?.asOf ?? latest.decidedAt,
+    buySnapshot: entry?.marketSnapshot ?? null,
+    latestSnapshot: latest.marketSnapshot ?? null,
+    holdPrices: holds
+      .map((row) => storedNumber(row.currentPrice))
+      .filter((price): price is number => price !== null),
+    lastPrice: storedNumber(latest.currentPrice),
+    tuuid: entry?.tuuid ?? latest.tuuid ?? null,
   };
+}
+
+export type StoredDecisionRow = {
+  action: LlmTradeAction;
+  decidedAt: Date;
+  buyPrice: number | null;
+  sellPrice: number | null;
+  marketSnapshot: unknown;
+};
+
+export async function findDecisionsSince(from: Date): Promise<StoredDecisionRow[]> {
+  const rows = await database.llmTradeDecision.findMany({
+    where: { decidedAt: { gte: from } },
+    orderBy: [{ decidedAt: 'asc' }, { asOf: 'asc' }],
+    select: {
+      action: true,
+      decidedAt: true,
+      buyPrice: true,
+      sellPrice: true,
+      marketSnapshot: true,
+    },
+  });
+  return rows.map((row) => ({
+    action: row.action,
+    decidedAt: row.decidedAt,
+    buyPrice: storedNumber(row.buyPrice),
+    sellPrice: storedNumber(row.sellPrice),
+    marketSnapshot: row.marketSnapshot,
+  }));
 }

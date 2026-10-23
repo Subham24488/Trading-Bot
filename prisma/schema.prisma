@@ -67,10 +67,13 @@ model LlmTradeDecision {
   sellPrice              Decimal?       @db.Decimal(18, 4)
   executed               Boolean        @default(false)
   executionBlockedReason String         @default("LLM decisions are never sent to the broker.")
+  /// Trade id: set on BUY and reused on that trade's HOLDs and EXIT; null on SKIP.
+  tuuid                  String?        @db.Uuid
 
   @@index([decidedAt])
   @@index([symbol, decidedAt])
   @@index([action, decidedAt])
+  @@index([tuuid])
 }
 
 enum TradingMode {

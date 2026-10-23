@@ -33,8 +33,8 @@ const environmentSchema = z
     GROQ_MODEL: z.string().min(1).default('llama-3.1-8b-instant'),
     GROQ_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
     GROQ_MAX_TOKENS: z.coerce.number().int().positive().max(8192).default(800),
+    GROQ_REASONING_EFFORT: z.enum(['low', 'medium', 'high']).default('low'),
     LLM_DECISION_INTERVAL_MINUTES: z.coerce.number().int().positive().max(240).default(15),
-    LLM_CANDLE_LOOKBACK_MINUTES: z.coerce.number().int().positive().max(240).default(60),
     LLM_MIN_HOLD_MINUTES: z.coerce.number().int().positive().max(240).default(15),
     LLM_TARGET_NET_PNL_PCT: z.coerce.number().positive().max(100).default(8),
     LLM_NEWS_LOOKBACK_DAYS: z.coerce.number().int().positive().max(90).default(30),
@@ -43,6 +43,7 @@ const environmentSchema = z
     UNIVERSE_DIR: z.string().min(1).default('universe'),
     KITE_INSTRUMENTS_PATH: z.string().min(1).default('data/kite-instruments.json'),
     KITE_INDEX_UNDERLYINGS_PATH: z.string().min(1).default('data/kite-index-underlyings.json'),
+    STRATEGY_LEDGER_PATH: z.string().min(1).default('data/strategy-enhancements.json'),
   })
   .superRefine((environment, context) => {
     if (
@@ -119,10 +120,10 @@ export const config = {
     model: parsedEnvironment.GROQ_MODEL,
     timeoutMs: parsedEnvironment.GROQ_TIMEOUT_MS,
     maxTokens: parsedEnvironment.GROQ_MAX_TOKENS,
+    reasoningEffort: parsedEnvironment.GROQ_REASONING_EFFORT,
   },
   llm: {
     decisionIntervalMinutes: parsedEnvironment.LLM_DECISION_INTERVAL_MINUTES,
-    candleLookbackMinutes: parsedEnvironment.LLM_CANDLE_LOOKBACK_MINUTES,
     minHoldMinutes: parsedEnvironment.LLM_MIN_HOLD_MINUTES,
     targetNetPnlPct: parsedEnvironment.LLM_TARGET_NET_PNL_PCT,
     newsLookbackDays: parsedEnvironment.LLM_NEWS_LOOKBACK_DAYS,
@@ -131,5 +132,8 @@ export const config = {
     universeDir: parsedEnvironment.UNIVERSE_DIR,
     kiteInstrumentsPath: parsedEnvironment.KITE_INSTRUMENTS_PATH,
     kiteIndexUnderlyingsPath: parsedEnvironment.KITE_INDEX_UNDERLYINGS_PATH,
+  },
+  review: {
+    ledgerPath: parsedEnvironment.STRATEGY_LEDGER_PATH,
   },
 } as const;

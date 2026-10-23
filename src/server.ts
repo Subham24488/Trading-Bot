@@ -23,20 +23,24 @@ import { NewsService } from './news/NewsService.js';
 import { getCatalogTradingsymbols } from './instruments/kiteInstruments.js';
 import { parseSessionStartBody } from './session/sessionStartSchema.js';
 import { decisionIndexesBodySchema, universeBookBodySchema } from './llm/schemas.js';
-import { reviewTradingSessions } from './llm/sessionReview.js';
+import { reviewTradingSessions } from './review/sessionReview.js';
 
 const application = Fastify({ logger: { level: config.logLevel } });
-application.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) => {
-  if (!body || String(body).trim() === '') {
-    done(null, {});
-    return;
-  }
-  try {
-    done(null, JSON.parse(String(body)));
-  } catch (error: unknown) {
-    done(error instanceof Error ? error : new Error('Invalid JSON body.'), undefined);
-  }
-});
+application.addContentTypeParser(
+  'application/json',
+  { parseAs: 'string' },
+  (request, body, done) => {
+    if (!body || String(body).trim() === '') {
+      done(null, {});
+      return;
+    }
+    try {
+      done(null, JSON.parse(String(body)));
+    } catch (error: unknown) {
+      done(error instanceof Error ? error : new Error('Invalid JSON body.'), undefined);
+    }
+  },
+);
 const control = new TradingControl();
 const broker = new KiteBroker();
 const riskGate = new RiskGate({
@@ -387,6 +391,7 @@ const llmDecisionLoopStatusSchema = {
     watchlistFile: { type: ['string', 'null'] },
     book: { type: 'string', enum: ['equity', 'options'] },
     instruments: { type: 'array', items: decisionInstrumentSchema },
+    tuuid: { type: ['string', 'null'], description: 'Trade id of the open trade; null when flat.' },
   },
 };
 
@@ -395,7 +400,8 @@ application.post(
   {
     schema: {
       tags: ['llm'],
-      summary: 'Start live options decision loop (picks contract + BUY/HOLD/EXIT/SKIP each cycle; store-only)',
+      summary:
+        'Start live options decision loop (rules decide BUY/HOLD/EXIT/SKIP; the LLM only picks the strike; positions sold by 15:15 IST; store-only)',
       security: [{ adminToken: [] }],
       body: {
         type: 'object',
@@ -482,7 +488,8 @@ application.post(
   {
     schema: {
       tags: ['trading'],
-      summary: 'Review stored LLM decisions for a date range. Does not change the decision loop.',
+      summary:
+        'Review all stored trades and skips for a date range and suggest strategy changes (tracked date-wise in the strategy ledger). Does not change the decision loop.',
       security: [{ adminToken: [] }],
       body: {
         type: 'object',
