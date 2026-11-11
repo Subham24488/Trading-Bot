@@ -23,7 +23,8 @@ vi.mock('../src/database.js', () => ({
 }));
 
 const { DEFAULT_STRATEGY, tunableValues } = await import('../src/strategy/params.js');
-const { buildSkipEpisodes, buildTrades } = await import('../src/review/tradeAnalysis.js');
+const { buildSkipEpisodes, buildTrades, simulateExitRules } =
+  await import('../src/review/tradeAnalysis.js');
 const { evaluateRules, ruleMinSamples } = await import('../src/review/enhancementRules.js');
 const { emptyLedger, planLedgerUpdate } = await import('../src/review/enhancementLedger.js');
 const { reviewTradingSessions } = await import('../src/review/sessionReview.js');
@@ -218,6 +219,39 @@ describe('buildSkipEpisodes', () => {
       estPnlPct: 25,
     });
     expect(news).toMatchObject({ rows: 1, blockedBy: ['high-news'] });
+  });
+});
+
+describe('simulateExitRules', () => {
+  const start = { premium: 100, delta: 0.5, side: 'CE' as const, spot: 25_000, at: ist('10:00') };
+  const path = (moves: Array<[string, number]>) =>
+    moves.map(([time, spot]) => ({ at: ist(time), spot }));
+
+  it('replays the break-even lock and the stepped trailing stop like the live rules', () => {
+    // +12% (index +24 points), then back to +3%: sold on the trailing stop at once.
+    const trailed = simulateExitRules(
+      start,
+      path([
+        ['10:05', 25_024],
+        ['10:10', 25_006],
+      ]),
+      params,
+    );
+    expect(trailed).toMatchObject({ reason: 'trailing-stop' });
+    expect(trailed?.bestPct).toBeCloseTo(12);
+    expect(trailed?.pnlPct).toBeCloseTo(3);
+
+    // +9%, then back to +1%: the break-even exit.
+    expect(
+      simulateExitRules(
+        start,
+        path([
+          ['10:05', 25_018],
+          ['10:10', 25_002],
+        ]),
+        params,
+      ),
+    ).toMatchObject({ reason: 'breakeven-stop' });
   });
 });
 

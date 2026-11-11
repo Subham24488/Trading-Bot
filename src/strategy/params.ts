@@ -31,14 +31,26 @@ export type StrategyParams = {
   maxVixRiseForCallsPct: number;
   newsLookbackMinutes: number;
   bigLevelBufferPct: number;
+  /** Room to the next big option level must be at least this many times `indexStopPct`. */
+  minRewardToRisk: number;
   maxTradesPerDay: number;
   maxLosingTradesPerDay: number;
+  /** No new trades once today's closed trades are net above this (₹), so a green day stays green. */
+  dayProfitLockInr: number;
   cooldownMinutes: number;
   stopLossPct: number;
   /** Sell when the index has moved this % against the trade since entry. */
   indexStopPct: number;
+  /** Once the best gain reaches this %, the exit moves up to cost plus `breakevenLockPct`. */
+  breakevenActivatePct: number;
+  /** Gain (%) the break-even exit keeps, enough to cover charges and the spread. */
+  breakevenLockPct: number;
   trailActivatePct: number;
   trailKeepFraction: number;
+  /** Larger gains keep a larger share: from `fromPct` best gain, keep at least `keep`. */
+  trailTiers: ReadonlyArray<{ fromPct: number; keep: number }>;
+  /** Share of the best gain kept once the index reaches a big option-seller level. */
+  bigLevelKeepFraction: number;
   timeStopMinutes: number;
   timeStopMinGainPct: number;
   reversalScore: number;
@@ -65,13 +77,27 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   maxVixRiseForCallsPct: 8,
   newsLookbackMinutes: 60,
   bigLevelBufferPct: 0.15,
+  // Three losing puts had 0.15–0.27% room to the put wall; no winner had less than 0.34%.
+  minRewardToRisk: 2,
   maxTradesPerDay: 3,
   maxLosingTradesPerDay: 2,
+  dayProfitLockInr: 0,
   cooldownMinutes: 30,
-  stopLossPct: 25,
-  indexStopPct: 0.25,
-  trailActivatePct: 15,
+  // Stopped trades never showed a profit; the one deep dip that recovered bottomed at −16%.
+  stopLossPct: 20,
+  // The premium moves ~70× the index in %, so 0.25% cost −17% on 2026-11-09; 0.15% ≈ −10%.
+  // Winners' index pullbacks stayed within 0.08%.
+  indexStopPct: 0.15,
+  // Three trades reached +9% to +15% and still closed at a loss before this lock existed.
+  breakevenActivatePct: 8,
+  breakevenLockPct: 2,
+  trailActivatePct: 10,
   trailKeepFraction: 0.5,
+  trailTiers: [
+    { fromPct: 25, keep: 0.65 },
+    { fromPct: 40, keep: 0.75 },
+  ],
+  bigLevelKeepFraction: 0.8,
   timeStopMinutes: 45,
   timeStopMinGainPct: 5,
   reversalScore: 3,

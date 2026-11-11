@@ -31,8 +31,10 @@ import {
   persistDecisions,
   writeUniverseFile,
   type DecisionMeta,
+  type DecisionRowInput,
   type OpenTradeRecord,
 } from './decisionStore.js';
+import type { DecisionRunLock } from './decisionRunLock.js';
 import {
   UNIVERSE_BAR_LOOKBACK_DAYS,
   UNIVERSE_MIN_BARS_FOR_MOMENTUM,
@@ -82,7 +84,14 @@ import type { NewsService } from '../news/NewsService.js';
 import type { UniverseBook } from '../universe/types.js';
 import type { MarketQuote } from '../broker/KiteBroker.js';
 import { LiveMarketFeed, type MarketView } from '../services/LiveMarketFeed.js';
-import { istClock, istDayStart, minutesBetween, msUntilNextCycle } from '../strategy/clock.js';
+import {
+  formatIstWallClock,
+  istClock,
+  istDayStart,
+  istTimeOnDay,
+  minutesBetween,
+  msUntilNextCycle,
+} from '../strategy/clock.js';
 import {
   buildCandidates,
   type CandidateRejection,
@@ -133,13 +142,25 @@ export type MarketDataBroker = Pick<
 
 export type LlmTradeAdvisorOptions = {
   llm: LlmChatClient;
-  news: NewsService;
+  news: Pick<NewsService, 'fetchIndexNews' | 'fetchNewsForRange'>;
   kite: MarketDataBroker;
   logger: SessionLogger;
+  /** Clock for the decision path; a simulation passes its virtual clock. */
+  now?: () => Date;
+  /** Set for a simulated replay: rows are stored flagged under this run id. */
+  simulationId?: string;
+  /** Shared with the simulator so only one decision run is active at a time. */
+  runLock?: DecisionRunLock;
 };
 
 /** Stops are checked this often between cycles, so a fast move is sold close to its level. */
 const MONITOR_INTERVAL_MS = 15_000;
+
+/** While a trade is open it gets a full cycle (signals included) every minute. */
+const OPEN_POSITION_CYCLE_MINUTES = 1;
+
+/** Window searched for the last 5-minute bar before the square-off of a stale position. */
+const SQUARE_OFF_LOOKBACK_MS = 30 * 60_000;
 
 /** The single open trade; `tuuid` ties its BUY, HOLDs and EXIT rows together. */
 type OpenTrade = OpenPosition & { tuuid: string };
@@ -155,6 +176,17 @@ const EMPTY_BACKDROP: DecisionSnapshot['market'] = {
 
 function round(value: number | null, digits = 2): number | null {
   return value === null || !Number.isFinite(value) ? null : Number(value.toFixed(digits));
+}
+
+/** Net ₹ of a stored EXIT, from its prices and the charges recorded in its snapshot. */
+export function storedNetPnlInr(
+  row: { action: string; buyPrice: number | null; sellPrice: number | null },
+  snapshot: DecisionSnapshot | null,
+): number | null {
+  if (row.action !== 'EXIT' || row.buyPrice === null || row.sellPrice === null || !snapshot?.fees) {
+    return null;
+  }
+  return round((row.sellPrice - row.buyPrice) * snapshot.fees.lotSize - snapshot.fees.totalInr);
 }
 
 /** Stops compare against the bid (what a sell would get), falling back to the last trade. */
@@ -190,16 +222,19 @@ export type UniverseSuggestResult = {
 
 export class LlmTradeAdvisorService {
   private readonly llm: LlmChatClient;
-  private readonly news: NewsService;
+  private readonly news: LlmTradeAdvisorOptions['news'];
   private readonly kite: MarketDataBroker;
   private readonly logger: SessionLogger;
+  private readonly now: () => Date;
+  private readonly simulationId: string | undefined;
+  private readonly runLock: DecisionRunLock | undefined;
   private readonly feed: LiveMarketFeed;
   private readonly params: StrategyParams;
   private running = false;
   private loopGeneration = 0;
   private cycleTimer: NodeJS.Timeout | undefined;
   private monitorTimer: NodeJS.Timeout | undefined;
-  /** Serialises the 15-minute cycle and the 1-minute monitor. */
+  /** Serialises the decision cycle and the 15-second monitor. */
   private queue: Promise<void> = Promise.resolve();
   private queued = 0;
   /** At most one open trade: while set, cycles only HOLD or EXIT it and never BUY. */
@@ -220,6 +255,9 @@ export class LlmTradeAdvisorService {
     this.news = options.news;
     this.kite = options.kite;
     this.logger = options.logger;
+    this.now = options.now ?? (() => new Date());
+    this.simulationId = options.simulationId;
+    this.runLock = options.runLock;
     this.feed = new LiveMarketFeed({
       kite: options.kite,
       news: options.news,
@@ -777,6 +815,7 @@ export class LlmTradeAdvisorService {
     return {
       running: this.isDecisionLoopRunning(),
       decisionIntervalMinutes: config.llm.decisionIntervalMinutes,
+      currentIntervalMinutes: this.cycleIntervalMinutes(),
       includedSymbols: [...this.includedSymbols],
       instruments: this.sessionStartPayload.instruments.map((instrument) => ({
         ...instrument,
@@ -791,7 +830,8 @@ export class LlmTradeAdvisorService {
 
   /**
    * Rules decide BUY/HOLD/EXIT/SKIP every cycle (aligned to the clock); the LLM only picks
-   * the strike for a BUY. An open position is also checked every minute. Store-only.
+   * the strike for a BUY. A flat book cycles every LLM_DECISION_INTERVAL_MINUTES; an open
+   * position is reviewed every minute and its stops checked every 15 seconds. Store-only.
    */
   public async startDecisionLoop(
     indexes?: readonly IndexOptionName[],
@@ -802,6 +842,7 @@ export class LlmTradeAdvisorService {
       });
     }
 
+    this.runLock?.acquire('live');
     this.book = 'options';
     this.decisionIndexes = indexes && indexes.length > 0 ? [...indexes] : [...INDEX_OPTION_NAMES];
     this.includedSymbols = [];
@@ -827,6 +868,7 @@ export class LlmTradeAdvisorService {
     this.logger.info(
       {
         intervalMinutes: config.llm.decisionIntervalMinutes,
+        openPositionIntervalMinutes: OPEN_POSITION_CYCLE_MINUTES,
         indexes: this.decisionIndexes,
         openSymbol: this.position?.symbol ?? null,
         paramsVersion: paramsVersion(this.params),
@@ -838,6 +880,7 @@ export class LlmTradeAdvisorService {
 
   public stop(): ReturnType<LlmTradeAdvisorService['getDecisionLoopStatus']> {
     this.running = false;
+    this.runLock?.release('live');
     if (this.cycleTimer) {
       clearTimeout(this.cycleTimer);
       this.cycleTimer = undefined;
@@ -861,20 +904,74 @@ export class LlmTradeAdvisorService {
     return run;
   }
 
+  /** Every minute while a trade is open; otherwise the .env interval. */
+  private cycleIntervalMinutes(): number {
+    return this.position ? OPEN_POSITION_CYCLE_MINUTES : config.llm.decisionIntervalMinutes;
+  }
+
   /** `generation` stops a cycle from a stopped-and-restarted loop scheduling a second timer. */
   private scheduleNextCycle(generation: number): void {
     if (!this.running || generation !== this.loopGeneration) {
       return;
     }
-    const delay = msUntilNextCycle(new Date(), config.llm.decisionIntervalMinutes);
+    const delay = msUntilNextCycle(new Date(), this.cycleIntervalMinutes());
+    const slot = new Date(Date.now() + delay);
     this.cycleTimer = setTimeout(() => {
-      void this.runExclusive(() => this.runDecisionCycle())
+      void this.runExclusive(() => this.runScheduledCycle(slot))
         .catch((error: unknown) => {
           this.logger.error({ err: error }, 'Decision cycle failed.');
         })
         .finally(() => this.scheduleNextCycle(generation));
     }, delay);
     this.cycleTimer.unref?.();
+  }
+
+  /**
+   * A flat book keeps the .env cadence: a 1-minute slot booked while a trade was open, which
+   * the monitor has sold since, stores nothing and the next cycle falls on the .env interval.
+   */
+  private async runScheduledCycle(slot: Date): Promise<number> {
+    if (!this.position && istClock(slot).minute % config.llm.decisionIntervalMinutes !== 0) {
+      return 0;
+    }
+    return this.runDecisionCycle();
+  }
+
+  /**
+   * Replays one day on the simulator's virtual clock with the live cadence: a cycle on every
+   * slot (the .env interval while flat, every minute while a trade is open) and the 15-second
+   * stop check in between. `advanceTo` moves the clock that `now` reads. Store-only.
+   */
+  public async replayDay(input: {
+    indexes: readonly IndexOptionName[];
+    end: Date;
+    advanceTo: (at: Date) => void;
+  }): Promise<void> {
+    this.book = 'options';
+    this.decisionIndexes = input.indexes.length > 0 ? [...input.indexes] : [...INDEX_OPTION_NAMES];
+    this.dayRows = null;
+    await this.restoreOpenPosition();
+    await this.runDecisionCycle();
+    const nextSlot = () => {
+      const now = this.now();
+      return new Date(now.getTime() + msUntilNextCycle(now, this.cycleIntervalMinutes()));
+    };
+    let slot = nextSlot();
+    let monitorAt = this.now().getTime() + MONITOR_INTERVAL_MS;
+    while (slot <= input.end) {
+      if (this.position && monitorAt < slot.getTime()) {
+        input.advanceTo(new Date(monitorAt));
+        await this.checkOpenPositionNow('monitor');
+      } else {
+        input.advanceTo(slot);
+        await this.runScheduledCycle(slot);
+        slot = nextSlot();
+      }
+      // The monitor keeps its 15-second rhythm; while flat its ticks do nothing.
+      while (monitorAt <= this.now().getTime()) {
+        monitorAt += MONITOR_INTERVAL_MS;
+      }
+    }
   }
 
   private async monitorTick(): Promise<void> {
@@ -890,7 +987,7 @@ export class LlmTradeAdvisorService {
 
   /** One decision cycle. Returns the number of rows stored (0 when nothing to decide). */
   public async runDecisionCycle(): Promise<number> {
-    const now = new Date();
+    const now = this.now();
     const clock = istClock(now);
     const open = this.position;
     const outsideDecisionHours =
@@ -983,16 +1080,27 @@ export class LlmTradeAdvisorService {
   private async todayRows(now: Date): Promise<DayRow[]> {
     const ymd = istClock(now).ymd;
     if (this.dayRows?.ymd !== ymd) {
-      const stored = await findDecisionsSince(istDayStart(now));
+      const stored = await findDecisionsSince(istDayStart(now), this.simulationId);
       this.dayRows = {
         ymd,
-        rows: stored.map((row) => ({
-          ...row,
-          trigger: parseDecisionSnapshot(row.marketSnapshot)?.trigger ?? null,
-        })),
+        rows: stored.map((row) => {
+          const snapshot = parseDecisionSnapshot(row.marketSnapshot);
+          return {
+            ...row,
+            trigger: snapshot?.trigger ?? null,
+            netPnlInr: storedNetPnlInr(row, snapshot),
+          };
+        }),
       };
     }
     return this.dayRows.rows;
+  }
+
+  /** Stores rows; a simulation's rows are flagged under its run id. */
+  private persist(input: DecisionRowInput): Promise<number> {
+    return persistDecisions(
+      this.simulationId ? { ...input, simulationId: this.simulationId } : input,
+    );
   }
 
   /** Keeps the in-memory day rows in step with a stored BUY or EXIT. */
@@ -1035,7 +1143,7 @@ export class LlmTradeAdvisorService {
     }
     const netPnlInr = this.netPnlInr(position, price);
     const rationale = describeHold({ position, price, netPnlInr, reading, params: this.params });
-    const stored = await persistDecisions({
+    const stored = await this.persist({
       asOf: now,
       batch: { decisions: [{ symbol: position.symbol, action: 'HOLD', rationale }] },
       lastPriceBySymbol: { [position.symbol]: price },
@@ -1059,13 +1167,13 @@ export class LlmTradeAdvisorService {
     return stored;
   }
 
-  /** Minute check (and start-up check) of the open position: stops, trailing, time, 15:15. */
+  /** 15-second check (and start-up check) of the open position: stops, profit floor, time, 15:15. */
   private async checkOpenPositionNow(trigger: 'monitor' | 'startup'): Promise<void> {
     const position = this.position;
     if (!position) {
       return;
     }
-    const now = new Date();
+    const now = this.now();
     let quote: MarketQuote | null = null;
     let spots: Partial<Record<IndexOptionName, number>> = {};
     try {
@@ -1073,7 +1181,9 @@ export class LlmTradeAdvisorService {
     } catch (error: unknown) {
       this.logger.warn({ err: error, symbol: position.symbol }, 'Position quote failed.');
     }
-    const price = this.trackPrice(position, quote);
+    // A position from an earlier day is sold at once; today's prices must not move its best/worst.
+    const stale = istClock(position.enteredAt).ymd < istClock(now).ymd;
+    const price = stale ? null : this.trackPrice(position, quote);
     const check = checkPositionExit(
       {
         now,
@@ -1091,7 +1201,7 @@ export class LlmTradeAdvisorService {
   /** Rebuilds the open position from the DB on start; closes it at once if it is from an earlier day. */
   private async restoreOpenPosition(): Promise<void> {
     this.position = null;
-    const trade = await findOpenTrade();
+    const trade = await findOpenTrade(this.simulationId);
     if (!trade) {
       return;
     }
@@ -1123,7 +1233,7 @@ export class LlmTradeAdvisorService {
       entrySpot: buySnapshot?.spots[index] ?? null,
     };
     this.applyDecisionState('HOLD', trade.symbol, trade.instrumentToken);
-    if (istClock(trade.enteredAt).ymd < istClock(new Date()).ymd) {
+    if (istClock(trade.enteredAt).ymd < istClock(this.now()).ymd) {
       await this.checkOpenPositionNow('startup');
     }
   }
@@ -1133,14 +1243,14 @@ export class LlmTradeAdvisorService {
    * with no entry price), so the one-open-trade rule holds and the loop can trade again.
    */
   private async closeUnrestorableTrade(trade: OpenTradeRecord): Promise<void> {
-    const now = new Date();
+    const now = this.now();
     const tuuid = trade.tuuid ?? randomUUID();
     const rationale = describeUnrestorableExit({
       symbol: trade.symbol,
       exitPrice: trade.lastPrice,
       buyPrice: trade.buyPrice,
     });
-    await persistDecisions({
+    await this.persist({
       asOf: now,
       batch: { decisions: [{ symbol: trade.symbol, action: 'EXIT', rationale }] },
       lastPriceBySymbol: { [trade.symbol]: trade.lastPrice },
@@ -1166,6 +1276,7 @@ export class LlmTradeAdvisorService {
       buyPrice: trade.buyPrice,
       sellPrice: trade.lastPrice,
       trigger: 'startup',
+      netPnlInr: null,
     });
     this.applyDecisionState('EXIT', trade.symbol, trade.instrumentToken);
     this.logger.warn(
@@ -1220,7 +1331,7 @@ export class LlmTradeAdvisorService {
         ? { model: llm.model, promptHash: llm.promptHash, rawCompletion: llm.rawCompletion }
         : {}),
     };
-    const stored = await persistDecisions({
+    const stored = await this.persist({
       asOf: input.now,
       batch: { decisions: [{ symbol: candidate.symbol, action: 'BUY', rationale }] },
       lastPriceBySymbol: { [candidate.symbol]: fillPrice },
@@ -1265,6 +1376,7 @@ export class LlmTradeAdvisorService {
       buyPrice: fillPrice,
       sellPrice: null,
       trigger: 'cycle',
+      netPnlInr: null,
     });
     this.lastQuotedPriceBySymbol[candidate.symbol] = candidate.ltp;
     this.applyDecisionState('BUY', candidate.symbol, candidate.token);
@@ -1317,7 +1429,7 @@ export class LlmTradeAdvisorService {
       params: this.params,
       ...(input.detail ? { detail: input.detail } : {}),
     });
-    const stored = await persistDecisions({
+    const stored = await this.persist({
       asOf: input.now,
       batch: { decisions: [{ symbol, action: 'SKIP', rationale }] },
       lastPriceBySymbol: { [symbol]: row.price },
@@ -1356,20 +1468,36 @@ export class LlmTradeAdvisorService {
     readings?: IndexReading[];
   }): Promise<number> {
     const { position } = input;
+    const squareOffPrice =
+      input.reason === 'stale-position' ? await this.squareOffPrice(position) : null;
     const last = input.quote?.lastPrice && input.quote.lastPrice > 0 ? input.quote.lastPrice : null;
     const bid = input.quote?.bid ?? null;
-    const exitPrice = bid ?? last ?? this.lastQuotedPriceBySymbol[position.symbol] ?? null;
-    const priceSource = bid !== null ? 'bid' : last !== null ? 'last-trade' : 'last-known';
+    const exitPrice =
+      squareOffPrice ?? bid ?? last ?? this.lastQuotedPriceBySymbol[position.symbol] ?? null;
+    const priceSource =
+      squareOffPrice !== null
+        ? 'square-off-candle'
+        : bid !== null
+          ? 'bid'
+          : last !== null
+            ? 'last-trade'
+            : 'last-known';
+    // Held until the square-off of the day it was bought when priced from that day's candle.
+    const exitAt =
+      squareOffPrice !== null
+        ? istTimeOnDay(position.enteredAt, this.params.squareOffMinute)
+        : input.now;
     const netPnlInr = this.netPnlInr(position, exitPrice);
     const rationale = describeExit({
-      now: input.now,
+      now: exitAt,
       position,
       exitPrice,
       reason: input.reason,
       netPnlInr,
       params: this.params,
+      pricedAtSquareOff: squareOffPrice !== null,
     });
-    const stored = await persistDecisions({
+    const stored = await this.persist({
       asOf: input.now,
       batch: { decisions: [{ symbol: position.symbol, action: 'EXIT', rationale }] },
       lastPriceBySymbol: { [position.symbol]: exitPrice },
@@ -1385,7 +1513,7 @@ export class LlmTradeAdvisorService {
           readings: input.readings ?? [],
           blockedBy: [],
           leaning: null,
-          position: this.positionSnapshot(position, input.now, last ?? exitPrice),
+          position: this.positionSnapshot(position, exitAt, squareOffPrice ?? last ?? exitPrice),
           exit: { reason: input.reason, priceSource },
           ...(position.lotSize
             ? {
@@ -1412,6 +1540,7 @@ export class LlmTradeAdvisorService {
       buyPrice: position.entryPrice,
       sellPrice: exitPrice,
       trigger: input.trigger,
+      netPnlInr,
     });
     this.applyDecisionState('EXIT', position.symbol, position.token);
     this.logger.info(
@@ -1426,6 +1555,32 @@ export class LlmTradeAdvisorService {
       'Stored rules-based EXIT without executing.',
     );
     return stored;
+  }
+
+  /**
+   * Close of the option's last 5-minute bar before the square-off on the day it was bought, so a
+   * position left open overnight is recorded at the price it should have been sold at.
+   */
+  private async squareOffPrice(position: OpenTrade): Promise<number | null> {
+    if (position.token === null || position.token <= 0) {
+      return null;
+    }
+    const squareOff = istTimeOnDay(position.enteredAt, this.params.squareOffMinute);
+    try {
+      const bars = await this.kite.getFiveMinuteCandles(
+        position.token,
+        formatIstWallClock(new Date(squareOff.getTime() - SQUARE_OFF_LOOKBACK_MS)),
+        formatIstWallClock(squareOff),
+      );
+      const close = bars.filter((bar) => Date.parse(bar.t) < squareOff.getTime()).at(-1)?.c;
+      return close !== undefined && close > 0 ? close : null;
+    } catch (error: unknown) {
+      this.logger.warn(
+        { err: error, symbol: position.symbol },
+        'Square-off candle failed; pricing the stale position at the current quote.',
+      );
+      return null;
+    }
   }
 
   /** Updates the last price and the best/worst premium seen; returns the usable price. */

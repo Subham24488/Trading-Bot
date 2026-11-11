@@ -74,7 +74,14 @@ export type DecisionRowInput = {
   metaBySymbol?: Record<string, DecisionMeta>;
   /** Trade id for BUY/HOLD/EXIT rows; never written on SKIP. */
   tuuidBySymbol?: Record<string, string>;
+  /** Set for a simulated replay: rows are flagged and dated at the virtual `asOf`. */
+  simulationId?: string;
 };
+
+/** Live reads see only live rows; a simulation sees only its own run. */
+function runFilter(simulationId?: string): Prisma.LlmTradeDecisionWhereInput {
+  return simulationId ? { simulationId } : { simulated: false };
+}
 
 export function pricesForDecision(
   action: DecisionBatch['decisions'][number]['action'],
@@ -137,6 +144,9 @@ export async function persistDecisions(input: DecisionRowInput): Promise<number>
       ...(currentPrice === null ? {} : { currentPrice }),
       ...(prices.sellPrice === null ? {} : { sellPrice: prices.sellPrice }),
       ...(tuuid ? { tuuid } : {}),
+      ...(input.simulationId
+        ? { simulated: true, simulationId: input.simulationId, decidedAt: input.asOf }
+        : {}),
     };
   });
 
@@ -167,7 +177,7 @@ export async function latestActionsForSymbols(
   const entries = await Promise.all(
     unique.map(async (symbol) => {
       const row = await database.llmTradeDecision.findFirst({
-        where: { symbol },
+        where: { symbol, simulated: false },
         orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
         select: { action: true, buyPrice: true },
       });
@@ -207,8 +217,10 @@ export type OpenTradeRecord = {
 };
 
 /** The position left open by the latest BUY/HOLD row (EXIT/SKIP ⇒ flat), with its entry row. */
-export async function findOpenTrade(): Promise<OpenTradeRecord | null> {
+export async function findOpenTrade(simulationId?: string): Promise<OpenTradeRecord | null> {
+  const run = runFilter(simulationId);
   const latest = await database.llmTradeDecision.findFirst({
+    where: run,
     orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
     select: {
       symbol: true,
@@ -224,7 +236,7 @@ export async function findOpenTrade(): Promise<OpenTradeRecord | null> {
     return null;
   }
   const entry = await database.llmTradeDecision.findFirst({
-    where: { symbol: latest.symbol, action: 'BUY', decidedAt: { lte: latest.decidedAt } },
+    where: { ...run, symbol: latest.symbol, action: 'BUY', decidedAt: { lte: latest.decidedAt } },
     orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
     select: {
       asOf: true,
@@ -237,6 +249,7 @@ export async function findOpenTrade(): Promise<OpenTradeRecord | null> {
   });
   const holds = await database.llmTradeDecision.findMany({
     where: {
+      ...run,
       symbol: latest.symbol,
       action: 'HOLD',
       decidedAt: { gte: entry?.decidedAt ?? latest.decidedAt },
@@ -262,18 +275,25 @@ export async function findOpenTrade(): Promise<OpenTradeRecord | null> {
 export type StoredDecisionRow = {
   action: LlmTradeAction;
   decidedAt: Date;
+  symbol: string;
+  tuuid: string | null;
   buyPrice: number | null;
   sellPrice: number | null;
   marketSnapshot: unknown;
 };
 
-export async function findDecisionsSince(from: Date): Promise<StoredDecisionRow[]> {
+export async function findDecisionsSince(
+  from: Date,
+  simulationId?: string,
+): Promise<StoredDecisionRow[]> {
   const rows = await database.llmTradeDecision.findMany({
-    where: { decidedAt: { gte: from } },
+    where: { ...runFilter(simulationId), decidedAt: { gte: from } },
     orderBy: [{ decidedAt: 'asc' }, { asOf: 'asc' }],
     select: {
       action: true,
       decidedAt: true,
+      symbol: true,
+      tuuid: true,
       buyPrice: true,
       sellPrice: true,
       marketSnapshot: true,
@@ -282,6 +302,8 @@ export async function findDecisionsSince(from: Date): Promise<StoredDecisionRow[
   return rows.map((row) => ({
     action: row.action,
     decidedAt: row.decidedAt,
+    symbol: row.symbol,
+    tuuid: row.tuuid,
     buyPrice: storedNumber(row.buyPrice),
     sellPrice: storedNumber(row.sellPrice),
     marketSnapshot: row.marketSnapshot,

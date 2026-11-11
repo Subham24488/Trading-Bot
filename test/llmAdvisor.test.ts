@@ -14,7 +14,7 @@ vi.mock('../src/config.js', () => ({
       maxTokens: 200,
     },
     llm: {
-      decisionIntervalMinutes: 15,
+      decisionIntervalMinutes: 5,
       minHoldMinutes: 15,
       targetNetPnlPct: 8,
       newsLookbackDays: 30,
@@ -754,25 +754,109 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
     }
   });
 
-  it('sells when the index moves 0.25% against the trade', async () => {
+  it('sells when the index moves 0.15% against the trade', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
       vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
       const { advisor, setNiftySpot } = await optionsAdvisorScenario();
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
-      expect(storedRows()[0]?.rationale).toContain('or if NIFTY falls to 24,938');
+      expect(storedRows()[0]?.rationale).toContain('or if NIFTY falls to 24,963');
 
-      setNiftySpot(24_950);
+      setNiftySpot(24_970);
       vi.setSystemTime(ist('2026-10-21', '10:31'));
       await advisor.runDecisionCycle();
-      setNiftySpot(24_930);
+      setNiftySpot(24_955);
       vi.setSystemTime(ist('2026-10-21', '10:32'));
       await advisor.runDecisionCycle();
 
       expect(storedRows().slice(1).map((row) => row.action)).toEqual(['HOLD', 'EXIT']);
       expect(storedRows()[2]?.marketSnapshot.exit?.reason).toBe('index-stop');
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops buying for the day once a closed trade leaves the day in profit', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      const { advisor, setOptionPriceFactor } = await optionsAdvisorScenario();
+      await advisor.startDecisionLoop(['NIFTY']);
+      advisor.stop();
+
+      // Best +30%, then back to +10%: the trailing stop sells at a profit.
+      setOptionPriceFactor(1.3);
+      vi.setSystemTime(ist('2026-10-21', '10:31'));
+      await advisor.runDecisionCycle();
+      setOptionPriceFactor(1.1);
+      vi.setSystemTime(ist('2026-10-21', '10:32'));
+      await advisor.runDecisionCycle();
+      const exit = storedRows()[2];
+      expect(exit?.marketSnapshot.exit?.reason).toBe('trailing-stop');
+      expect(Number(exit?.sellPrice)).toBeGreaterThan(Number(exit?.buyPrice));
+
+      // Past the cool-down, the same market would buy again; the green day stays green.
+      vi.setSystemTime(ist('2026-10-21', '11:15'));
+      await advisor.runDecisionCycle();
+      expect(storedRows().at(-1)).toMatchObject({
+        action: 'SKIP',
+        marketSnapshot: { blockedBy: ['day-in-profit'] },
+      });
+      expect(storedRows().at(-1)?.rationale).toContain(
+        "today's closed trades are already in profit",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reviews an open trade every minute and returns to the .env interval once it is sold', async () => {
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
+    // setImmediate stays real, so each step lets the cycle's promise chain settle.
+    const advance = async (ms: number) => {
+      await vi.advanceTimersByTimeAsync(ms);
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    let stop: (() => unknown) | undefined;
+    try {
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      const { advisor, setOptionPriceFactor } = await optionsAdvisorScenario();
+      stop = () => advisor.stop();
+      const started = await advisor.startDecisionLoop(['NIFTY']);
+      expect(started).toMatchObject({ decisionIntervalMinutes: 5, currentIntervalMinutes: 1 });
+      expect(storedRows().map((row) => row.action)).toEqual(['BUY']);
+
+      // The open trade gets its next full review a minute later, not at the 5-minute slot.
+      await advance(60_000);
+      expect(storedRows()[1]).toMatchObject({
+        action: 'HOLD',
+        asOf: new Date(ist('2026-10-21', '10:31').getTime() + 20_000),
+      });
+
+      // The 15-second monitor sells on the stop-loss before the 10:32 review.
+      setOptionPriceFactor(0.5);
+      await advance(15_000);
+      expect(storedRows()[2]).toMatchObject({
+        action: 'EXIT',
+        marketSnapshot: { trigger: 'monitor', exit: { reason: 'stop-loss' } },
+      });
+      expect(advisor.getDecisionLoopStatus().currentIntervalMinutes).toBe(5);
+
+      // Flat again: the leftover 10:32 slot stores nothing; the next row is the 10:35 SKIP.
+      setOptionPriceFactor(1);
+      await advance(60_000);
+      expect(storedRows()).toHaveLength(3);
+      await advance(3 * 60_000);
+      expect(storedRows()).toHaveLength(4);
+      expect(storedRows()[3]).toMatchObject({
+        action: 'SKIP',
+        asOf: new Date(ist('2026-10-21', '10:35').getTime() + 20_000),
+      });
+    } finally {
+      stop?.();
       vi.useRealTimers();
     }
   });
@@ -830,6 +914,73 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       expect(storedRows()).toEqual([
         expect.objectContaining({ action: 'HOLD', symbol: 'NIFTY26OCT25000CE', tuuid }),
       ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records a trade left open overnight at its own day's 3:15 PM price", async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(ist('2026-10-21', '10:35'));
+      const { advisor, getFiveMinuteCandles } = await optionsAdvisorScenario();
+      const tuuid = '3b7d9e1f-2a4c-4e6b-8d0f-1a3c5e7b9d2f';
+      findFirst
+        .mockResolvedValueOnce({
+          symbol: 'NIFTY26OCT25000CE',
+          action: 'HOLD',
+          instrumentToken: 250001,
+          marketSnapshot: {},
+          decidedAt: ist('2026-10-20', '11:40'),
+          currentPrice: 118,
+          tuuid,
+        })
+        .mockResolvedValueOnce({
+          asOf: ist('2026-10-20', '11:35'),
+          decidedAt: ist('2026-10-20', '11:35'),
+          buyPrice: 120,
+          instrumentToken: 250001,
+          marketSnapshot: {},
+          tuuid,
+        });
+      const bar = (time: string, close: number) => ({
+        t: ist('2026-10-20', time).toISOString(),
+        o: close,
+        h: close,
+        l: close,
+        c: close,
+        v: 1_000,
+      });
+      // The 15:10 bar closes at 3:15 PM; the 15:15 bar is after the square-off.
+      getFiveMinuteCandles.mockResolvedValueOnce([
+        bar('15:05', 131),
+        bar('15:10', 133.5),
+        bar('15:15', 135),
+      ]);
+
+      await advisor.startDecisionLoop(['NIFTY']);
+      advisor.stop();
+
+      expect(getFiveMinuteCandles).toHaveBeenNthCalledWith(
+        1,
+        250001,
+        '2026-10-20 14:45:00',
+        '2026-10-20 15:15:00',
+      );
+      const [sell] = storedRows();
+      expect(sell).toMatchObject({
+        action: 'EXIT',
+        symbol: 'NIFTY26OCT25000CE',
+        tuuid,
+        buyPrice: '120.0000',
+        sellPrice: '133.5000',
+        marketSnapshot: {
+          trigger: 'startup',
+          exit: { reason: 'stale-position', priceSource: 'square-off-candle' },
+        },
+      });
+      expect(sell?.rationale).toContain('held for 220 minutes');
+      expect(sell?.rationale).toContain('recorded at its 3:15 PM price on the day it was bought');
     } finally {
       vi.useRealTimers();
     }

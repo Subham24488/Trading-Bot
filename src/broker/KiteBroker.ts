@@ -535,9 +535,29 @@ export class KiteBroker implements BrokerAdapter {
     toIst: string,
     options: { includeOi?: boolean } = {},
   ): Promise<IntradayBar[]> {
+    return this.intradayCandles(instrumentToken, '5minute', fromIst, toIst, options);
+  }
+
+  /** 1-minute bars between IST wall-clock datetimes; used to record a day for a simulation. */
+  public async getMinuteCandles(
+    instrumentToken: number,
+    fromIst: string,
+    toIst: string,
+    options: { includeOi?: boolean } = {},
+  ): Promise<IntradayBar[]> {
+    return this.intradayCandles(instrumentToken, 'minute', fromIst, toIst, options);
+  }
+
+  private async intradayCandles(
+    instrumentToken: number,
+    interval: 'minute' | '5minute',
+    fromIst: string,
+    toIst: string,
+    options: { includeOi?: boolean },
+  ): Promise<IntradayBar[]> {
     const rows = await this.fetchHistorical(
       instrumentToken,
-      '5minute',
+      interval,
       fromIst,
       toIst,
       options.includeOi ?? false,
@@ -559,7 +579,7 @@ export class KiteBroker implements BrokerAdapter {
 
   private async fetchHistorical(
     instrumentToken: number,
-    interval: 'day' | '5minute',
+    interval: 'day' | 'minute' | '5minute',
     from: string,
     to: string,
     includeOi = false,

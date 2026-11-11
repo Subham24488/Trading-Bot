@@ -255,7 +255,7 @@ export async function reviewTradingSessions(
     targetNetPnlPct: config.llm.targetNetPnlPct,
   });
   const stored = await database.llmTradeDecision.findMany({
-    where: { decidedAt: { gte: from, lte: to } },
+    where: { simulated: false, decidedAt: { gte: from, lte: to } },
     orderBy: [{ decidedAt: 'asc' }, { asOf: 'asc' }],
     select: {
       decidedAt: true,

@@ -16,6 +16,12 @@ export const decisionIndexesBodySchema = z.object({
 
 export type DecisionIndexesBody = z.infer<typeof decisionIndexesBodySchema>;
 
+export const simulateDecisionsBodySchema = decisionIndexesBodySchema.extend({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
+});
+
+export type SimulateDecisionsBody = z.infer<typeof simulateDecisionsBodySchema>;
+
 export const greeksIvAlgorithmSchema = z.enum(GREEKS_IV_ALGORITHMS);
 export type GreeksIvAlgorithmName = z.infer<typeof greeksIvAlgorithmSchema>;
 

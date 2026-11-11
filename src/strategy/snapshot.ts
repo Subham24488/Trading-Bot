@@ -97,7 +97,8 @@ export const decisionSnapshotSchema = z.object({
   exit: z
     .object({
       reason: z.enum(EXIT_REASONS),
-      priceSource: z.enum(['bid', 'last-trade', 'last-known']),
+      /** `square-off-candle`: a position left open overnight, priced at its own day's 3:15 PM. */
+      priceSource: z.enum(['bid', 'last-trade', 'last-known', 'square-off-candle']),
     })
     .optional(),
   fees: z.object({ totalInr: z.number(), lotSize: z.number() }).optional(),

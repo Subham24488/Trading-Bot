@@ -1,6 +1,13 @@
 import { formatClockTime, formatIstTime, minutesBetween } from './clock.js';
 import type { ContractCandidate } from './contracts.js';
-import type { ExitReason, GateId, Leaning, OpenPosition } from './decisionEngine.js';
+import {
+  levelRoomPct,
+  profitFloor,
+  type ExitReason,
+  type GateId,
+  type Leaning,
+  type OpenPosition,
+} from './decisionEngine.js';
 import { pctChange, type OptionSide } from './indicators.js';
 import type { StrategyParams } from './params.js';
 import type { IndexReading } from './signals.js';
@@ -90,7 +97,43 @@ const GATE_TEXT: Record<GateId, (params: StrategyParams) => string> = {
     'the price is right next to a level that many option sellers are betting it will not cross',
   'no-liquid-contract': () =>
     'no option passed our checks for price, trading costs and how easily it can be bought and sold',
+  'low-reward': (p) =>
+    `the next level many option sellers are betting the price will not cross is less than ${p.minRewardToRisk}× our ${p.indexStopPct}% loss limit away, so the possible gain is too small for the risk`,
+  'day-in-profit': (p) =>
+    `today's closed trades are already ${p.dayProfitLockInr > 0 ? `up more than ${formatInr(p.dayProfitLockInr)}` : 'in profit'}, so we stop for the day to keep it`,
 };
+
+/** " or if NIFTY falls to 24,963 (0.15% against us)"; empty when the entry spot is unknown. */
+function indexStopText(
+  index: string,
+  side: OptionSide,
+  spot: number | null,
+  params: StrategyParams,
+): string {
+  if (spot === null) {
+    return '';
+  }
+  const against = side === 'CE' ? -1 : 1;
+  return (
+    ` or if ${index} ${against > 0 ? 'rises' : 'falls'} to ` +
+    `${wholeNumber.format(spot * (1 + (against * params.indexStopPct) / 100))} ` +
+    `(${params.indexStopPct}% against us)`
+  );
+}
+
+/** Room to the next big option level, stated as the reward side of the trade; empty when unknown. */
+function roomText(reading: IndexReading, side: OptionSide, params: StrategyParams): string {
+  const room = levelRoomPct(reading, side);
+  const wall = side === 'CE' ? reading.callWall : reading.putWall;
+  if (room === null || wall === null) {
+    return '';
+  }
+  return (
+    `${reading.index} has room to ${side === 'CE' ? 'rise' : 'fall'} to ${wholeNumber.format(wall)} ` +
+    `(${room.toFixed(2)}% away) before a level many option sellers are betting it will not cross, ` +
+    `at least ${params.minRewardToRisk}× the ${params.indexStopPct}% loss limit. `
+  );
+}
 
 export function describeGate(gate: GateId, params: StrategyParams): string {
   return GATE_TEXT[gate](params);
@@ -108,15 +151,9 @@ export function describeBuy(input: {
   const { candidate, fillPrice, params } = input;
   const direction = candidate.side === 'CE' ? 'rise' : 'fall';
   const stopPrice = fillPrice * (1 - params.stopLossPct / 100);
-  const protectFrom = fillPrice * (1 + params.trailActivatePct / 100);
-  const spot = input.reading.spot;
-  const against = candidate.side === 'CE' ? -1 : 1;
-  const indexStop =
-    spot === null
-      ? ''
-      : ` or if ${candidate.index} ${against > 0 ? 'rises' : 'falls'} to ` +
-        `${wholeNumber.format(spot * (1 + (against * params.indexStopPct) / 100))} ` +
-        `(${params.indexStopPct}% against us)`;
+  const protectFrom = fillPrice * (1 + params.breakevenActivatePct / 100);
+  const lockAt = fillPrice * (1 + params.breakevenLockPct / 100);
+  const indexStop = indexStopText(candidate.index, candidate.side, input.reading.spot, params);
   const pick =
     input.pickedBy === 'llm'
       ? `The AI assistant chose this strike from ${input.candidateCount} options that passed our checks.`
@@ -126,9 +163,11 @@ export function describeBuy(input: {
   return finish(
     `Bought 1 lot (${candidate.lotSize} units) of ${describeContract(candidate)} at ${formatInr(fillPrice)} ` +
       `at ${formatIstTime(input.now)}, betting that ${candidate.index} will ${direction}. ` +
-      `Why: ${joinReasons(supportingReasons(input.reading, candidate.side))}. ${pick} ` +
+      `Why: ${joinReasons(supportingReasons(input.reading, candidate.side))}. ` +
+      `${roomText(input.reading, candidate.side, params)}${pick} ` +
       `Plan: sell if the price falls to ${formatInr(stopPrice)} (−${params.stopLossPct}%)${indexStop}, ` +
-      `protect profits once it reaches ${formatInr(protectFrom)} (+${params.trailActivatePct}%), ` +
+      `protect profits once it reaches ${formatInr(protectFrom)} (+${params.breakevenActivatePct}%) ` +
+      `by moving the exit up to ${formatInr(lockAt)}, keep a growing share of bigger gains, ` +
       `and sell by ${formatClockTime(params.squareOffMinute)} at the latest.`,
   );
 }
@@ -182,10 +221,14 @@ export function describeHold(input: {
       : `, about ${formatSignedInr(input.netPnlInr)} on 1 lot after estimated charges`;
   const peakGainPct =
     pctChange(position.entryPrice, Math.max(position.peakPrice, input.price)) ?? 0;
+  const floor = profitFloor(peakGainPct, params);
+  const floorPrice = floor ? position.entryPrice * (1 + floor.floorPct / 100) : null;
   const protection =
-    peakGainPct >= params.trailActivatePct
-      ? `profit protection is on and sells below ${formatInr(position.entryPrice * (1 + (peakGainPct * params.trailKeepFraction) / 100))}`
-      : `profit protection starts at ${formatInr(position.entryPrice * (1 + params.trailActivatePct / 100))}`;
+    floor === null || floorPrice === null
+      ? `profit protection starts at ${formatInr(position.entryPrice * (1 + params.breakevenActivatePct / 100))}`
+      : floor.kind === 'breakeven'
+        ? `the exit has moved up to ${formatInr(floorPrice)} so this trade cannot turn into a loss`
+        : `profit protection is on and sells below ${formatInr(floorPrice)}`;
   const support = input.reading ? supportingReasons(input.reading, position.side, 1) : [];
   const trend =
     support.length > 0
@@ -195,7 +238,8 @@ export function describeHold(input: {
         : '';
   return finish(
     `Holding ${contract}. Bought at ${formatInr(position.entryPrice)}, now ${formatInr(input.price)} ` +
-      `(${formatPct(pnlPct)}${money}).${trend} Safety exit at ${formatInr(stopPrice)}; ${protection}; ` +
+      `(${formatPct(pnlPct)}${money}).${trend} Safety exit at ${formatInr(stopPrice)}` +
+      `${indexStopText(position.index, position.side, position.entrySpot, params)}; ${protection}; ` +
       `sells by ${formatClockTime(params.squareOffMinute)} at the latest.`,
   );
 }
@@ -218,6 +262,10 @@ const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, peakPrice: number) 
   unrestorable: () => UNRESTORABLE_TEXT,
   'index-stop': (p) =>
     `the index moved ${p.indexStopPct}% against the trade since we bought, so the reason for the trade no longer held`,
+  'breakeven-stop': (p) =>
+    `the option had gained ${p.breakevenActivatePct}% and then fell back to our break-even exit, so a winning trade was not allowed to turn into a loss`,
+  'level-reached': (_, peakPrice) =>
+    `the index reached a level many option sellers are betting it will not cross, and the price slipped from its best of ${formatInr(peakPrice)}, so we locked in most of the gain`,
 };
 
 /** SELL for an open trade that start-up could not rebuild into a position. */
@@ -241,6 +289,8 @@ export function describeExit(input: {
   reason: ExitReason;
   netPnlInr: number | null;
   params: StrategyParams;
+  /** The exit price is that day's 3:15 PM price, not today's (a position left open overnight). */
+  pricedAtSquareOff?: boolean;
 }): string {
   const { position } = input;
   const pnlPct = pctChange(position.entryPrice, input.exitPrice);
@@ -252,9 +302,12 @@ export function describeExit(input: {
           ? ')'
           : `, about ${formatSignedInr(input.netPnlInr)} after estimated charges on 1 lot)`);
   const reason = EXIT_TEXT[input.reason](input.params, position.peakPrice);
+  const pricing = input.pricedAtSquareOff
+    ? ` It is recorded at its ${formatClockTime(input.params.squareOffMinute)} price on the day it was bought, when it should have been sold.`
+    : '';
   return finish(
     `Sold ${describeContract(position)} ${result}. Reason: ${reason}. ` +
       `It was bought at ${formatInr(position.entryPrice)} at ${formatIstTime(position.enteredAt)} ` +
-      `and held for ${minutesBetween(position.enteredAt, input.now)} minutes.`,
+      `and held for ${minutesBetween(position.enteredAt, input.now)} minutes.${pricing}`,
   );
 }

@@ -20,6 +20,8 @@ export const GATE_IDS = [
   'high-news',
   'near-big-level',
   'no-liquid-contract',
+  'low-reward',
+  'day-in-profit',
 ] as const;
 
 export type GateId = (typeof GATE_IDS)[number];
@@ -34,11 +36,19 @@ export const EXIT_REASONS = [
   'news-risk',
   'unrestorable',
   'index-stop',
+  'breakeven-stop',
+  'level-reached',
 ] as const;
 
 export type ExitReason = (typeof EXIT_REASONS)[number];
 
-export type DayStats = { trades: number; losingTrades: number; lastExitAt: Date | null };
+export type DayStats = {
+  trades: number;
+  losingTrades: number;
+  lastExitAt: Date | null;
+  /** Net ₹ of today's closed trades after estimated charges. */
+  netPnlInr: number;
+};
 
 export type Leaning = { index: IndexOptionName; side: OptionSide; score: number };
 
@@ -89,6 +99,20 @@ function isNearBigLevel(reading: IndexReading, side: OptionSide, params: Strateg
   return putWall !== null && ((spot - putWall) / spot) * 100 < params.bigLevelBufferPct;
 }
 
+/**
+ * Room (% of spot) the index has before the next big option level in the trade's direction:
+ * the call wall above for calls, the put wall below for puts. Null when either is unknown.
+ */
+export function levelRoomPct(reading: IndexReading, side: OptionSide): number | null {
+  const { spot } = reading;
+  const wall = side === 'CE' ? reading.callWall : reading.putWall;
+  if (spot === null || wall === null) {
+    return null;
+  }
+  const room = ((wall - spot) / spot) * 100;
+  return side === 'CE' ? room : -room;
+}
+
 function readingGates(
   reading: IndexReading,
   side: OptionSide | null,
@@ -137,7 +161,56 @@ function readingGates(
   if (isNearBigLevel(reading, side, params)) {
     gates.push('near-big-level');
   }
+  const room = levelRoomPct(reading, side);
+  if (room !== null && room < params.minRewardToRisk * params.indexStopPct) {
+    gates.push('low-reward');
+  }
   return gates;
+}
+
+export type ProfitFloor = { floorPct: number; kind: 'breakeven' | 'trail' | 'level' };
+
+const FLOOR_EXIT_REASON: Record<ProfitFloor['kind'], ExitReason> = {
+  breakeven: 'breakeven-stop',
+  trail: 'trailing-stop',
+  level: 'level-reached',
+};
+
+/**
+ * Lowest gain (% on premium) the trade may fall back to before it is sold, from its best gain
+ * so far; null until the break-even lock arms. Shared by the live checks, the HOLD rationale
+ * and the review's what-if replay.
+ */
+export function profitFloor(
+  peakGainPct: number,
+  params: StrategyParams,
+  atBigLevel = false,
+): ProfitFloor | null {
+  if (peakGainPct < params.breakevenActivatePct) {
+    return null;
+  }
+  let floor: ProfitFloor = { floorPct: params.breakevenLockPct, kind: 'breakeven' };
+  const raise = (floorPct: number, kind: ProfitFloor['kind']) => {
+    if (floorPct > floor.floorPct) {
+      floor = { floorPct, kind };
+    }
+  };
+  if (peakGainPct >= params.trailActivatePct) {
+    const keep = params.trailTiers.reduce(
+      (best, tier) => (peakGainPct >= tier.fromPct ? Math.max(best, tier.keep) : best),
+      params.trailKeepFraction,
+    );
+    raise(peakGainPct * keep, 'trail');
+  }
+  if (atBigLevel) {
+    raise(peakGainPct * params.bigLevelKeepFraction, 'level');
+  }
+  return floor;
+}
+
+/** The exit reason stored when the price falls through `floor`. */
+export function floorExitReason(floor: ProfitFloor): ExitReason {
+  return FLOOR_EXIT_REASON[floor.kind];
 }
 
 /** How far (%) the index has moved against the position since entry; 0 when unknown. */
@@ -172,6 +245,9 @@ export function decideEntry(
   }
   if (input.day.losingTrades >= params.maxLosingTradesPerDay) {
     common.push('daily-loss-limit');
+  }
+  if (input.day.netPnlInr > params.dayProfitLockInr) {
+    common.push('day-in-profit');
   }
   if (
     input.day.lastExitAt &&
@@ -214,9 +290,10 @@ export function decideEntry(
 }
 
 /**
- * Open position, checked in order: end-of-day square-off, stale position, stop-loss,
- * trailing stop, time stop; then (cycle only, after the minimum hold) trend reversal
- * and major news while losing.
+ * Open position, checked in order: end-of-day square-off, stale position, stop-loss, index
+ * stop, profit floor (break-even lock, stepped trailing stop, tighter at a big level on cycle
+ * checks), time stop; then (cycle only, after the minimum hold) trend reversal and major news
+ * while losing.
  */
 export function checkPositionExit(
   input: {
@@ -247,15 +324,20 @@ export function checkPositionExit(
   if (price === null || pnlPct === null) {
     return { action: 'HOLD' };
   }
+  const reading = input.reading;
   const peakGainPct = pctChange(position.entryPrice, Math.max(position.peakPrice, price)) ?? 0;
-  if (peakGainPct >= params.trailActivatePct && pnlPct < peakGainPct * params.trailKeepFraction) {
-    return { action: 'EXIT', reason: 'trailing-stop' };
+  const floor = profitFloor(
+    peakGainPct,
+    params,
+    reading ? isNearBigLevel(reading, position.side, params) : false,
+  );
+  if (floor && pnlPct < floor.floorPct) {
+    return { action: 'EXIT', reason: floorExitReason(floor) };
   }
   const heldMinutes = minutesBetween(position.enteredAt, now);
   if (heldMinutes >= params.timeStopMinutes && pnlPct < params.timeStopMinGainPct) {
     return { action: 'EXIT', reason: 'time-stop' };
   }
-  const reading = input.reading;
   if (reading && heldMinutes >= params.minHoldMinutes) {
     const direction = position.side === 'CE' ? 1 : -1;
     const trendFlipped =
@@ -277,6 +359,8 @@ export type DayRow = {
   sellPrice: number | null;
   /** Snapshot trigger; start-up exits of older positions do not count against today. */
   trigger: string | null;
+  /** EXIT only: net ₹ after estimated charges, when known. */
+  netPnlInr: number | null;
 };
 
 export function summarizeDay(rows: readonly DayRow[], now: Date): DayStats {
@@ -292,5 +376,6 @@ export function summarizeDay(rows: readonly DayRow[], now: Date): DayStats {
       (latest, row) => (latest && latest >= row.decidedAt ? latest : row.decidedAt),
       null,
     ),
+    netPnlInr: exits.reduce((sum, row) => sum + (row.netPnlInr ?? 0), 0),
   };
 }

@@ -22,7 +22,13 @@ import { LlmTradeAdvisorService } from './llm/LlmTradeAdvisorService.js';
 import { NewsService } from './news/NewsService.js';
 import { getCatalogTradingsymbols } from './instruments/kiteInstruments.js';
 import { parseSessionStartBody } from './session/sessionStartSchema.js';
-import { decisionIndexesBodySchema, universeBookBodySchema } from './llm/schemas.js';
+import {
+  decisionIndexesBodySchema,
+  simulateDecisionsBodySchema,
+  universeBookBodySchema,
+} from './llm/schemas.js';
+import { DecisionRunLock } from './llm/decisionRunLock.js';
+import { SimulationService } from './simulation/SimulationService.js';
 import { reviewTradingSessions } from './review/sessionReview.js';
 
 const application = Fastify({ logger: { level: config.logLevel } });
@@ -62,11 +68,22 @@ const sessionService = new MarketDataSessionService({
   logger: application.log,
 });
 const llmClient = config.llmProvider === 'GQ' ? new GroqClient() : new HuggingFaceClient();
+const newsService = new NewsService();
+/** The live loop and a simulated replay never run at the same time. */
+const decisionRunLock = new DecisionRunLock();
 const llmAdvisor = new LlmTradeAdvisorService({
   llm: llmClient,
-  news: new NewsService(),
+  news: newsService,
   kite: broker,
   logger: application.log,
+  runLock: decisionRunLock,
+});
+const simulator = new SimulationService({
+  llm: llmClient,
+  kite: broker,
+  news: newsService,
+  logger: application.log,
+  runLock: decisionRunLock,
 });
 
 function hasValidAdminToken(token: unknown): boolean {
@@ -387,6 +404,10 @@ const llmDecisionLoopStatusSchema = {
   properties: {
     running: { type: 'boolean' },
     decisionIntervalMinutes: { type: 'integer' },
+    currentIntervalMinutes: {
+      type: 'integer',
+      description: '1 while a trade is open; otherwise decisionIntervalMinutes (.env).',
+    },
     includedSymbols: { type: 'array', items: { type: 'string' } },
     watchlistFile: { type: ['string', 'null'] },
     book: { type: 'string', enum: ['equity', 'options'] },
@@ -401,7 +422,7 @@ application.post(
     schema: {
       tags: ['llm'],
       summary:
-        'Start live options decision loop (rules decide BUY/HOLD/EXIT/SKIP; the LLM only picks the strike; positions sold by 15:15 IST; store-only)',
+        'Start live options decision loop (rules decide BUY/HOLD/EXIT/SKIP; the LLM only picks the strike; flat cycles every LLM_DECISION_INTERVAL_MINUTES, an open position is reviewed every minute with a break-even lock and stepped trailing stop; positions sold by 15:15 IST; store-only)',
       security: [{ adminToken: [] }],
       body: {
         type: 'object',
@@ -422,6 +443,91 @@ application.post(
     try {
       const body = decisionIndexesBodySchema.parse(request.body ?? {});
       return await llmAdvisor.startDecisionLoop(body.indexes);
+    } catch (error: unknown) {
+      if (error instanceof ZodError) {
+        throw Object.assign(new Error(error.issues.map((issue) => issue.message).join('; ')), {
+          statusCode: 400,
+        });
+      }
+      throw error;
+    }
+  },
+);
+
+const simulationTradeSchema = {
+  type: 'object',
+  properties: {
+    tuuid: { type: ['string', 'null'] },
+    symbol: { type: 'string' },
+    buyAt: { type: 'string' },
+    buyPrice: { type: ['number', 'null'] },
+    exitAt: { type: ['string', 'null'] },
+    sellPrice: { type: ['number', 'null'] },
+    exitReason: { type: ['string', 'null'] },
+    netPnlInr: { type: ['number', 'null'], description: 'After estimated charges.' },
+  },
+};
+
+application.post(
+  '/api/v1/llm/simulate/decisions/start',
+  {
+    schema: {
+      tags: ['llm'],
+      summary:
+        'Replay a past trading day through the live options decision logic (outside market hours). The day is downloaded from Kite once into SIMULATION_DIR/<date>.json and reused; decisions are stored flagged as simulated. Approximations: fills at 1-minute closes, a modelled 0.25% option spread, and the nearest still-listed expiry for weeks whose contracts have expired. 409 while the live loop or another simulation runs.',
+      security: [{ adminToken: [] }],
+      body: {
+        type: 'object',
+        required: ['date'],
+        properties: {
+          date: {
+            type: 'string',
+            pattern: '^\\d{4}-\\d{2}-\\d{2}$',
+            description: 'IST trading day, YYYY-MM-DD.',
+          },
+          indexes: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 3,
+            items: { type: 'string', enum: ['NIFTY', 'BANKNIFTY', 'FINNIFTY'] },
+          },
+        },
+      },
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            simulationId: { type: 'string' },
+            date: { type: 'string' },
+            indexes: { type: 'array', items: { type: 'string' } },
+            dataFile: { type: 'string' },
+            recorded: {
+              type: 'boolean',
+              description:
+                'True when the day was downloaded for this run; false when the saved file was reused.',
+            },
+            decisions: {
+              type: 'object',
+              properties: {
+                BUY: { type: 'integer' },
+                HOLD: { type: 'integer' },
+                EXIT: { type: 'integer' },
+                SKIP: { type: 'integer' },
+              },
+            },
+            trades: { type: 'array', items: simulationTradeSchema },
+            netPnlInr: { type: 'number' },
+            dataGaps: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+  },
+  async (request) => {
+    await requireAdmin(request);
+    try {
+      const body = simulateDecisionsBodySchema.parse(request.body ?? {});
+      return await simulator.run({ date: body.date, indexes: body.indexes });
     } catch (error: unknown) {
       if (error instanceof ZodError) {
         throw Object.assign(new Error(error.issues.map((issue) => issue.message).join('; ')), {

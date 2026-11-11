@@ -60,7 +60,7 @@ export function minutesBetween(from: Date, to: Date): number {
  * plus `offsetSeconds` so the 5-minute candle that just ended has been published.
  */
 export function msUntilNextCycle(now: Date, intervalMinutes: number, offsetSeconds = 20): number {
-  const minutes = Number.isFinite(intervalMinutes) && intervalMinutes >= 1 ? intervalMinutes : 15;
+  const minutes = Number.isFinite(intervalMinutes) && intervalMinutes >= 1 ? intervalMinutes : 5;
   const intervalMs = minutes * 60_000;
   const sinceMidnight = (now.getTime() + IST_OFFSET_MS) % DAY_MS;
   const sinceSlot =

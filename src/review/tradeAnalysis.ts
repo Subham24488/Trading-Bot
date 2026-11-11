@@ -1,4 +1,5 @@
 import { istClock, minutesBetween } from '../strategy/clock.js';
+import { floorExitReason, profitFloor } from '../strategy/decisionEngine.js';
 import { pctChange, type OptionSide } from '../strategy/indicators.js';
 import type { StrategyParams } from '../strategy/params.js';
 import { parseDecisionSnapshot, type DecisionSnapshot } from '../strategy/snapshot.js';
@@ -119,7 +120,8 @@ export function indexPath(rows: readonly ReviewRow[], after: Date, index: string
 
 /**
  * Rough option price path: premium + delta × index move (time decay ignored), run through
- * the stop-loss, trailing stop, time stop and square-off rules.
+ * the stop-loss, profit floor (break-even lock and stepped trailing stop), time stop and
+ * square-off rules.
  */
 export function simulateExitRules(
   start: { premium: number; delta: number; side: OptionSide; spot: number; at: Date },
@@ -143,8 +145,9 @@ export function simulateExitRules(
     if (latestPct <= -params.stopLossPct) {
       return { pnlPct: latestPct, bestPct, reason: 'stop-loss' };
     }
-    if (bestPct >= params.trailActivatePct && latestPct < bestPct * params.trailKeepFraction) {
-      return { pnlPct: latestPct, bestPct, reason: 'trailing-stop' };
+    const floor = profitFloor(bestPct, params);
+    if (floor && latestPct < floor.floorPct) {
+      return { pnlPct: latestPct, bestPct, reason: floorExitReason(floor) };
     }
     if (
       minutesBetween(start.at, point.at) >= params.timeStopMinutes &&

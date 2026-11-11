@@ -69,11 +69,16 @@ model LlmTradeDecision {
   executionBlockedReason String         @default("LLM decisions are never sent to the broker.")
   /// Trade id: set on BUY and reused on that trade's HOLDs and EXIT; null on SKIP.
   tuuid                  String?        @db.Uuid
+  /// True for rows from POST /api/v1/llm/simulate/decisions/start; live reads skip them.
+  simulated              Boolean        @default(false)
+  /// One id per simulation run, so repeated runs of the same day stay apart.
+  simulationId           String?        @db.Uuid
 
   @@index([decidedAt])
   @@index([symbol, decidedAt])
   @@index([action, decidedAt])
   @@index([tuuid])
+  @@index([simulationId])
 }
 
 enum TradingMode {

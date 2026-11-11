@@ -1,6 +1,7 @@
 logs/
 trades/*.json
 universe/*.json
+simulations/
 !universe/.gitkeep
 .kite-session.json
 node_modules/

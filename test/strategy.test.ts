@@ -5,6 +5,10 @@ import type { ChainQuote, ContractCandidate } from '../src/strategy/contracts.js
 import {
   checkPositionExit,
   decideEntry,
+  levelRoomPct,
+  profitFloor,
+  summarizeDay,
+  type DayRow,
   type DayStats,
   type OpenPosition,
 } from '../src/strategy/decisionEngine.js';
@@ -118,7 +122,7 @@ function reading(
   };
 }
 
-const quietDay: DayStats = { trades: 0, losingTrades: 0, lastExitAt: null };
+const quietDay: DayStats = { trades: 0, losingTrades: 0, lastExitAt: null, netPnlInr: 0 };
 
 describe('indicators', () => {
   it('computes EMA and RSI and drops the candle that is still forming', () => {
@@ -267,6 +271,7 @@ describe('decideEntry', () => {
     ],
     ['after the daily trade limit', { day: { ...quietDay, trades: 3 } }, 'daily-trade-limit'],
     ['after two losing trades', { day: { ...quietDay, losingTrades: 2 } }, 'daily-loss-limit'],
+    ['once the day is in profit', { day: { ...quietDay, netPnlInr: 450 } }, 'day-in-profit'],
     [
       'soon after an exit',
       { day: { ...quietDay, lastExitAt: new Date(now.getTime() - 10 * 60_000) } },
@@ -299,6 +304,69 @@ describe('decideEntry', () => {
   });
 });
 
+describe('reward-to-risk and the day lock', () => {
+  // 2026-11-09 10:45: NIFTY 24,855.15 had fallen 0.29% in 15 minutes toward the 24,800 put wall.
+  const nov9 = (putWall: number) =>
+    reading({
+      votes: Object.fromEntries(SIGNAL_NAMES.map((name) => [name, -1])) as Record<SignalName, Vote>,
+      spot: 24_855.15,
+      rsi: 33,
+      putWall,
+      callWall: 25_000,
+    });
+  const now = ist('2026-11-09', '10:45');
+
+  it('measures room to the next big level in the trade direction', () => {
+    expect(levelRoomPct(reading({}), 'CE')).toBeCloseTo(1.2);
+    expect(levelRoomPct(reading({}), 'PE')).toBeCloseTo(1.2);
+    expect(levelRoomPct(nov9(24_800), 'PE')).toBeCloseTo(0.222, 3);
+    expect(levelRoomPct(reading({ putWall: null }), 'PE')).toBeNull();
+  });
+
+  it('does not buy the 2026-11-09 put with 0.22% room against a 0.15% loss limit', () => {
+    const decision = decideEntry(
+      { now, readings: [nov9(24_800)], day: quietDay, vixPct: -6 },
+      params,
+    );
+    // Outside the 0.15% big-level buffer, so only the reward-to-risk check stops it.
+    expect(decision).toMatchObject({ action: 'SKIP', blockedBy: ['low-reward'] });
+    expect(
+      decideEntry({ now, readings: [nov9(24_700)], day: quietDay, vixPct: -6 }, params),
+    ).toMatchObject({ action: 'BUY', side: 'PE' });
+  });
+
+  it('keeps trading on a losing day and stops once the day is green', () => {
+    const buys = (day: DayStats) =>
+      decideEntry({ now, readings: [nov9(24_700)], day, vixPct: -6 }, params).action;
+    expect(buys({ ...quietDay, trades: 1, losingTrades: 1, netPnlInr: -1_900 })).toBe('BUY');
+    expect(buys({ ...quietDay, trades: 1, netPnlInr: 0 })).toBe('BUY');
+    expect(buys({ ...quietDay, trades: 1, netPnlInr: 1 })).toBe('SKIP');
+  });
+
+  it("sums the net result of today's closed trades, leaving out start-up exits", () => {
+    const row = (action: string, time: string, extra: Partial<DayRow> = {}): DayRow => ({
+      action,
+      decidedAt: ist('2026-11-09', time),
+      buyPrice: 100,
+      sellPrice: null,
+      trigger: 'cycle',
+      netPnlInr: null,
+      ...extra,
+    });
+    const day = summarizeDay(
+      [
+        row('EXIT', '09:16', { sellPrice: 60, trigger: 'startup', netPnlInr: -2_700 }),
+        row('BUY', '10:00'),
+        row('EXIT', '10:20', { sellPrice: 90, trigger: 'monitor', netPnlInr: -730 }),
+        row('BUY', '11:00'),
+        row('EXIT', '11:40', { sellPrice: 118, netPnlInr: 1_090 }),
+      ],
+      ist('2026-11-09', '12:00'),
+    );
+    expect(day).toMatchObject({ trades: 2, losingTrades: 1, netPnlInr: 360 });
+  });
+});
+
 describe('checkPositionExit', () => {
   const position: OpenPosition = {
     symbol: 'NIFTY26OCT25000CE',
@@ -316,6 +384,8 @@ describe('checkPositionExit', () => {
     entrySpot: 25_000,
   };
   const flipped = reading({ votes: { averagePrice: -1, trend: -1 } });
+  // Spot 25,000 is 0.1% under the strike where option sellers hold the most calls.
+  const atCallWall = reading({ callWall: 25_025 });
 
   it.each([
     ['square-off at 3:15 PM', { now: '15:15', price: 130 }, 'square-off'],
@@ -339,12 +409,37 @@ describe('checkPositionExit', () => {
     ['hold while the minimum hold runs', { now: '10:10', price: 101, reading: flipped }, null],
     ['hold a healthy trade', { now: '10:20', price: 108 }, null],
     [
-      'index stop when the index falls 0.25% against a call',
-      { now: '10:10', price: 95, spot: 24_937 },
+      'index stop when the index falls 0.15% against a call',
+      { now: '10:10', price: 95, spot: 24_962 },
       'index-stop',
     ],
-    ['hold while the index move stays inside 0.25%', { now: '10:10', price: 95, spot: 24_940 }, null],
+    [
+      'hold while the index move stays inside 0.15%',
+      { now: '10:10', price: 95, spot: 24_965 },
+      null,
+    ],
     ['index stop even without an option price', { now: '10:10', price: null, spot: 24_900 }, 'index-stop'],
+    [
+      'break-even exit once a +9% gain fades to +1.5%',
+      { now: '10:20', price: 101.5, peakPrice: 109 },
+      'breakeven-stop',
+    ],
+    ['hold above the break-even exit', { now: '10:20', price: 103, peakPrice: 109 }, null],
+    [
+      'bigger gains keep a bigger share (65% of a +30% best)',
+      { now: '10:40', price: 118, peakPrice: 130 },
+      'trailing-stop',
+    ],
+    [
+      'tighter profit lock at a big option-seller level',
+      { now: '10:20', price: 108, peakPrice: 112, reading: atCallWall },
+      'level-reached',
+    ],
+    [
+      'the same pullback away from big levels holds',
+      { now: '10:20', price: 108, peakPrice: 112, reading: reading({}) },
+      null,
+    ],
   ] as const)('%s', (_label, scenario, reason) => {
     const result = checkPositionExit(
       {
@@ -363,7 +458,7 @@ describe('checkPositionExit', () => {
     expect(result).toEqual(reason ? { action: 'EXIT', reason } : { action: 'HOLD' });
   });
 
-  it('sells a put once the index rises 0.25% from the entry spot (2026-10-22 trade)', () => {
+  it('sells a put once the index rises 0.15% from the entry spot (2026-10-22 trade)', () => {
     const put: OpenPosition = {
       ...position,
       symbol: 'NIFTY26OCT22600PE',
@@ -376,8 +471,62 @@ describe('checkPositionExit', () => {
     };
     const at = (spot: number) =>
       checkPositionExit({ now: ist('2026-10-21', '10:25'), position: put, price: 120, spot }, params);
-    expect(at(22_640)).toEqual({ action: 'HOLD' });
-    expect(at(22_657)).toEqual({ action: 'EXIT', reason: 'index-stop' });
+    expect(at(22_630)).toEqual({ action: 'HOLD' });
+    expect(at(22_634)).toEqual({ action: 'EXIT', reason: 'index-stop' });
+  });
+
+  it('keeps the gains the 2026-11-03 call and 2026-11-04 put gave back under the old rules', () => {
+    // Best +14.6%, just under the old +15% trail start; it was later closed at −0.5% on time.
+    const call: OpenPosition = {
+      ...position,
+      symbol: 'NIFTY26N0923700CE',
+      strike: 23_700,
+      expiry: '2026-11-09',
+      entryPrice: 159.3,
+      enteredAt: ist('2026-11-03', '11:40'),
+      peakPrice: 182.6,
+      troughPrice: 158.5,
+      entrySpot: 23_666.7,
+    };
+    const callAt = (time: string, price: number, spot: number) =>
+      checkPositionExit({ now: ist('2026-11-03', time), position: call, price, spot }, params);
+    expect(callAt('12:10', 171.15, 23_689.1)).toEqual({ action: 'HOLD' });
+    expect(callAt('12:15', 158.8, 23_661.2)).toEqual({ action: 'EXIT', reason: 'trailing-stop' });
+
+    // Best +13.3% within ten minutes; it was later closed at −18.4% on time.
+    const put: OpenPosition = {
+      ...call,
+      symbol: 'NIFTY26N0923700PE',
+      side: 'PE',
+      entryPrice: 157.55,
+      enteredAt: ist('2026-11-04', '12:10'),
+      peakPrice: 178.45,
+      troughPrice: 157.55,
+      entrySpot: 23_775.9,
+    };
+    expect(
+      checkPositionExit(
+        { now: ist('2026-11-04', '12:20'), position: put, price: 158.35, spot: 23_766.85 },
+        params,
+      ),
+    ).toEqual({ action: 'EXIT', reason: 'trailing-stop' });
+  });
+});
+
+describe('profitFloor', () => {
+  it('locks break-even from +8%, trails from +10% and keeps more of bigger gains', () => {
+    expect(profitFloor(7.9, params)).toBeNull();
+    expect(profitFloor(8, params)).toEqual({ floorPct: 2, kind: 'breakeven' });
+    expect(profitFloor(12, params)).toEqual({ floorPct: 6, kind: 'trail' });
+    expect(profitFloor(30, params)?.floorPct).toBeCloseTo(19.5);
+    expect(profitFloor(40, params)?.floorPct).toBeCloseTo(30);
+    expect(profitFloor(12, params, true)).toMatchObject({ kind: 'level' });
+    expect(profitFloor(12, params, true)?.floorPct).toBeCloseTo(9.6);
+  });
+
+  it('still follows a review-tuned trailKeepFraction', () => {
+    expect(profitFloor(12, { ...params, trailKeepFraction: 0.7 })?.floorPct).toBeCloseTo(8.4);
+    expect(profitFloor(30, { ...params, trailKeepFraction: 0.7 })?.floorPct).toBeCloseTo(21);
   });
 });
 
@@ -466,10 +615,76 @@ describe('plain-English rationale', () => {
       'Bought 1 lot (65 units) of NIFTY 25,000 Call (expires 27 Oct) at ₹120.20',
     );
     expect(texts[0]).toContain('sell by 3:15 PM');
-    expect(texts[0]).toContain('or if NIFTY falls to 24,938 (0.25% against us), protect profits');
-    expect(texts[4]).toContain('the index moved 0.25% against the trade');
+    expect(texts[0]).toContain('or if NIFTY falls to 24,963 (0.15% against us), protect profits');
+    expect(texts[4]).toContain('the index moved 0.15% against the trade');
     expect(texts[1]).toMatch(/^No trade at 10:30 AM\. NIFTY is leaning upward/);
+    expect(texts[0]).toContain('NIFTY has room to rise to 25,250 (1.00% away)');
+    expect(texts[2]).toContain('or if NIFTY falls to 24,963 (0.15% against us)');
     expect(texts[2]).toContain('₹');
     expect(texts[3]).toContain('fell back from its best level of ₹150.00');
+  });
+
+  it('explains the break-even lock and the new exits in plain words', () => {
+    const buy = describeBuy({
+      now,
+      candidate,
+      fillPrice: 120.2,
+      reading: marketReading,
+      pickedBy: 'llm',
+      candidateCount: 3,
+      params,
+    });
+    // Best +9%: the exit has moved to cost plus 2% (₹122.60).
+    const hold = describeHold({
+      position: { ...position, peakPrice: 131 },
+      price: 125,
+      netPnlInr: 250,
+      reading: null,
+      params,
+    });
+    const exits = (['breakeven-stop', 'level-reached'] as const).map((reason) =>
+      describeExit({
+        now: ist('2026-10-21', '11:10'),
+        position,
+        exitPrice: 128,
+        reason,
+        netPnlInr: 450,
+        params,
+      }),
+    );
+    const overnight = describeExit({
+      now: ist('2026-10-21', '15:15'),
+      position,
+      exitPrice: 133.5,
+      reason: 'stale-position',
+      netPnlInr: 800,
+      params,
+      pricedAtSquareOff: true,
+    });
+    for (const text of [buy, hold, ...exits, overnight]) {
+      expect(text).not.toMatch(JARGON);
+      expect(text.length).toBeLessThanOrEqual(1200);
+    }
+    expect(buy).toContain('(−20%)');
+    expect(buy).toContain('reaches ₹129.82 (+8%) by moving the exit up to ₹122.60');
+    expect(hold).toContain(
+      'the exit has moved up to ₹122.60 so this trade cannot turn into a loss',
+    );
+    expect(exits[0]).toContain('fell back to our break-even exit');
+    expect(exits[1]).toContain('option sellers are betting it will not cross');
+    expect(overnight).toContain('recorded at its 3:15 PM price on the day it was bought');
+  });
+
+  it('explains the reward-to-risk and day-profit skips in plain words', () => {
+    const skip = describeSkip({
+      now,
+      blockedBy: ['low-reward', 'day-in-profit'],
+      leaning: { index: 'NIFTY', side: 'PE', score: -5 },
+      reading: marketReading,
+      params,
+    });
+    expect(skip).not.toMatch(JARGON);
+    expect(skip).toContain('less than 2× our 0.15% loss limit away');
+    expect(skip).toContain("today's closed trades are already in profit, so we stop for the day");
   });
 });

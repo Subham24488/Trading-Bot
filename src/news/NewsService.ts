@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { addCalendarDays } from '../universe/dates.js';
 
 export type NewsItem = {
   symbol: string;
@@ -20,6 +21,9 @@ export type NewsServiceOptions = {
   timeoutMs?: number;
   nseBaseUrl?: string;
 };
+
+/** A replayed day needs every headline of the day, not just the latest few. */
+const DAY_NEWS_ITEMS_PER_QUERY = 100;
 
 const NSE_BROWSER_HEADERS = {
   'User-Agent':
@@ -251,6 +255,35 @@ export class NewsService {
     return results;
   }
 
+  /**
+   * Headlines around one past IST day, from Google's `after:`/`before:` search, for a simulated
+   * replay. The window starts a day early so overnight items are included; callers filter by time.
+   */
+  public async fetchIndexNewsOn(
+    queries: readonly { symbol: string; query: string }[],
+    ymd: string,
+  ): Promise<SymbolNews[]> {
+    const after = addCalendarDays(ymd, -2);
+    const before = addCalendarDays(ymd, 1);
+    const results: SymbolNews[] = [];
+    for (const entry of queries) {
+      const search = `${entry.query} India after:${after} before:${before}`;
+      const googleUrl =
+        `https://news.google.com/rss/search?q=${encodeURIComponent(search)}` +
+        `&hl=en-IN&gl=IN&ceid=IN:en`;
+      results.push({
+        symbol: entry.symbol.toUpperCase(),
+        items: await this.fetchRss(
+          googleUrl,
+          entry.symbol.toUpperCase(),
+          'google-news-rss',
+          DAY_NEWS_ITEMS_PER_QUERY,
+        ),
+      });
+    }
+    return results;
+  }
+
   private async fetchNseAnnouncements(symbol: string, from: Date, to: Date): Promise<NewsItem[]> {
     const params = new URLSearchParams({
       index: 'equities',
@@ -298,7 +331,12 @@ export class NewsService {
     }
   }
 
-  private async fetchRss(url: string, symbol: string, source: string): Promise<NewsItem[]> {
+  private async fetchRss(
+    url: string,
+    symbol: string,
+    source: string,
+    limit = this.itemsPerSymbol,
+  ): Promise<NewsItem[]> {
     try {
       const response = await this.request(url, {
         Accept: 'application/rss+xml, application/xml, text/xml, */*',
@@ -308,7 +346,7 @@ export class NewsService {
         return [];
       }
       const xml = await response.text();
-      return parseRssItems(xml, symbol, source, this.itemsPerSymbol);
+      return parseRssItems(xml, symbol, source, limit);
     } catch {
       return [];
     }

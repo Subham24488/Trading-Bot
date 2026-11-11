@@ -45,23 +45,23 @@ export type MarketView = {
   dataGaps: string[];
 };
 
-const VIX_KEY = 'NSE:INDIA VIX';
-const CHAIN_WINGS = 5;
+export const VIX_KEY = 'NSE:INDIA VIX';
+export const CHAIN_WINGS = 5;
 /** New positions never use a contract that expires today. */
-const MIN_DAYS_TO_EXPIRY = 1;
-const FUTURES_LOOKBACK_DAYS = 7;
-const DAILY_LOOKBACK_DAYS = 45;
+export const MIN_DAYS_TO_EXPIRY = 1;
+export const FUTURES_LOOKBACK_DAYS = 7;
+export const DAILY_LOOKBACK_DAYS = 45;
 const INDEX_NEWS_WINDOW_MS = 2 * 60 * 60_000;
 const MACRO_NEWS_WINDOW_MS = 3 * 60 * 60_000;
 /** Macro headlines move slowly; they are re-fetched at most this often. */
 const MACRO_NEWS_CACHE_MS = 15 * 60_000;
 const MIN_BREADTH_STOCKS = 20;
-const MACRO_QUERIES = [
+export const MACRO_QUERIES = [
   { symbol: 'GLOBAL', query: 'global markets Wall Street Fed' },
   { symbol: 'MACRO', query: 'crude oil rupee dollar' },
 ];
 
-function spotKey(row: IndexUnderlying): string {
+export function spotKey(row: IndexUnderlying): string {
   return `${row.exchange}:${row.kiteQuoteSymbol}`;
 }
 
