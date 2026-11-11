@@ -395,6 +395,42 @@ describe('simulated replay of a day', () => {
       ),
     ).toBe(true);
   });
+
+  it('logs every stored BUY, HOLD, EXIT and SKIP once, at its replay time', async () => {
+    const day = recordedDay();
+    const clock = new SimulationClock(new Date(ist(DAY, '09:15').getTime() + 20_000));
+    const log = logger();
+    const advisor = new LlmTradeAdvisorService({
+      llm: pickLlm(),
+      kite: new ReplayBroker(day, clock.now),
+      news: new ReplayHeadlines(day, clock.now),
+      logger: log,
+      now: clock.now,
+      simulationId: '00000000-0000-4000-8000-000000000002',
+    });
+    await advisor.replayDay({
+      indexes: ['NIFTY'],
+      end: ist(DAY, '15:30'),
+      advanceTo: clock.advanceTo,
+    });
+
+    const decisionLines = log.info.mock.calls.filter(([, message]) =>
+      String(message).startsWith('Stored rules-based '),
+    );
+    expect(decisionLines.map(([details]) => (details as { action: string }).action)).toEqual(
+      rows.map((row) => row.action),
+    );
+    const firstHold = decisionLines.find(([details]) => details.action === 'HOLD')?.[0];
+    expect(firstHold).toMatchObject({
+      simulationId: '00000000-0000-4000-8000-000000000002',
+      symbol: 'NIFTY26OCT25000CE',
+      at: '2026-10-21 10:21:20',
+    });
+    expect(firstHold).toHaveProperty('pnlPct');
+    const firstSkip = decisionLines[0]?.[0];
+    expect(firstSkip).toMatchObject({ action: 'SKIP', at: '2026-10-21 09:30:20' });
+    expect(firstSkip).toHaveProperty('blockedBy');
+  });
 });
 
 describe('decision store scoping', () => {

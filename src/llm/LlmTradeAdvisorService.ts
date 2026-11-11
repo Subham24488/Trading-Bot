@@ -1103,6 +1103,23 @@ export class LlmTradeAdvisorService {
     );
   }
 
+  /** One terminal line per stored decision; a simulation's lines carry its run id. */
+  private logDecision(
+    action: 'BUY' | 'HOLD' | 'EXIT' | 'SKIP',
+    now: Date,
+    details: Record<string, unknown>,
+  ): void {
+    this.logger.info(
+      {
+        action,
+        at: formatIstWallClock(now),
+        ...(this.simulationId ? { simulationId: this.simulationId } : {}),
+        ...details,
+      },
+      `Stored rules-based ${action} without executing.`,
+    );
+  }
+
   /** Keeps the in-memory day rows in step with a stored BUY or EXIT. */
   private recordDayRow(row: DayRow): void {
     if (this.dayRows?.ymd === istClock(row.decidedAt).ymd) {
@@ -1164,6 +1181,16 @@ export class LlmTradeAdvisorService {
       },
     });
     this.applyDecisionState('HOLD', position.symbol, position.token);
+    this.logDecision('HOLD', now, {
+      symbol: position.symbol,
+      tuuid: position.tuuid,
+      price,
+      entryPrice: position.entryPrice,
+      peakPrice: position.peakPrice,
+      pnlPct:
+        price === null ? null : round(((price - position.entryPrice) / position.entryPrice) * 100),
+      netPnlInr,
+    });
     return stored;
   }
 
@@ -1380,16 +1407,13 @@ export class LlmTradeAdvisorService {
     });
     this.lastQuotedPriceBySymbol[candidate.symbol] = candidate.ltp;
     this.applyDecisionState('BUY', candidate.symbol, candidate.token);
-    this.logger.info(
-      {
-        symbol: candidate.symbol,
-        tuuid: position.tuuid,
-        fillPrice,
-        pickedBy,
-        score: input.reading.score,
-      },
-      'Stored rules-based BUY without executing.',
-    );
+    this.logDecision('BUY', input.now, {
+      symbol: candidate.symbol,
+      tuuid: position.tuuid,
+      fillPrice,
+      pickedBy,
+      score: input.reading.score,
+    });
     return stored;
   }
 
@@ -1454,6 +1478,14 @@ export class LlmTradeAdvisorService {
       },
     });
     this.applyDecisionState('SKIP', symbol, null);
+    this.logDecision('SKIP', input.now, {
+      symbol,
+      blockedBy: input.blockedBy,
+      leaning: input.leaning
+        ? `${input.leaning.index} ${input.leaning.side} (score ${input.leaning.score})`
+        : null,
+      wouldBuy: shadow?.symbol ?? null,
+    });
     return stored;
   }
 
@@ -1543,17 +1575,15 @@ export class LlmTradeAdvisorService {
       netPnlInr,
     });
     this.applyDecisionState('EXIT', position.symbol, position.token);
-    this.logger.info(
-      {
-        symbol: position.symbol,
-        tuuid: position.tuuid,
-        reason: input.reason,
-        exitPrice,
-        priceSource,
-        trigger: input.trigger,
-      },
-      'Stored rules-based EXIT without executing.',
-    );
+    this.logDecision('EXIT', input.now, {
+      symbol: position.symbol,
+      tuuid: position.tuuid,
+      reason: input.reason,
+      exitPrice,
+      priceSource,
+      trigger: input.trigger,
+      netPnlInr,
+    });
     return stored;
   }
 
