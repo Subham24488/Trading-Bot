@@ -33,9 +33,11 @@ vi.mock('../src/config.js', () => ({
 const createMany = vi.fn().mockResolvedValue({ count: 1 });
 const findFirst = vi.fn().mockResolvedValue(null);
 const findMany = vi.fn().mockResolvedValue([]);
+const queryRaw = vi.fn().mockResolvedValue([{ ok: 1 }]);
 
 vi.mock('../src/database.js', () => ({
   database: {
+    $queryRaw: queryRaw,
     llmTradeDecision: {
       createMany,
       findFirst,
@@ -889,6 +891,62 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
         action: 'EXIT',
         marketSnapshot: { exit: { reason: 'chart-stop' } },
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stores a decision once when the database drops the connection mid-insert', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const { persistDecisions } = await import('../src/llm/decisionStore.js');
+      createMany.mockRejectedValueOnce(
+        Object.assign(new Error('Server has closed the connection.'), { code: 'P1017' }),
+      );
+      const stored = persistDecisions({
+        asOf: ist('2026-10-21', '10:00'),
+        batch: { decisions: [{ symbol: 'NIFTY26OCTFUT', action: 'SKIP', rationale: 'quiet' }] },
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(stored).resolves.toBe(1);
+      const [first, retry] = createMany.mock.calls.map((call) => call[0]);
+      expect(first).not.toHaveProperty('skipDuplicates');
+      // The same row ids again, so a write the dropped attempt did make is not repeated.
+      expect(retry).toMatchObject({ skipDuplicates: true });
+      expect(retry.data[0].id).toBe(first.data[0].id);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the database awake during market hours while the loop runs', async () => {
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
+    const advance = async (ms: number) => {
+      await vi.advanceTimersByTimeAsync(ms);
+      await new Promise((resolve) => setImmediate(resolve));
+    };
+    try {
+      queryRaw.mockClear();
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      const { advisor } = await optionsAdvisorScenario();
+      await advisor.startDecisionLoop(['NIFTY']);
+      await advance(4 * 60_000);
+      expect(queryRaw).toHaveBeenCalledTimes(1);
+      await advance(4 * 60_000);
+      expect(queryRaw).toHaveBeenCalledTimes(2);
+      advisor.stop();
+      await advance(12 * 60_000);
+      expect(queryRaw).toHaveBeenCalledTimes(2);
+
+      // After the 3:15 PM square-off and its 15-minute margin, the database may suspend.
+      queryRaw.mockClear();
+      vi.setSystemTime(ist('2026-10-21', '15:40'));
+      await advisor.startDecisionLoop(['NIFTY']);
+      await advance(8 * 60_000);
+      advisor.stop();
+      expect(queryRaw).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { KiteBroker } from '../broker/KiteBroker.js';
 import type { SessionLogger } from '../broker/kite/KiteTickerStream.js';
 import { config } from '../config.js';
+import { pingDatabase } from '../databaseRetry.js';
 import type { SessionInstrument } from '../domain.js';
 import {
   getCatalogTradingsymbols,
@@ -159,6 +160,15 @@ export type LlmTradeAdvisorOptions = {
 /** Stops are checked this often between cycles, so a fast move is sold close to its level. */
 const MONITOR_INTERVAL_MS = 15_000;
 
+/**
+ * Neon's free plan suspends the database after 5 minutes without queries, dropping Prisma's
+ * connections; a ping this often keeps it awake between 5-minute cycles.
+ */
+export const DB_KEEP_ALIVE_MS = 4 * 60_000;
+
+/** Pings start this long before the first entry time and stop this long after the square-off. */
+const KEEP_ALIVE_MARGIN_MINUTES = 15;
+
 /** While a trade is open it gets a full cycle (signals included) every minute. */
 const OPEN_POSITION_CYCLE_MINUTES = 1;
 
@@ -258,6 +268,7 @@ export class LlmTradeAdvisorService {
   private loopGeneration = 0;
   private cycleTimer: NodeJS.Timeout | undefined;
   private monitorTimer: NodeJS.Timeout | undefined;
+  private keepAliveTimer: NodeJS.Timeout | undefined;
   /** Serialises the decision cycle and the 15-second monitor. */
   private queue: Promise<void> = Promise.resolve();
   private queued = 0;
@@ -888,6 +899,10 @@ export class LlmTradeAdvisorService {
       void this.monitorTick();
     }, MONITOR_INTERVAL_MS);
     this.monitorTimer.unref?.();
+    this.keepAliveTimer = setInterval(() => {
+      void this.keepDatabaseAwake();
+    }, DB_KEEP_ALIVE_MS);
+    this.keepAliveTimer.unref?.();
 
     this.logger.info(
       {
@@ -913,7 +928,29 @@ export class LlmTradeAdvisorService {
       clearInterval(this.monitorTimer);
       this.monitorTimer = undefined;
     }
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = undefined;
+    }
     return this.getDecisionLoopStatus();
+  }
+
+  /**
+   * Pings the database during trading hours on weekdays only, so it stays awake for the cycles
+   * but can still suspend overnight; a failed ping is logged and the next one tries again.
+   */
+  private async keepDatabaseAwake(): Promise<void> {
+    const clock = istClock(this.now());
+    const from = this.params.entryStartMinute - KEEP_ALIVE_MARGIN_MINUTES;
+    const until = this.params.squareOffMinute + KEEP_ALIVE_MARGIN_MINUTES;
+    if (!this.running || !clock.isWeekday || clock.minute < from || clock.minute > until) {
+      return;
+    }
+    try {
+      await pingDatabase();
+    } catch (error: unknown) {
+      this.logger.warn({ err: error }, 'Database keep-alive ping failed; the next one retries.');
+    }
   }
 
   private runExclusive<T>(task: () => Promise<T>): Promise<T> {

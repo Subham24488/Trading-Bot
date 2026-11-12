@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -5,6 +6,7 @@ import type { LlmTradeAction, Prisma } from '@prisma/client';
 
 import { config } from '../config.js';
 import { database } from '../database.js';
+import { withReconnect } from '../databaseRetry.js';
 import type { DecisionBatch } from './schemas.js';
 import type { UniverseSuggestion } from './schemas.js';
 import type { SessionInstrument } from '../domain.js';
@@ -124,6 +126,8 @@ export async function persistDecisions(input: DecisionRowInput): Promise<number>
         ? current.toFixed(4)
         : null;
     return {
+      // Set here, not by Prisma, so a retry after a dropped connection cannot store a row twice.
+      id: randomUUID(),
       asOf: input.asOf,
       symbol: decision.symbol,
       action: decision.action,
@@ -150,9 +154,14 @@ export async function persistDecisions(input: DecisionRowInput): Promise<number>
     };
   });
 
-  await database.llmTradeDecision.createMany({
-    data: data as Prisma.LlmTradeDecisionCreateManyInput[],
-  });
+  let attempts = 0;
+  await withReconnect(() =>
+    database.llmTradeDecision.createMany({
+      data: data as Prisma.LlmTradeDecisionCreateManyInput[],
+      // A retry skips rows the dropped attempt may already have written.
+      ...(attempts++ > 0 ? { skipDuplicates: true } : {}),
+    }),
+  );
 
   return input.batch.decisions.length;
 }
@@ -176,11 +185,13 @@ export async function latestActionsForSymbols(
   const unique = [...new Set(symbols.map((symbol) => symbol.toUpperCase()))];
   const entries = await Promise.all(
     unique.map(async (symbol) => {
-      const row = await database.llmTradeDecision.findFirst({
-        where: { symbol, simulated: false },
-        orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
-        select: { action: true, buyPrice: true },
-      });
+      const row = await withReconnect(() =>
+        database.llmTradeDecision.findFirst({
+          where: { symbol, simulated: false },
+          orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
+          select: { action: true, buyPrice: true },
+        }),
+      );
       return [
         symbol,
         {
@@ -219,44 +230,50 @@ export type OpenTradeRecord = {
 /** The position left open by the latest BUY/HOLD row (EXIT/SKIP ⇒ flat), with its entry row. */
 export async function findOpenTrade(simulationId?: string): Promise<OpenTradeRecord | null> {
   const run = runFilter(simulationId);
-  const latest = await database.llmTradeDecision.findFirst({
-    where: run,
-    orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
-    select: {
-      symbol: true,
-      action: true,
-      instrumentToken: true,
-      marketSnapshot: true,
-      decidedAt: true,
-      currentPrice: true,
-      tuuid: true,
-    },
-  });
+  const latest = await withReconnect(() =>
+    database.llmTradeDecision.findFirst({
+      where: run,
+      orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
+      select: {
+        symbol: true,
+        action: true,
+        instrumentToken: true,
+        marketSnapshot: true,
+        decidedAt: true,
+        currentPrice: true,
+        tuuid: true,
+      },
+    }),
+  );
   if (!latest || (latest.action !== 'BUY' && latest.action !== 'HOLD')) {
     return null;
   }
-  const entry = await database.llmTradeDecision.findFirst({
-    where: { ...run, symbol: latest.symbol, action: 'BUY', decidedAt: { lte: latest.decidedAt } },
-    orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
-    select: {
-      asOf: true,
-      decidedAt: true,
-      buyPrice: true,
-      instrumentToken: true,
-      marketSnapshot: true,
-      tuuid: true,
-    },
-  });
-  const holds = await database.llmTradeDecision.findMany({
-    where: {
-      ...run,
-      symbol: latest.symbol,
-      action: 'HOLD',
-      decidedAt: { gte: entry?.decidedAt ?? latest.decidedAt },
-    },
-    orderBy: [{ decidedAt: 'asc' }],
-    select: { currentPrice: true },
-  });
+  const entry = await withReconnect(() =>
+    database.llmTradeDecision.findFirst({
+      where: { ...run, symbol: latest.symbol, action: 'BUY', decidedAt: { lte: latest.decidedAt } },
+      orderBy: [{ decidedAt: 'desc' }, { asOf: 'desc' }],
+      select: {
+        asOf: true,
+        decidedAt: true,
+        buyPrice: true,
+        instrumentToken: true,
+        marketSnapshot: true,
+        tuuid: true,
+      },
+    }),
+  );
+  const holds = await withReconnect(() =>
+    database.llmTradeDecision.findMany({
+      where: {
+        ...run,
+        symbol: latest.symbol,
+        action: 'HOLD',
+        decidedAt: { gte: entry?.decidedAt ?? latest.decidedAt },
+      },
+      orderBy: [{ decidedAt: 'asc' }],
+      select: { currentPrice: true },
+    }),
+  );
   return {
     symbol: latest.symbol.toUpperCase(),
     instrumentToken: latest.instrumentToken ?? entry?.instrumentToken ?? null,
@@ -286,19 +303,21 @@ export async function findDecisionsSince(
   from: Date,
   simulationId?: string,
 ): Promise<StoredDecisionRow[]> {
-  const rows = await database.llmTradeDecision.findMany({
-    where: { ...runFilter(simulationId), decidedAt: { gte: from } },
-    orderBy: [{ decidedAt: 'asc' }, { asOf: 'asc' }],
-    select: {
-      action: true,
-      decidedAt: true,
-      symbol: true,
-      tuuid: true,
-      buyPrice: true,
-      sellPrice: true,
-      marketSnapshot: true,
-    },
-  });
+  const rows = await withReconnect(() =>
+    database.llmTradeDecision.findMany({
+      where: { ...runFilter(simulationId), decidedAt: { gte: from } },
+      orderBy: [{ decidedAt: 'asc' }, { asOf: 'asc' }],
+      select: {
+        action: true,
+        decidedAt: true,
+        symbol: true,
+        tuuid: true,
+        buyPrice: true,
+        sellPrice: true,
+        marketSnapshot: true,
+      },
+    }),
+  );
   return rows.map((row) => ({
     action: row.action,
     decidedAt: row.decidedAt,
