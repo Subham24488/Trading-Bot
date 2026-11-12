@@ -95,8 +95,15 @@ export function openingRange(
 export type CandlePatternName =
   | 'bullish_engulfing'
   | 'bearish_engulfing'
+  | 'morning_star'
+  | 'evening_star'
+  | 'piercing'
+  | 'dark_cloud'
   | 'hammer'
+  | 'hanging_man'
   | 'shooting_star'
+  | 'inverted_hammer'
+  | 'doji'
   | 'inside_bar'
   | 'bull_marubozu'
   | 'bear_marubozu'
@@ -106,44 +113,105 @@ export type CandlePatternName =
 
 const BULLISH_PATTERNS: CandlePatternName[] = [
   'bullish_engulfing',
+  'morning_star',
+  'piercing',
   'hammer',
   'bull_marubozu',
   'three_bar_push_up',
 ];
 const BEARISH_PATTERNS: CandlePatternName[] = [
   'bearish_engulfing',
+  'evening_star',
+  'dark_cloud',
   'shooting_star',
   'bear_marubozu',
   'three_bar_push_down',
 ];
 
+/** A last candle smaller than this share of a normal 5-minute swing (ATR) is noise, not a pattern. */
+const MIN_PATTERN_RANGE_ATR = 0.3;
+/** Body at most this share of the range: a doji (indecision). */
+const DOJI_BODY_SHARE = 0.1;
+/** The first candle of a star or the candle pierced must be at least this solid. */
+const STRONG_BODY_SHARE = 0.5;
+/** The middle candle of a star is at most this share of the first candle's body. */
+const STAR_BODY_SHARE = 0.3;
+/** Candles before a pattern read for the move it follows (hammer vs hanging man). */
+const CONTEXT_BARS = 3;
+
 function body(bar: Ohlc): number {
   return Math.abs(bar.c - bar.o);
 }
 
-/** Pattern formed by the last one to three bars and the side it favours. */
-export function classifyLastCandles(bars: readonly Ohlc[]): {
+function rangeOf(bar: Ohlc): number {
+  return Math.max(bar.h - bar.l, 1e-9);
+}
+
+function bodyMid(bar: Ohlc): number {
+  return (bar.o + bar.c) / 2;
+}
+
+/** Net move of up to three candles just before the last `patternLength`; null with fewer than 2. */
+function moveBefore(bars: readonly Ohlc[], patternLength: number): number | null {
+  const end = bars.length - patternLength;
+  const start = Math.max(0, end - CONTEXT_BARS);
+  if (end - start < 2) {
+    return null;
+  }
+  return bars[end - 1]!.c - bars[start]!.o;
+}
+
+/**
+ * Pattern formed by the last one to three candles and the side it favours. Hammers and shooting
+ * stars count only after the move they reverse (a hammer after a rise is a hanging man), and a
+ * last candle under 0.3 ATR is too small to mean anything when `atr` is given.
+ */
+export function classifyLastCandles(
+  bars: readonly Ohlc[],
+  options: { atr?: number | null } = {},
+): {
   pattern: CandlePatternName;
   side: OptionSide | null;
 } {
-  if (bars.length === 0) {
-    return { pattern: 'none', side: null };
+  const pattern = lastCandlePattern(bars, options.atr ?? null);
+  const side = BULLISH_PATTERNS.includes(pattern)
+    ? 'CE'
+    : BEARISH_PATTERNS.includes(pattern)
+      ? 'PE'
+      : null;
+  return { pattern, side };
+}
+
+function lastCandlePattern(bars: readonly Ohlc[], atr: number | null): CandlePatternName {
+  const last = bars.at(-1);
+  if (!last) {
+    return 'none';
   }
-  const last3 = bars.slice(-3);
-  const last = last3.at(-1)!;
-  const prior = last3.length >= 2 ? last3.at(-2)! : null;
-  const first = last3.length >= 3 ? last3.at(-3)! : null;
+  if (atr !== null && atr > 0 && last.h - last.l < MIN_PATTERN_RANGE_ATR * atr) {
+    return 'none';
+  }
+  const prior = bars.length >= 2 ? bars.at(-2)! : null;
+  const first = bars.length >= 3 ? bars.at(-3)! : null;
   const lastBull = last.c > last.o;
   const lastBear = last.c < last.o;
   const lastBody = body(last);
-  const lastRange = Math.max(last.h - last.l, 1e-9);
+  const lastRange = rangeOf(last);
   const upper = last.h - Math.max(last.o, last.c);
   const lower = Math.min(last.o, last.c) - last.l;
 
-  let pattern: CandlePatternName = 'none';
   if (prior) {
     const priorBull = prior.c > prior.o;
     const priorBear = prior.c < prior.o;
+    // The three-candle stars first: their last candle often also engulfs the small middle one.
+    if (first && body(first) >= STRONG_BODY_SHARE * rangeOf(first)) {
+      const smallStar = body(prior) <= STAR_BODY_SHARE * body(first);
+      if (smallStar && first.c < first.o && lastBull && last.c > bodyMid(first)) {
+        return 'morning_star';
+      }
+      if (smallStar && first.c > first.o && lastBear && last.c < bodyMid(first)) {
+        return 'evening_star';
+      }
+    }
     if (
       lastBull &&
       priorBear &&
@@ -151,42 +219,62 @@ export function classifyLastCandles(bars: readonly Ohlc[]): {
       last.c >= prior.o &&
       lastBody > body(prior) * 0.9
     ) {
-      pattern = 'bullish_engulfing';
-    } else if (
+      return 'bullish_engulfing';
+    }
+    if (
       lastBear &&
       priorBull &&
       last.o >= prior.c &&
       last.c <= prior.o &&
       lastBody > body(prior) * 0.9
     ) {
-      pattern = 'bearish_engulfing';
-    } else if (last.h <= prior.h && last.l >= prior.l) {
-      pattern = 'inside_bar';
+      return 'bearish_engulfing';
+    }
+    const solidPrior = body(prior) >= STRONG_BODY_SHARE * rangeOf(prior);
+    if (
+      solidPrior &&
+      priorBear &&
+      lastBull &&
+      last.o <= prior.c &&
+      last.c > bodyMid(prior) &&
+      last.c < prior.o
+    ) {
+      return 'piercing';
+    }
+    if (
+      solidPrior &&
+      priorBull &&
+      lastBear &&
+      last.o >= prior.c &&
+      last.c < bodyMid(prior) &&
+      last.c > prior.o
+    ) {
+      return 'dark_cloud';
     }
   }
-  if (pattern === 'none' || pattern === 'inside_bar') {
-    if (lower >= lastBody * 2 && upper <= lastBody * 0.5 && lastBull) {
-      pattern = 'hammer';
-    } else if (upper >= lastBody * 2 && lower <= lastBody * 0.5 && lastBear) {
-      pattern = 'shooting_star';
-    } else if (lastBody / lastRange >= 0.7 && lastBull) {
-      pattern = 'bull_marubozu';
-    } else if (lastBody / lastRange >= 0.7 && lastBear) {
-      pattern = 'bear_marubozu';
+  if (lastBody <= DOJI_BODY_SHARE * lastRange) {
+    return 'doji';
+  }
+  const before = moveBefore(bars, 1);
+  if (lower >= lastBody * 2 && upper <= lastBody * 0.5 && before !== null && before !== 0) {
+    return before < 0 ? 'hammer' : 'hanging_man';
+  }
+  if (upper >= lastBody * 2 && lower <= lastBody * 0.5 && before !== null && before !== 0) {
+    return before > 0 ? 'shooting_star' : 'inverted_hammer';
+  }
+  if (lastBody / lastRange >= 0.7) {
+    return lastBull ? 'bull_marubozu' : 'bear_marubozu';
+  }
+  if (prior && last.h <= prior.h && last.l >= prior.l) {
+    return 'inside_bar';
+  }
+  if (first && prior) {
+    if (last.c > prior.c && prior.c > first.c && lastBull) {
+      return 'three_bar_push_up';
+    }
+    if (last.c < prior.c && prior.c < first.c && lastBear) {
+      return 'three_bar_push_down';
     }
   }
-  if (pattern === 'none' && first && prior) {
-    if (last.c > prior.c && prior.c > first.c && last.c > last.o) {
-      pattern = 'three_bar_push_up';
-    } else if (last.c < prior.c && prior.c < first.c && last.c < last.o) {
-      pattern = 'three_bar_push_down';
-    }
-  }
-
-  const side = BULLISH_PATTERNS.includes(pattern)
-    ? 'CE'
-    : BEARISH_PATTERNS.includes(pattern)
-      ? 'PE'
-      : null;
-  return { pattern, side };
+  return 'none';
 }

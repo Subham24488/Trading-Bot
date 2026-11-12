@@ -61,7 +61,7 @@ const { compactNewsForPrompt, buildUniverseMessages, buildDecisionMessages } =
   await import('../src/llm/prompts.js');
 const { parseRssItems } = await import('../src/news/NewsService.js');
 const { blackScholesPrice } = await import('../src/options/greeksIv.js');
-const { ist, uptrendFuturesBars } = await import('./marketFixtures.js');
+const { fiveMinuteBars, ist, uptrendFuturesBars } = await import('./marketFixtures.js');
 
 describe('parseRssItems', () => {
   it('reads Google-style RSS items', () => {
@@ -391,7 +391,11 @@ type StoredRow = Record<string, unknown> & {
   marketSnapshot: {
     trigger?: string;
     exit?: { reason: string };
-    readings?: Array<{ index: string }>;
+    readings?: Array<{ index: string; chart?: { atr: number } | null }>;
+    entry?: {
+      plan?: { stopSpot: number; premiumStop: number; maxLossInr: number; lockPrice: number };
+    };
+    position?: { stopSpot?: number | null; premiumStop?: number | null };
   };
 };
 
@@ -582,7 +586,7 @@ describe('LlmTradeAdvisorService safety', () => {
     vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
     try {
       createMany.mockClear();
-      const { advisor, completeJson, optionPrice } = await optionsAdvisorScenario();
+      const { advisor, completeJson, logger, optionPrice } = await optionsAdvisorScenario();
 
       const started = await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
@@ -617,6 +621,23 @@ describe('LlmTradeAdvisorService safety', () => {
         expect.stringContaining('Bought 1 lot (65 units) of NIFTY 25,000 Call'),
       );
       expect(stored.rationale).not.toMatch(/\b(VWAP|EMA|RSI|PCR|OI|delta|IV)\b/i);
+      // The chart plan: a stop under the setup, a loss within ₹15 a unit, the ₹10 lock.
+      const plan = (stored.marketSnapshot as StoredRow['marketSnapshot']).entry?.plan;
+      expect(plan?.lockPrice).toBeCloseTo(ask + 10, 2);
+      expect(plan?.premiumStop).toBeLessThan(ask);
+      expect(plan?.premiumStop).toBeGreaterThanOrEqual(ask - 15);
+      expect(plan?.maxLossInr).toBeLessThan(15 * 65 + 100);
+      expect(stored.rationale).toContain('a planned loss of about ₹');
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'BUY',
+          stopSpot: plan?.stopSpot,
+          premiumStop: plan?.premiumStop,
+          lockPrice: plan?.lockPrice,
+          maxLossInr: plan?.maxLossInr,
+        }),
+        'Stored rules-based BUY without executing.',
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -738,8 +759,9 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
       const entry = Number(storedRows()[0]?.buyPrice);
-      const stop = entry * 0.75;
-      // Last trade 0.05 above the −25% stop, bid 0.05 below it.
+      const stop = storedRows()[0]?.marketSnapshot.entry?.plan?.premiumStop ?? NaN;
+      expect(stop).toBeLessThan(entry);
+      // Last trade 0.05 above the planned premium stop, bid 0.05 below it.
       setOptionPriceFactor((stop + 0.05) / optionPrice('NIFTY26OCT25000CE'));
       vi.setSystemTime(ist('2026-10-21', '10:31'));
       await advisor.runDecisionCycle();
@@ -754,24 +776,119 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
     }
   });
 
-  it('sells when the index moves 0.15% against the trade', async () => {
+  it('sells when NIFTY breaks the chart stop under the setup candles', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
       vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
       const { advisor, setNiftySpot } = await optionsAdvisorScenario();
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
-      expect(storedRows()[0]?.rationale).toContain('or if NIFTY falls to 24,963');
+      const stopSpot = storedRows()[0]?.marketSnapshot.entry?.plan?.stopSpot ?? NaN;
+      // Under the low of the last two 5-minute candles by a quarter of a normal swing.
+      expect(stopSpot).toBeCloseTo(24_982.72, 1);
+      expect(storedRows()[0]?.rationale).toContain('sell if NIFTY falls below 24,983');
 
-      setNiftySpot(24_970);
+      setNiftySpot(24_984);
       vi.setSystemTime(ist('2026-10-21', '10:31'));
       await advisor.runDecisionCycle();
-      setNiftySpot(24_955);
+      setNiftySpot(24_982);
       vi.setSystemTime(ist('2026-10-21', '10:32'));
       await advisor.runDecisionCycle();
 
       expect(storedRows().slice(1).map((row) => row.action)).toEqual(['HOLD', 'EXIT']);
-      expect(storedRows()[2]?.marketSnapshot.exit?.reason).toBe('index-stop');
+      expect(storedRows()[2]?.marketSnapshot.exit?.reason).toBe('chart-stop');
+      expect(storedRows()[2]?.rationale).toContain('NIFTY fell below 24,983');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the planned stops of a trade restored after a restart', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      const first = await optionsAdvisorScenario();
+      await first.advisor.startDecisionLoop(['NIFTY']);
+      first.advisor.stop();
+      const [buy] = storedRows();
+      const plan = buy?.marketSnapshot.entry?.plan;
+      expect(plan).toBeDefined();
+      // The next start finds that BUY still open.
+      findFirst
+        .mockResolvedValueOnce({
+          symbol: buy?.symbol,
+          action: 'BUY',
+          instrumentToken: buy?.instrumentToken,
+          marketSnapshot: buy?.marketSnapshot,
+          decidedAt: ist('2026-10-21', '10:30'),
+          currentPrice: Number(buy?.buyPrice),
+          tuuid: buy?.tuuid,
+        })
+        .mockResolvedValueOnce({
+          asOf: ist('2026-10-21', '10:30'),
+          decidedAt: ist('2026-10-21', '10:30'),
+          buyPrice: Number(buy?.buyPrice),
+          instrumentToken: buy?.instrumentToken,
+          marketSnapshot: buy?.marketSnapshot,
+          tuuid: buy?.tuuid,
+        });
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:35').getTime() + 20_000));
+      const second = await optionsAdvisorScenario();
+      await second.advisor.startDecisionLoop(['NIFTY']);
+      second.advisor.stop();
+      expect(storedRows().at(-1)).toMatchObject({
+        action: 'HOLD',
+        tuuid: buy?.tuuid,
+        marketSnapshot: { position: { stopSpot: plan?.stopSpot, premiumStop: plan?.premiumStop } },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('raises the chart stop under a new swing low and sells when NIFTY breaks it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      const { advisor, getFiveMinuteCandles, setNiftySpot } = await optionsAdvisorScenario();
+      await advisor.startDecisionLoop(['NIFTY']);
+      advisor.stop();
+      const initial = storedRows()[0]?.marketSnapshot.entry?.plan?.stopSpot ?? NaN;
+
+      // After the buy: two higher candles, a dip to a higher low (24,664), then two more higher
+      // candles that confirm it as a swing low.
+      const before = uptrendFuturesBars({
+        yesterday: '2026-10-20',
+        today: '2026-10-21',
+        startPrice: 24_400,
+      });
+      getFiveMinuteCandles.mockResolvedValue([
+        ...before,
+        ...fiveMinuteBars('2026-10-21', '10:30', [
+          [24_670, 24_692, 24_668, 24_690],
+          [24_690, 24_702, 24_688, 24_700],
+          [24_700, 24_702, 24_664, 24_668],
+          [24_668, 24_682, 24_666, 24_680],
+          [24_680, 24_694, 24_678, 24_692],
+        ]),
+      ]);
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:55').getTime() + 20_000));
+      await advisor.runDecisionCycle();
+      const hold = storedRows()[1];
+      expect(hold?.action).toBe('HOLD');
+      const atr = hold?.marketSnapshot.readings?.[0]?.chart?.atr ?? NaN;
+      // Futures trade 330 under spot here: 24,664 on futures is 24,994 on NIFTY.
+      const trailed = hold?.marketSnapshot.position?.stopSpot ?? NaN;
+      expect(trailed).toBeGreaterThan(initial);
+      expect(trailed).toBeCloseTo(24_664 + 330 - 0.25 * atr, 1);
+
+      setNiftySpot(Math.floor(trailed));
+      vi.setSystemTime(ist('2026-10-21', '10:56'));
+      await advisor.runDecisionCycle();
+      expect(storedRows()[2]).toMatchObject({
+        action: 'EXIT',
+        marketSnapshot: { exit: { reason: 'chart-stop' } },
+      });
     } finally {
       vi.useRealTimers();
     }

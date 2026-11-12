@@ -92,9 +92,11 @@ import {
   minutesBetween,
   msUntilNextCycle,
 } from '../strategy/clock.js';
+import { trailStopSpot } from '../strategy/chart.js';
 import {
   buildCandidates,
   type CandidateRejection,
+  type ChainQuote,
   type ContractCandidate,
 } from '../strategy/contracts.js';
 import {
@@ -116,6 +118,7 @@ import {
 } from '../strategy/params.js';
 import {
   describeBuy,
+  describeContract,
   describeExit,
   describeHold,
   describeSkip,
@@ -192,6 +195,27 @@ export function storedNetPnlInr(
 /** Stops compare against the bid (what a sell would get), falling back to the last trade. */
 function exitCheckPrice(quote: MarketQuote | null, lastPrice: number | null): number | null {
   return quote?.bid && quote.bid > 0 ? quote.bid : lastPrice;
+}
+
+/** The chart-plan rejection of the strike closest to the money, e.g. for a `risk-too-wide` SKIP. */
+function describePlanRejections(
+  rejected: readonly CandidateRejection[],
+  chain: readonly ChainQuote[],
+  spot: number | null,
+): string {
+  const rows = new Map(chain.map((row) => [row.symbol, row] as const));
+  const distance = (item: CandidateRejection) => {
+    const strike = rows.get(item.symbol)?.strike;
+    return strike === undefined || spot === null ? Infinity : Math.abs(strike - spot);
+  };
+  const nearest = rejected
+    .filter((item) => item.code)
+    .sort((left, right) => distance(left) - distance(right))[0];
+  if (!nearest) {
+    return '';
+  }
+  const row = rows.get(nearest.symbol);
+  return `Closest to the current price, ${row ? describeContract(row) : nearest.symbol}: ${nearest.reason}.`;
 }
 
 function summarizeRejections(rejected: readonly CandidateRejection[]): string {
@@ -1036,6 +1060,8 @@ export class LlmTradeAdvisorService {
     }
 
     const data = view.indexes.find((item) => item.index === entry.index);
+    const chart = entry.reading.chart;
+    const chartPlan = chart?.plans[entry.side];
     const { candidates, rejected } =
       data && data.spot !== null
         ? buildCandidates(
@@ -1047,19 +1073,35 @@ export class LlmTradeAdvisorService {
               step: data.step,
               todayYmd: view.todayYmd,
               indexDaily: view.indexDaily[entry.index] ?? [],
+              ...(chart && chartPlan
+                ? {
+                    plan: {
+                      stopSpot: chartPlan.stopSpot,
+                      targetSpot: chartPlan.targetSpot,
+                      riskPoints: chartPlan.riskPoints,
+                      rewardPoints: chartPlan.rewardPoints,
+                      atr: chart.atr,
+                    },
+                  }
+                : {}),
             },
             this.params,
           )
         : { candidates: [], rejected: [] };
     if (candidates.length === 0) {
+      // Liquid contracts that failed the ₹ profit-lock room or the loss limit name that gate.
+      const planGates = [...new Set(rejected.flatMap((item) => (item.code ? [item.code] : [])))];
       return this.storeSkip({
         view,
         readings,
         now,
-        blockedBy: ['no-liquid-contract'],
+        blockedBy: planGates.length > 0 ? planGates : ['no-liquid-contract'],
         leaning: { index: entry.index, side: entry.side, score: entry.score },
         reading: entry.reading,
-        detail: summarizeRejections(rejected),
+        detail:
+          planGates.length > 0
+            ? describePlanRejections(rejected, data?.chain ?? [], data?.spot ?? null)
+            : summarizeRejections(rejected),
       });
     }
 
@@ -1136,6 +1178,7 @@ export class LlmTradeAdvisorService {
     const quote = view.extraQuotes[position.symbol] ?? null;
     const price = this.trackPrice(position, quote);
     const reading = readings.find((item) => item.index === position.index) ?? null;
+    this.trailStop(position, reading);
     const check = checkPositionExit(
       {
         now,
@@ -1190,8 +1233,29 @@ export class LlmTradeAdvisorService {
       pnlPct:
         price === null ? null : round(((price - position.entryPrice) / position.entryPrice) * 100),
       netPnlInr,
+      stopSpot: position.stopSpot,
+      premiumStop: position.premiumStop,
+      lockArmed: position.peakPrice >= position.entryPrice + this.params.profitLockInr,
     });
     return stored;
+  }
+
+  /**
+   * Moves the chart stop up to each new swing low after entry (down to each new swing high for a
+   * put), less the buffer; it never loosens.
+   */
+  private trailStop(position: OpenTrade, reading: IndexReading | null): void {
+    if (position.stopSpot === null || !reading?.chart) {
+      return;
+    }
+    const next = trailStopSpot(reading.chart, position.side, position.enteredAt, this.params.chart);
+    if (next === null) {
+      return;
+    }
+    const tighter = position.side === 'CE' ? next > position.stopSpot : next < position.stopSpot;
+    if (tighter) {
+      position.stopSpot = Number(next.toFixed(2));
+    }
   }
 
   /** 15-second check (and start-up check) of the open position: stops, profit floor, time, 15:15. */
@@ -1258,6 +1322,9 @@ export class LlmTradeAdvisorService {
       lotSize: bought?.lotSize ?? null,
       entryDelta: bought?.entryDelta ?? null,
       entrySpot: buySnapshot?.spots[index] ?? null,
+      // The latest HOLD carries the trailed stop; the BUY carries the planned one.
+      stopSpot: latest?.stopSpot ?? buySnapshot?.entry?.plan?.stopSpot ?? null,
+      premiumStop: latest?.premiumStop ?? buySnapshot?.entry?.plan?.premiumStop ?? null,
     };
     this.applyDecisionState('HOLD', trade.symbol, trade.instrumentToken);
     if (istClock(trade.enteredAt).ymd < istClock(this.now()).ymd) {
@@ -1342,7 +1409,18 @@ export class LlmTradeAdvisorService {
       lotSize: candidate.lotSize,
       entryDelta: candidate.delta,
       entrySpot: input.view.spots[candidate.index] ?? input.reading.spot ?? null,
+      stopSpot: candidate.plan?.stopSpot ?? null,
+      premiumStop: candidate.plan?.premiumStop ?? null,
     };
+    const chartPlan = input.reading.chart?.plans[candidate.side];
+    const plan =
+      candidate.plan && chartPlan
+        ? {
+            ...candidate.plan,
+            targetKind: chartPlan.targetKind,
+            rewardToRisk: Number(chartPlan.rewardToRisk.toFixed(2)),
+          }
+        : null;
     const rationale = describeBuy({
       now: input.now,
       candidate,
@@ -1390,6 +1468,7 @@ export class LlmTradeAdvisorService {
               ivToHv: item.ivToHv,
               rank: item.rank,
             })),
+            ...(plan ? { plan } : {}),
           },
           position: this.positionSnapshot(position, input.now, candidate.ltp),
           fees: { totalInr: candidate.feeInr, lotSize: candidate.lotSize },
@@ -1413,6 +1492,15 @@ export class LlmTradeAdvisorService {
       fillPrice,
       pickedBy,
       score: input.reading.score,
+      ...(plan
+        ? {
+            stopSpot: plan.stopSpot,
+            premiumStop: plan.premiumStop,
+            lockPrice: plan.lockPrice,
+            maxLossInr: plan.maxLossInr,
+            rewardToRisk: plan.rewardToRisk,
+          }
+        : {}),
     });
     return stored;
   }
@@ -1696,6 +1784,8 @@ export class LlmTradeAdvisorService {
       peakPrice: position.peakPrice,
       troughPrice: position.troughPrice,
       entryDelta: position.entryDelta,
+      stopSpot: position.stopSpot,
+      premiumStop: position.premiumStop,
     };
   }
 
@@ -1735,6 +1825,23 @@ export class LlmTradeAdvisorService {
         putWall: reading.putWall,
         pcr: reading.pcr,
         expiryToday: reading.expiryToday,
+        chart: reading.chart
+          ? {
+              atr: Number(reading.chart.atr.toFixed(2)),
+              structure: reading.chart.structure,
+              higherTrend: reading.chart.higherTrend,
+              burstAtr: round(reading.chart.burstAtr),
+              candle: {
+                pattern: reading.chart.candle.pattern,
+                confirms: reading.chart.candle.confirms,
+                closeLocation: Number(reading.chart.candle.closeLocation.toFixed(2)),
+                rangeAtr: Number(reading.chart.candle.rangeAtr.toFixed(2)),
+                volumeRatio: round(reading.chart.candle.volumeRatio),
+              },
+              support: round(reading.chart.support?.price ?? null),
+              resistance: round(reading.chart.resistance?.price ?? null),
+            }
+          : null,
       })),
       market: backdrop
         ? {

@@ -19,6 +19,40 @@ export type SignalThresholds = {
   headlineTone: number;
 };
 
+/**
+ * Chart reading on completed 5-minute futures bars (chart.ts). "ATR" is the 14-bar average true
+ * range: the size of a normal 5-minute swing, which scales every distance below.
+ */
+export type ChartParams = {
+  /** Gain to the next level must be at least this many times the loss at the stop (Varsity: 1.5). */
+  minRewardToRisk: number;
+  atrPeriod: number;
+  /** A swing high (low) is above (below) this many bars on each side. */
+  swingBars: number;
+  /** The stop sits this many ATRs beyond the low (calls) or high (puts) of the last two candles. */
+  stopBufferAtr: number;
+  /** Stops closer than this many ATRs to the price get hit by normal 5-minute noise. */
+  minStopAtr: number;
+  /** A level this close (in ATRs) ahead of the price counts as being at it. */
+  levelBufferAtr: number;
+  /** A net move of `maxBurstAtr` ATRs or more over the last `burstBars` bars is a climax. */
+  burstBars: number;
+  maxBurstAtr: number;
+  /** A confirming candle closes in this top (calls) or bottom (puts) share of its range... */
+  confirmCloseLocation: number;
+  /** ...is at least this many ATRs tall... */
+  minSignalRangeAtr: number;
+  /** ...and trades at least this multiple of the usual volume for its time of day. */
+  minSignalVolumeRatio: number;
+  /** Bigger-picture trend: an EMA of `trendEmaPeriod` bars of `trendMinutes` minutes. */
+  trendMinutes: number;
+  trendEmaPeriod: number;
+  /** Target when no level lies ahead of the price, in ATRs. */
+  targetFallbackAtr: number;
+  /** The index move the ₹ profit lock needs must be within this many ATRs (else a dead market). */
+  maxTargetAtr: number;
+};
+
 /** Every number the decision engine uses. Times are minutes after midnight IST. */
 export type StrategyParams = {
   entryStartMinute: number;
@@ -31,16 +65,27 @@ export type StrategyParams = {
   maxVixRiseForCallsPct: number;
   newsLookbackMinutes: number;
   bigLevelBufferPct: number;
-  /** Room to the next big option level must be at least this many times `indexStopPct`. */
+  /**
+   * Without a chart reading: room to the next big option level must be at least this many times
+   * `indexStopPct`. With one, `chart.minRewardToRisk` applies to the chart stop and target.
+   */
   minRewardToRisk: number;
   maxTradesPerDay: number;
   maxLosingTradesPerDay: number;
   /** No new trades once today's closed trades are net above this (₹), so a green day stays green. */
   dayProfitLockInr: number;
   cooldownMinutes: number;
+  /** Widest stop on the option price; the planned stop from the chart is never looser. */
   stopLossPct: number;
-  /** Sell when the index has moved this % against the trade since entry. */
+  /** Without a chart stop: sell when the index has moved this % against the trade since entry. */
   indexStopPct: number;
+  /**
+   * ₹ per unit. A trade needs room to gain this much over its buy price; once it has, the exit
+   * moves up to buy price + this, so the gain is kept.
+   */
+  profitLockInr: number;
+  /** ₹ per unit: the most a trade may lose at its chart stop, spread included. */
+  maxRiskPerUnitInr: number;
   /** Once the best gain reaches this %, the exit moves up to cost plus `breakevenLockPct`. */
   breakevenActivatePct: number;
   /** Gain (%) the break-even exit keeps, enough to cover charges and the spread. */
@@ -64,6 +109,7 @@ export type StrategyParams = {
   minPremium: number;
   minOptionOi: number;
   signals: SignalThresholds;
+  chart: ChartParams;
 };
 
 export const DEFAULT_STRATEGY: StrategyParams = {
@@ -88,6 +134,10 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   // The premium moves ~70× the index in %, so 0.25% cost −17% on 2026-11-09; 0.15% ≈ −10%.
   // Winners' index pullbacks stayed within 0.08%.
   indexStopPct: 0.15,
+  // Three trades reached +₹13 to +₹23 a unit and still closed at a loss (2026-10-23, 11-03, 11-04).
+  profitLockInr: 10,
+  // About ₹1,050 on a 65-unit NIFTY lot with charges; past stopped trades lost ₹1,650–3,340.
+  maxRiskPerUnitInr: 15,
   // Three trades reached +9% to +15% and still closed at a loss before this lock existed.
   breakevenActivatePct: 8,
   breakevenLockPct: 2,
@@ -127,6 +177,24 @@ export const DEFAULT_STRATEGY: StrategyParams = {
     crudeMovePct: 1.5,
     gapPct: 0.4,
     headlineTone: 2,
+  },
+  chart: {
+    minRewardToRisk: 1.5,
+    atrPeriod: 14,
+    swingBars: 2,
+    stopBufferAtr: 0.25,
+    minStopAtr: 1,
+    levelBufferAtr: 0.3,
+    burstBars: 3,
+    // 2026-11-09: a 72-point fall in 15 minutes (about 7 normal swings) right before the put buy.
+    maxBurstAtr: 2.5,
+    confirmCloseLocation: 0.6,
+    minSignalRangeAtr: 0.5,
+    minSignalVolumeRatio: 1,
+    trendMinutes: 15,
+    trendEmaPeriod: 20,
+    targetFallbackAtr: 2,
+    maxTargetAtr: 3,
   },
 };
 

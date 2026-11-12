@@ -227,9 +227,9 @@ describe('simulateExitRules', () => {
   const path = (moves: Array<[string, number]>) =>
     moves.map(([time, spot]) => ({ at: ist(time), spot }));
 
-  it('replays the break-even lock and the stepped trailing stop like the live rules', () => {
-    // +12% (index +24 points), then back to +3%: sold on the trailing stop at once.
-    const trailed = simulateExitRules(
+  it('replays the ₹10 profit lock, the break-even lock and the stepped trailing stop like the live rules', () => {
+    // ₹100 option: +₹12 (index +24 points), then back to +₹3: sold on the ₹10 profit lock.
+    const locked = simulateExitRules(
       start,
       path([
         ['10:05', 25_024],
@@ -237,11 +237,23 @@ describe('simulateExitRules', () => {
       ]),
       params,
     );
-    expect(trailed).toMatchObject({ reason: 'trailing-stop' });
-    expect(trailed?.bestPct).toBeCloseTo(12);
-    expect(trailed?.pnlPct).toBeCloseTo(3);
+    expect(locked).toMatchObject({ reason: 'profit-lock' });
+    expect(locked?.bestPct).toBeCloseTo(12);
+    expect(locked?.pnlPct).toBeCloseTo(3);
 
-    // +9%, then back to +1%: the break-even exit.
+    // ₹200 option: +12% (₹24) keeps half, +6% (₹12), above the ₹10 lock: the trailing stop sells.
+    expect(
+      simulateExitRules(
+        { ...start, premium: 200 },
+        path([
+          ['10:05', 25_048],
+          ['10:10', 25_012],
+        ]),
+        params,
+      ),
+    ).toMatchObject({ reason: 'trailing-stop' });
+
+    // +9% (₹9, short of the lock), then back to +1%: the break-even exit.
     expect(
       simulateExitRules(
         start,

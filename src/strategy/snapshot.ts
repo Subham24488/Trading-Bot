@@ -8,6 +8,39 @@ const nullableNumber = z.number().nullable();
 const sideSchema = z.enum(['CE', 'PE']);
 const voteSchema = z.union([z.literal(-1), z.literal(0), z.literal(1)]);
 
+/** The chart reading behind a decision (chart.ts); absent on rows from before it existed. */
+const chartSchema = z.object({
+  atr: z.number(),
+  structure: z.enum(['up', 'down', 'unclear']),
+  higherTrend: z.enum(['up', 'down', 'flat']).nullable(),
+  burstAtr: nullableNumber,
+  candle: z.object({
+    pattern: z.string(),
+    confirms: sideSchema.nullable(),
+    closeLocation: z.number(),
+    rangeAtr: z.number(),
+    volumeRatio: nullableNumber,
+  }),
+  support: nullableNumber,
+  resistance: nullableNumber,
+});
+
+/** Stop, target and money at risk for the contract bought (contracts.ts `ContractPlan`). */
+const entryPlanSchema = z.object({
+  stopSpot: z.number(),
+  targetSpot: z.number(),
+  targetKind: z.string(),
+  riskPoints: z.number(),
+  rewardPoints: z.number(),
+  rewardToRisk: z.number(),
+  rewardPerUnit: z.number(),
+  riskPerUnit: z.number(),
+  premiumStop: z.number(),
+  lockPrice: z.number(),
+  maxLossInr: z.number(),
+  lockedProfitInr: z.number(),
+});
+
 /**
  * Structured market snapshot stored with every rules-based decision (`marketSnapshot` column).
  * The decision loop writes it; the session review reads it back.
@@ -31,6 +64,7 @@ export const decisionSnapshotSchema = z.object({
       putWall: nullableNumber,
       pcr: nullableNumber,
       expiryToday: z.boolean(),
+      chart: chartSchema.nullable().optional(),
     }),
   ),
   market: z.object({
@@ -73,6 +107,7 @@ export const decisionSnapshotSchema = z.object({
           rank: z.number(),
         }),
       ),
+      plan: entryPlanSchema.optional(),
     })
     .optional(),
   position: z
@@ -92,6 +127,9 @@ export const decisionSnapshotSchema = z.object({
       peakPrice: z.number(),
       troughPrice: z.number(),
       entryDelta: nullableNumber,
+      /** Current (trailed) chart stop on the index and the planned premium stop. */
+      stopSpot: nullableNumber.optional(),
+      premiumStop: nullableNumber.optional(),
     })
     .optional(),
   exit: z

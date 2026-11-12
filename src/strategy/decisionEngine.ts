@@ -22,6 +22,11 @@ export const GATE_IDS = [
   'no-liquid-contract',
   'low-reward',
   'day-in-profit',
+  'no-candle-confirmation',
+  'near-chart-level',
+  'chart-trend-disagrees',
+  'target-out-of-reach',
+  'risk-too-wide',
 ] as const;
 
 export type GateId = (typeof GATE_IDS)[number];
@@ -38,6 +43,8 @@ export const EXIT_REASONS = [
   'index-stop',
   'breakeven-stop',
   'level-reached',
+  'chart-stop',
+  'profit-lock',
 ] as const;
 
 export type ExitReason = (typeof EXIT_REASONS)[number];
@@ -77,6 +84,13 @@ export type OpenPosition = {
   entryDelta: number | null;
   /** Index spot when bought; drives the index-move stop. Null when it was not known. */
   entrySpot: number | null;
+  /**
+   * Index level (spot) that ends the trade: under the setup's low for calls, over its high for
+   * puts, tightened as new swings form. Null: the `indexStopPct` move from entry applies.
+   */
+  stopSpot: number | null;
+  /** Option price that ends the trade, the planned loss limit. Null: `stopLossPct` applies. */
+  premiumStop: number | null;
 };
 
 export type ExitCheck = { action: 'EXIT'; reason: ExitReason } | { action: 'HOLD' };
@@ -141,16 +155,22 @@ function readingGates(
   if (opposing > params.maxOpposingVotes) {
     gates.push('too-many-opposing');
   }
-  const chasing =
+  const { chart } = reading;
+  const stretched =
     reading.rsi !== null &&
     (side === 'CE'
       ? reading.rsi >= params.rsiChaseLimit
       : reading.rsi <= 100 - params.rsiChaseLimit);
-  if (chasing) {
+  // A climax: the last few candles already moved several normal swings in the trade's direction.
+  const burstAtr = chart?.burstAtr ?? null;
+  const burst = burstAtr !== null && burstAtr * direction >= params.chart.maxBurstAtr;
+  if (stretched || burst) {
     gates.push('chasing');
   }
   if (reading.lastCandle.side !== null && reading.lastCandle.side !== side) {
     gates.push('opposite-candle');
+  } else if (chart && chart.candle.confirms !== side) {
+    gates.push('no-candle-confirmation');
   }
   if (side === 'CE' && vixPct !== null && vixPct >= params.maxVixRiseForCallsPct) {
     gates.push('fear-spike');
@@ -161,35 +181,68 @@ function readingGates(
   if (isNearBigLevel(reading, side, params)) {
     gates.push('near-big-level');
   }
-  const room = levelRoomPct(reading, side);
-  if (room !== null && room < params.minRewardToRisk * params.indexStopPct) {
+  if (!chart) {
+    const room = levelRoomPct(reading, side);
+    if (room !== null && room < params.minRewardToRisk * params.indexStopPct) {
+      gates.push('low-reward');
+    }
+    return gates;
+  }
+  const plan = chart.plans[side];
+  if (plan.nearLevel) {
+    gates.push('near-chart-level');
+  }
+  const against = side === 'CE' ? 'down' : 'up';
+  if (chart.structure === against || chart.higherTrend === against) {
+    gates.push('chart-trend-disagrees');
+  }
+  if (plan.rewardToRisk < params.chart.minRewardToRisk) {
     gates.push('low-reward');
   }
   return gates;
 }
 
-export type ProfitFloor = { floorPct: number; kind: 'breakeven' | 'trail' | 'level' };
+export type ProfitFloor = { floorPct: number; kind: 'lock' | 'breakeven' | 'trail' | 'level' };
 
 const FLOOR_EXIT_REASON: Record<ProfitFloor['kind'], ExitReason> = {
+  lock: 'profit-lock',
   breakeven: 'breakeven-stop',
   trail: 'trailing-stop',
   level: 'level-reached',
 };
 
+/** Rounding slack so a price exactly at a stop, floor or lock level counts as at it. */
+const ROUNDING_SLACK = 1e-9;
+
+/** Gain (% on premium) the ₹ profit lock keeps for an option bought at `entryPrice`. */
+export function profitLockPct(entryPrice: number, params: StrategyParams): number | null {
+  return entryPrice > 0 && params.profitLockInr > 0
+    ? (params.profitLockInr / entryPrice) * 100
+    : null;
+}
+
 /**
  * Lowest gain (% on premium) the trade may fall back to before it is sold, from its best gain
- * so far; null until the break-even lock arms. Shared by the live checks, the HOLD rationale
- * and the review's what-if replay.
+ * so far; null until the break-even lock or the ₹ profit lock arms. With `entryPrice`, a best
+ * price of buy + `profitLockInr` moves the floor up to that price. Shared by the live checks,
+ * the HOLD rationale and the review's what-if replay.
  */
 export function profitFloor(
   peakGainPct: number,
   params: StrategyParams,
   atBigLevel = false,
+  entryPrice: number | null = null,
 ): ProfitFloor | null {
-  if (peakGainPct < params.breakevenActivatePct) {
+  const lockPct = entryPrice === null ? null : profitLockPct(entryPrice, params);
+  const lockArmed = lockPct !== null && peakGainPct + ROUNDING_SLACK >= lockPct;
+  const breakevenArmed = peakGainPct >= params.breakevenActivatePct;
+  if (!breakevenArmed && !lockArmed) {
     return null;
   }
-  let floor: ProfitFloor = { floorPct: params.breakevenLockPct, kind: 'breakeven' };
+  let floor: ProfitFloor =
+    lockArmed && (!breakevenArmed || lockPct > params.breakevenLockPct)
+      ? { floorPct: lockPct, kind: 'lock' }
+      : { floorPct: params.breakevenLockPct, kind: 'breakeven' };
   const raise = (floorPct: number, kind: ProfitFloor['kind']) => {
     if (floorPct > floor.floorPct) {
       floor = { floorPct, kind };
@@ -290,8 +343,9 @@ export function decideEntry(
 }
 
 /**
- * Open position, checked in order: end-of-day square-off, stale position, stop-loss, index
- * stop, profit floor (break-even lock, stepped trailing stop, tighter at a big level on cycle
+ * Open position, checked in order: stale position, end-of-day square-off, the planned premium
+ * stop, the chart stop on the index (or the fixed index move without one), the profit floor
+ * (₹ profit lock, break-even lock, stepped trailing stop, tighter at a big level on cycle
  * checks), time stop; then (cycle only, after the minimum hold) trend reversal and major news
  * while losing.
  */
@@ -315,10 +369,19 @@ export function checkPositionExit(
     return { action: 'EXIT', reason: 'square-off' };
   }
   const pnlPct = pctChange(position.entryPrice, price);
-  if (pnlPct !== null && pnlPct <= -params.stopLossPct) {
+  const premiumStop = position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
+  if (price !== null && price <= premiumStop + ROUNDING_SLACK) {
     return { action: 'EXIT', reason: 'stop-loss' };
   }
-  if (indexMovedAgainst(position, input.spot ?? null) >= params.indexStopPct) {
+  const spot = input.spot ?? null;
+  if (position.stopSpot !== null) {
+    const broken =
+      spot !== null &&
+      (position.side === 'CE' ? spot <= position.stopSpot : spot >= position.stopSpot);
+    if (broken) {
+      return { action: 'EXIT', reason: 'chart-stop' };
+    }
+  } else if (indexMovedAgainst(position, spot) >= params.indexStopPct) {
     return { action: 'EXIT', reason: 'index-stop' };
   }
   if (price === null || pnlPct === null) {
@@ -330,8 +393,9 @@ export function checkPositionExit(
     peakGainPct,
     params,
     reading ? isNearBigLevel(reading, position.side, params) : false,
+    position.entryPrice,
   );
-  if (floor && pnlPct < floor.floorPct) {
+  if (floor && pnlPct < floor.floorPct - ROUNDING_SLACK) {
     return { action: 'EXIT', reason: floorExitReason(floor) };
   }
   const heldMinutes = minutesBetween(position.enteredAt, now);
@@ -369,8 +433,11 @@ export function summarizeDay(rows: readonly DayRow[], now: Date): DayStats {
   const exits = todays.filter((row) => row.action === 'EXIT' && row.trigger !== 'startup');
   return {
     trades: todays.filter((row) => row.action === 'BUY').length,
-    losingTrades: exits.filter(
-      (row) => row.buyPrice !== null && row.sellPrice !== null && row.sellPrice < row.buyPrice,
+    // A trade sold just above its buy price can still lose after charges; that counts as a loss.
+    losingTrades: exits.filter((row) =>
+      row.netPnlInr !== null
+        ? row.netPnlInr < 0
+        : row.buyPrice !== null && row.sellPrice !== null && row.sellPrice < row.buyPrice,
     ).length,
     lastExitAt: exits.reduce<Date | null>(
       (latest, row) => (latest && latest >= row.decidedAt ? latest : row.decidedAt),

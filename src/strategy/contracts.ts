@@ -25,6 +25,38 @@ export type ChainQuote = {
 
 export type Moneyness = 'in the money' | 'at the money' | 'out of the money';
 
+/** The chart's stop and target for the trade (spot terms), from chart.ts. */
+export type TradePlanInput = {
+  stopSpot: number;
+  targetSpot: number;
+  riskPoints: number;
+  rewardPoints: number;
+  /** Size of a normal 5-minute swing in index points. */
+  atr: number;
+};
+
+/** What the chart's stop and target mean for one contract, per unit and per lot. */
+export type ContractPlan = {
+  stopSpot: number;
+  targetSpot: number;
+  riskPoints: number;
+  rewardPoints: number;
+  /** Bid the option should reach at the target, less its buy price (delta × points − spread). */
+  rewardPerUnit: number;
+  /** Bought at the ask, sold at the bid once the index reaches the stop (delta × points + spread). */
+  riskPerUnit: number;
+  /** Option price that ends the trade: buy price less `riskPerUnit`, on the ₹0.05 tick. */
+  premiumStop: number;
+  /** Buy price + the ₹ profit lock; once reached, the exit moves up to it. */
+  lockPrice: number;
+  /** Loss on 1 lot if sold at `premiumStop`, charges included. */
+  maxLossInr: number;
+  /** Profit on 1 lot if sold at `lockPrice`, after charges. */
+  lockedProfitInr: number;
+};
+
+export type PlanRejectionCode = 'target-out-of-reach' | 'risk-too-wide';
+
 export type ContractCandidate = {
   symbol: string;
   index: IndexOptionName;
@@ -46,10 +78,93 @@ export type ContractCandidate = {
   stepsFromAtm: number;
   moneyness: Moneyness;
   feeInr: number;
+  /** Stop, target and money at risk from the chart; null when no chart plan was given. */
+  plan: ContractPlan | null;
   rank: number;
 };
 
-export type CandidateRejection = { symbol: string; reason: string };
+/** `code` marks a contract that was liquid and fairly priced but failed the chart plan. */
+export type CandidateRejection = { symbol: string; reason: string; code?: PlanRejectionCode };
+
+/** Option prices move in ₹0.05 steps. */
+const TICK = 0.05;
+
+function round2(value: number): number {
+  return Number(value.toFixed(2));
+}
+
+function formatRupees(value: number): string {
+  return `₹${value.toFixed(2)}`;
+}
+
+/**
+ * The ₹ profit-lock check and the loss limit for one contract. The option must be able to gain
+ * `profitLockInr` before the target (and the move that needs must be a normal one), and the
+ * loss at the chart stop must stay within `maxRiskPerUnitInr`.
+ */
+function planContract(
+  row: { ask: number; bid: number; lotSize: number },
+  delta: number,
+  plan: TradePlanInput,
+  params: StrategyParams,
+): { plan: ContractPlan } | { code: PlanRejectionCode; reason: string } {
+  const spread = row.ask - row.bid;
+  const rewardPerUnit = delta * plan.rewardPoints - spread;
+  if (rewardPerUnit < params.profitLockInr) {
+    return {
+      code: 'target-out-of-reach',
+      reason:
+        `the next level is worth only about ${formatRupees(Math.max(rewardPerUnit, 0))} on it, ` +
+        `short of the ₹${params.profitLockInr} target`,
+    };
+  }
+  const pointsForLock = (params.profitLockInr + spread) / delta;
+  if (pointsForLock > params.chart.maxTargetAtr * plan.atr) {
+    return {
+      code: 'target-out-of-reach',
+      reason:
+        `₹${params.profitLockInr} needs a ${Math.round(pointsForLock)}-point move, more than ` +
+        `${params.chart.maxTargetAtr} normal 5-minute swings`,
+    };
+  }
+  const riskPerUnit = delta * plan.riskPoints + spread;
+  if (riskPerUnit > params.maxRiskPerUnitInr) {
+    return {
+      code: 'risk-too-wide',
+      reason:
+        `it would lose about ${formatRupees(riskPerUnit)} a unit at the chart stop, ` +
+        `more than the ₹${params.maxRiskPerUnitInr} limit`,
+    };
+  }
+  const widest = row.ask * (1 - params.stopLossPct / 100);
+  const onTick = Math.floor((row.ask - riskPerUnit) / TICK + 1e-6) * TICK;
+  const premiumStop = round2(Math.max(widest, onTick));
+  const lockPrice = round2(row.ask + params.profitLockInr);
+  const atStop = estimateOptionsRoundTripCost({
+    buyPremium: row.ask,
+    sellPremium: premiumStop,
+    quantity: row.lotSize,
+  });
+  const atLock = estimateOptionsRoundTripCost({
+    buyPremium: row.ask,
+    sellPremium: lockPrice,
+    quantity: row.lotSize,
+  });
+  return {
+    plan: {
+      stopSpot: round2(plan.stopSpot),
+      targetSpot: round2(plan.targetSpot),
+      riskPoints: round2(plan.riskPoints),
+      rewardPoints: round2(plan.rewardPoints),
+      rewardPerUnit: round2(rewardPerUnit),
+      riskPerUnit: round2(riskPerUnit),
+      premiumStop,
+      lockPrice,
+      maxLossInr: round2((row.ask - premiumStop) * row.lotSize + atStop.totalInr),
+      lockedProfitInr: round2((lockPrice - row.ask) * row.lotSize - atLock.totalInr),
+    },
+  };
+}
 
 export function spreadPct(bid: number | null, ask: number | null): number | null {
   if (bid === null || ask === null || !(bid > 0) || ask < bid) {
@@ -69,6 +184,8 @@ function moneynessOf(side: OptionSide, strike: number, atm: number): Moneyness {
 /**
  * Liquid, fairly priced contracts near the money for the side the rules chose,
  * best first: delta closest to 0.5, then tightest spread, then deepest open interest.
+ * With a chart `plan`, each contract also needs room for the ₹ profit lock and a loss at the
+ * chart stop within the limit; those rejections carry a `code`.
  */
 export function buildCandidates(
   input: {
@@ -79,6 +196,7 @@ export function buildCandidates(
     step: number;
     todayYmd: string;
     indexDaily: readonly DailyBar[];
+    plan?: TradePlanInput;
   },
   params: StrategyParams,
 ): { candidates: ContractCandidate[]; rejected: CandidateRejection[] } {
@@ -146,6 +264,20 @@ export function buildCandidates(
       reject('charges would eat the profit target');
       continue;
     }
+    let plan: ContractPlan | null = null;
+    if (input.plan) {
+      const checked = planContract(
+        { ask: row.ask, bid: row.bid, lotSize: row.lotSize },
+        greeks.absDelta,
+        input.plan,
+        params,
+      );
+      if (!('plan' in checked)) {
+        rejected.push({ symbol: row.symbol, reason: checked.reason, code: checked.code });
+        continue;
+      }
+      plan = checked.plan;
+    }
     const fees = estimateOptionsRoundTripCost({
       buyPremium: row.ask,
       sellPremium: row.ask * (1 + params.targetNetPnlPct / 100),
@@ -170,6 +302,7 @@ export function buildCandidates(
       stepsFromAtm,
       moneyness: moneynessOf(row.side, row.strike, atm),
       feeInr: fees.totalInr,
+      plan,
     });
   }
 

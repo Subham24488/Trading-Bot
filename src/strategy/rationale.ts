@@ -1,5 +1,7 @@
+import { estimateOptionsRoundTripCost } from '../llm/optionTradeCosts.js';
+import type { LevelKind } from './chart.js';
 import { formatClockTime, formatIstTime, minutesBetween } from './clock.js';
-import type { ContractCandidate } from './contracts.js';
+import type { ContractCandidate, ContractPlan } from './contracts.js';
 import {
   levelRoomPct,
   profitFloor,
@@ -8,7 +10,7 @@ import {
   type Leaning,
   type OpenPosition,
 } from './decisionEngine.js';
-import { pctChange, type OptionSide } from './indicators.js';
+import { pctChange, type CandlePatternName, type OptionSide } from './indicators.js';
 import type { StrategyParams } from './params.js';
 import type { IndexReading } from './signals.js';
 
@@ -98,10 +100,101 @@ const GATE_TEXT: Record<GateId, (params: StrategyParams) => string> = {
   'no-liquid-contract': () =>
     'no option passed our checks for price, trading costs and how easily it can be bought and sold',
   'low-reward': (p) =>
-    `the next level many option sellers are betting the price will not cross is less than ${p.minRewardToRisk}× our ${p.indexStopPct}% loss limit away, so the possible gain is too small for the risk`,
+    `the next level where the price may turn back is too close: the possible gain is less than ${p.chart.minRewardToRisk}× the loss at our stop`,
   'day-in-profit': (p) =>
     `today's closed trades are already ${p.dayProfitLockInr > 0 ? `up more than ${formatInr(p.dayProfitLockInr)}` : 'in profit'}, so we stop for the day to keep it`,
+  'no-candle-confirmation': () =>
+    'the last 5-minute candle did not confirm the move (we wait for one that closes strongly past the candle before it, on at least the usual volume)',
+  'near-chart-level': () =>
+    'the price is right at a level where it turned back before, so we wait for a clear break through it',
+  'chart-trend-disagrees': () =>
+    "the chart's bigger picture points the other way (the 15-minute trend or the run of highs and lows)",
+  'target-out-of-reach': (p) =>
+    `no option could gain ₹${p.profitLockInr} before the next level where the price may turn back`,
+  'risk-too-wide': (p) =>
+    `the stop the chart calls for is too far away: the loss there would be more than ₹${p.maxRiskPerUnitInr} a unit`,
 };
+
+/** Where a target level comes from, in everyday words. */
+const LEVEL_TEXT: Record<LevelKind, string> = {
+  'swing-high': 'a recent high where it turned back',
+  'swing-low': 'a recent low where it turned back',
+  'previous-high': "yesterday's high",
+  'previous-low': "yesterday's low",
+  'previous-close': "yesterday's close",
+  'day-high': "today's high",
+  'day-low': "today's low",
+  'opening-high': "the first 15 minutes' high",
+  'opening-low': "the first 15 minutes' low",
+  'hour-high': "the last hour's high",
+  'hour-low': "the last hour's low",
+  'call-wall': 'where many option sellers bet it will not cross',
+  'put-wall': 'where many option sellers bet it will not cross',
+  projection: 'two normal 5-minute swings, with no level in the way',
+};
+
+/** Candle patterns that confirm a trade, in everyday words. */
+const PATTERN_TEXT: Partial<Record<CandlePatternName, string>> = {
+  bullish_engulfing: 'an up candle that swallowed the drop before it',
+  bearish_engulfing: 'a down candle that swallowed the rise before it',
+  morning_star: 'a three-candle turn upward',
+  evening_star: 'a three-candle turn downward',
+  piercing: 'an up candle that won back over half of the drop before it',
+  dark_cloud: 'a down candle that gave back over half of the rise before it',
+  hammer: 'a candle that dipped after a fall and recovered to close high',
+  shooting_star: 'a candle that spiked after a rise and fell back to close low',
+  bull_marubozu: 'a strong up candle with almost no pullback',
+  bear_marubozu: 'a strong down candle with almost no bounce',
+  three_bar_push_up: 'three rising closes in a row',
+  three_bar_push_down: 'three falling closes in a row',
+};
+
+/** "Chart: the last 5-minute candles show …; the 15-minute trend agrees." Empty without a chart. */
+function chartText(reading: IndexReading, side: OptionSide): string {
+  const chart = reading.chart;
+  if (!chart) {
+    return '';
+  }
+  const up = side === 'CE';
+  const { candle } = chart;
+  const pattern = candle.side === side ? PATTERN_TEXT[candle.pattern] : undefined;
+  const shape = pattern
+    ? `candles show ${pattern}`
+    : `candle closed near its ${up ? 'high' : 'low'}, ${up ? 'above' : 'below'} the candle before`;
+  const volume =
+    candle.volumeRatio === null
+      ? ''
+      : ` on ${candle.volumeRatio.toFixed(1)}× the usual volume for the time of day`;
+  const trend = chart.higherTrend === (up ? 'up' : 'down') ? '; the 15-minute trend agrees' : '';
+  return `Chart: the last 5-minute ${shape}${volume}${trend}. `;
+}
+
+/** Stop, target and profit lock of a BUY made from a chart plan. */
+function planText(input: {
+  index: string;
+  side: OptionSide;
+  plan: ContractPlan;
+  targetKind: LevelKind;
+  rewardToRisk: number;
+  params: StrategyParams;
+}): string {
+  const { plan, params } = input;
+  const up = input.side === 'CE';
+  const target =
+    input.targetKind === 'projection'
+      ? `Nothing on the chart stands in the way up to ${wholeNumber.format(plan.targetSpot)} (${LEVEL_TEXT.projection})`
+      : `Next level: ${wholeNumber.format(plan.targetSpot)} (${LEVEL_TEXT[input.targetKind]})`;
+  return (
+    `Plan: sell if ${input.index} ${up ? 'falls below' : 'rises above'} ${wholeNumber.format(plan.stopSpot)} ` +
+    `(${up ? 'under the low' : 'over the high'} of the last two 5-minute candles) or the option falls to ` +
+    `${formatInr(plan.premiumStop)}, a planned loss of about ${formatInr(plan.maxLossInr)} on 1 lot after charges. ` +
+    `${target}, ${Math.round(plan.rewardPoints)} points away, worth about ${formatInr(plan.rewardPerUnit)} ` +
+    `on this option (${input.rewardToRisk.toFixed(1)}× the risk). ` +
+    `Once it reaches ${formatInr(plan.lockPrice)} (₹${params.profitLockInr} above the buy price), the exit moves up to ` +
+    `${formatInr(plan.lockPrice)}, locking about ${formatInr(plan.lockedProfitInr)} after charges; bigger gains keep ` +
+    `a growing share. Sell by ${formatClockTime(params.squareOffMinute)} at the latest.`
+  );
+}
 
 /** " or if NIFTY falls to 24,963 (0.15% against us)"; empty when the entry spot is unknown. */
 function indexStopText(
@@ -150,6 +243,31 @@ export function describeBuy(input: {
 }): string {
   const { candidate, fillPrice, params } = input;
   const direction = candidate.side === 'CE' ? 'rise' : 'fall';
+  const chartPlan = input.reading.chart?.plans[candidate.side];
+  const opening =
+    `Bought 1 lot (${candidate.lotSize} units) of ${describeContract(candidate)} at ${formatInr(fillPrice)} ` +
+    `at ${formatIstTime(input.now)}, betting that ${candidate.index} will ${direction}. `;
+  if (candidate.plan && chartPlan) {
+    const pick =
+      input.pickedBy === 'llm'
+        ? `The AI assistant chose this strike from ${input.candidateCount} that passed our checks.`
+        : input.pickedBy === 'only-candidate'
+          ? 'It was the only option that passed our checks.'
+          : `It was the best-ranked of ${input.candidateCount} options that passed our checks.`;
+    return finish(
+      opening +
+        `Why: ${joinReasons(supportingReasons(input.reading, candidate.side, 3))}. ` +
+        `${chartText(input.reading, candidate.side)}${pick} ` +
+        planText({
+          index: candidate.index,
+          side: candidate.side,
+          plan: candidate.plan,
+          targetKind: chartPlan.targetKind,
+          rewardToRisk: chartPlan.rewardToRisk,
+          params,
+        }),
+    );
+  }
   const stopPrice = fillPrice * (1 - params.stopLossPct / 100);
   const protectFrom = fillPrice * (1 + params.breakevenActivatePct / 100);
   const lockAt = fillPrice * (1 + params.breakevenLockPct / 100);
@@ -161,8 +279,7 @@ export function describeBuy(input: {
         ? 'It was the only option that passed our checks for price, trading costs and ease of trading.'
         : `It was the best-ranked of ${input.candidateCount} options that passed our checks.`;
   return finish(
-    `Bought 1 lot (${candidate.lotSize} units) of ${describeContract(candidate)} at ${formatInr(fillPrice)} ` +
-      `at ${formatIstTime(input.now)}, betting that ${candidate.index} will ${direction}. ` +
+    opening +
       `Why: ${joinReasons(supportingReasons(input.reading, candidate.side))}. ` +
       `${roomText(input.reading, candidate.side, params)}${pick} ` +
       `Plan: sell if the price falls to ${formatInr(stopPrice)} (−${params.stopLossPct}%)${indexStop}, ` +
@@ -207,7 +324,7 @@ export function describeHold(input: {
 }): string {
   const { position, params } = input;
   const contract = describeContract(position);
-  const stopPrice = position.entryPrice * (1 - params.stopLossPct / 100);
+  const stopPrice = position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
   const pnlPct = pctChange(position.entryPrice, input.price);
   if (input.price === null || pnlPct === null) {
     return finish(
@@ -221,14 +338,26 @@ export function describeHold(input: {
       : `, about ${formatSignedInr(input.netPnlInr)} on 1 lot after estimated charges`;
   const peakGainPct =
     pctChange(position.entryPrice, Math.max(position.peakPrice, input.price)) ?? 0;
-  const floor = profitFloor(peakGainPct, params);
+  const floor = profitFloor(peakGainPct, params, false, position.entryPrice);
   const floorPrice = floor ? position.entryPrice * (1 + floor.floorPct / 100) : null;
+  const lockPrice = position.entryPrice + params.profitLockInr;
+  const breakevenFrom = position.entryPrice * (1 + params.breakevenActivatePct / 100);
   const protection =
     floor === null || floorPrice === null
-      ? `profit protection starts at ${formatInr(position.entryPrice * (1 + params.breakevenActivatePct / 100))}`
-      : floor.kind === 'breakeven'
-        ? `the exit has moved up to ${formatInr(floorPrice)} so this trade cannot turn into a loss`
-        : `profit protection is on and sells below ${formatInr(floorPrice)}`;
+      ? lockPrice <= breakevenFrom
+        ? `the ₹${params.profitLockInr} profit lock starts at ${formatInr(lockPrice)}`
+        : `profit protection starts at ${formatInr(breakevenFrom)} and the ₹${params.profitLockInr} profit lock at ${formatInr(lockPrice)}`
+      : floor.kind === 'lock'
+        ? `the ₹${params.profitLockInr} profit lock is on, so it sells below ${formatInr(floorPrice)}`
+        : floor.kind === 'breakeven'
+          ? `the exit has moved up to ${formatInr(floorPrice)} so this trade cannot turn into a loss`
+          : `profit protection is on and sells below ${formatInr(floorPrice)}`;
+  const exits =
+    position.stopSpot !== null
+      ? `Exit if ${position.index} ${position.side === 'CE' ? 'falls below' : 'rises above'} ` +
+        `${wholeNumber.format(position.stopSpot)} or the option falls to ${formatInr(stopPrice)}`
+      : `Safety exit at ${formatInr(stopPrice)}` +
+        indexStopText(position.index, position.side, position.entrySpot, params);
   const support = input.reading ? supportingReasons(input.reading, position.side, 1) : [];
   const trend =
     support.length > 0
@@ -238,8 +367,7 @@ export function describeHold(input: {
         : '';
   return finish(
     `Holding ${contract}. Bought at ${formatInr(position.entryPrice)}, now ${formatInr(input.price)} ` +
-      `(${formatPct(pnlPct)}${money}).${trend} Safety exit at ${formatInr(stopPrice)}` +
-      `${indexStopText(position.index, position.side, position.entrySpot, params)}; ${protection}; ` +
+      `(${formatPct(pnlPct)}${money}).${trend} ${exits}; ${protection}; ` +
       `sells by ${formatClockTime(params.squareOffMinute)} at the latest.`,
   );
 }
@@ -247,14 +375,17 @@ export function describeHold(input: {
 const UNRESTORABLE_TEXT =
   'this open trade could not be rebuilt on start-up, so it was marked sold to keep one trade at a time';
 
-const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, peakPrice: number) => string> = {
+const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, position: OpenPosition) => string> = {
   'square-off': (p) =>
     `it is ${formatClockTime(p.squareOffMinute)}, when every position is closed so nothing is carried overnight`,
   'stale-position': () =>
     'this position was left open from an earlier day, so it was closed at the first chance',
-  'stop-loss': (p) => `the price fell to our safety limit (−${p.stopLossPct}% from the buy price)`,
-  'trailing-stop': (_, peakPrice) =>
-    `the price fell back from its best level of ${formatInr(peakPrice)}, so we locked in part of the gain`,
+  'stop-loss': (p, position) =>
+    position.premiumStop !== null
+      ? `the price fell to our planned loss limit of ${formatInr(position.premiumStop)}`
+      : `the price fell to our safety limit (−${p.stopLossPct}% from the buy price)`,
+  'trailing-stop': (_, position) =>
+    `the price fell back from its best level of ${formatInr(position.peakPrice)}, so we locked in part of the gain`,
   'time-stop': (p) =>
     `the option had not gained after ${p.timeStopMinutes} minutes, and options lose value as time passes`,
   'trend-reversal': () => 'the market turned against the trade',
@@ -264,9 +395,29 @@ const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, peakPrice: number) 
     `the index moved ${p.indexStopPct}% against the trade since we bought, so the reason for the trade no longer held`,
   'breakeven-stop': (p) =>
     `the option had gained ${p.breakevenActivatePct}% and then fell back to our break-even exit, so a winning trade was not allowed to turn into a loss`,
-  'level-reached': (_, peakPrice) =>
-    `the index reached a level many option sellers are betting it will not cross, and the price slipped from its best of ${formatInr(peakPrice)}, so we locked in most of the gain`,
+  'level-reached': (_, position) =>
+    `the index reached a level many option sellers are betting it will not cross, and the price slipped from its best of ${formatInr(position.peakPrice)}, so we locked in most of the gain`,
+  'chart-stop': (_, position) =>
+    position.stopSpot === null
+      ? 'the index broke the chart level that supported the trade'
+      : `${position.index} ${position.side === 'CE' ? 'fell below' : 'rose above'} ${wholeNumber.format(position.stopSpot)}, ` +
+        `past the ${position.side === 'CE' ? 'low' : 'high'} that supported the trade, so the chart no longer backed it`,
+  'profit-lock': (p, position) =>
+    `the option had gained ₹${p.profitLockInr} and slipped back to the profit lock at ${formatInr(position.entryPrice + p.profitLockInr)}, so the gain was kept`,
 };
+
+/** Planned loss on 1 lot at the premium stop, charges included; null without a planned stop. */
+function plannedLossInr(position: OpenPosition): number | null {
+  if (position.premiumStop === null || position.lotSize === null) {
+    return null;
+  }
+  const costs = estimateOptionsRoundTripCost({
+    buyPremium: position.entryPrice,
+    sellPremium: position.premiumStop,
+    quantity: position.lotSize,
+  });
+  return (position.entryPrice - position.premiumStop) * position.lotSize + costs.totalInr;
+}
 
 /** SELL for an open trade that start-up could not rebuild into a position. */
 export function describeUnrestorableExit(input: {
@@ -301,13 +452,18 @@ export function describeExit(input: {
         (input.netPnlInr === null
           ? ')'
           : `, about ${formatSignedInr(input.netPnlInr)} after estimated charges on 1 lot)`);
-  const reason = EXIT_TEXT[input.reason](input.params, position.peakPrice);
+  const reason = EXIT_TEXT[input.reason](input.params, position);
   const pricing = input.pricedAtSquareOff
     ? ` It is recorded at its ${formatClockTime(input.params.squareOffMinute)} price on the day it was bought, when it should have been sold.`
     : '';
+  const planned = plannedLossInr(position);
+  const plan =
+    planned !== null && input.netPnlInr !== null && input.netPnlInr < 0
+      ? ` The planned loss limit was about ${formatInr(planned)}.`
+      : '';
   return finish(
     `Sold ${describeContract(position)} ${result}. Reason: ${reason}. ` +
       `It was bought at ${formatInr(position.entryPrice)} at ${formatIstTime(position.enteredAt)} ` +
-      `and held for ${minutesBetween(position.enteredAt, input.now)} minutes.${pricing}`,
+      `and held for ${minutesBetween(position.enteredAt, input.now)} minutes.${pricing}${plan}`,
   );
 }

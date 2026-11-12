@@ -120,11 +120,12 @@ function toMinuteBars(bars: readonly IntradayBar[]): IntradayBar[] {
 }
 
 /**
- * 2026-10-21: the uptrend from the live-loop tests until 10:30, with heavy volume from 10:15
- * (the rules BUY a call on the first 5-minute slot after it), then a quiet drift to the close.
+ * 2026-10-21: the uptrend from the live-loop tests until 10:30, then a quiet drift to the close.
+ * The rules BUY a call at 10:10, once NIFTY is clear of the nearest call strike and a strong
+ * candle confirms; the trade is closed by the time stop before the ₹10 profit lock is reached.
  */
 function recordedDay(): MarketRecording {
-  const trend = uptrendFuturesBars({ yesterday: '2026-10-20', today: DAY, startPrice: 24_400 });
+  const trend = uptrendFuturesBars({ yesterday: '2026-10-20', today: DAY, startPrice: 24_796 });
   const fiveMinute = [...trend];
   let last = trend.at(-1)!;
   for (let slot = 15; slot < 75; slot += 1) {
@@ -362,16 +363,16 @@ describe('simulated replay of a day', () => {
       expect(row.decidedAt).toEqual(row.asOf);
     }
     const actions = rows.map((row) => row.action);
-    // Flat from 09:30: one SKIP per 5-minute slot until the 10:20 BUY.
+    // Flat from 09:30: one SKIP per 5-minute slot until the 10:10 BUY.
     const skipsBefore = rows.slice(0, actions.indexOf('BUY'));
     expect(skipsBefore.map((row) => (row.decidedAt as Date).toISOString())).toEqual(
-      Array.from({ length: 10 }, (_, slot) =>
+      Array.from({ length: 8 }, (_, slot) =>
         new Date(ist(DAY, '09:30').getTime() + slot * 5 * 60_000 + 20_000).toISOString(),
       ),
     );
     const buyIndex = actions.indexOf('BUY');
     expect(rows[buyIndex]).toMatchObject({ symbol: 'NIFTY26OCT25000CE' });
-    expect(rows[buyIndex]?.decidedAt).toEqual(new Date(ist(DAY, '10:20').getTime() + 20_000));
+    expect(rows[buyIndex]?.decidedAt).toEqual(new Date(ist(DAY, '10:10').getTime() + 20_000));
     // The open trade is reviewed every minute until it is sold.
     const exitIndex = actions.indexOf('EXIT');
     expect(exitIndex).toBeGreaterThan(buyIndex + 1);
@@ -424,7 +425,7 @@ describe('simulated replay of a day', () => {
     expect(firstHold).toMatchObject({
       simulationId: '00000000-0000-4000-8000-000000000002',
       symbol: 'NIFTY26OCT25000CE',
-      at: '2026-10-21 10:21:20',
+      at: '2026-10-21 10:11:20',
     });
     expect(firstHold).toHaveProperty('pnlPct');
     const firstSkip = decisionLines[0]?.[0];
@@ -489,7 +490,7 @@ describe('SimulationService', () => {
       expect(first.decisions.BUY).toBeGreaterThan(0);
       expect(first.trades[0]).toMatchObject({
         symbol: 'NIFTY26OCT25000CE',
-        buyAt: new Date(ist(DAY, '10:20').getTime() + 20_000).toISOString(),
+        buyAt: new Date(ist(DAY, '10:10').getTime() + 20_000).toISOString(),
       });
       expect(first.trades[0]?.exitReason).not.toBeNull();
       const calls = kite.getMinuteCandles.mock.calls.length;

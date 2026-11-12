@@ -2,6 +2,7 @@ import type { IndexOptionName } from '../instruments/kiteIndexUnderlyings.js';
 import type { OptionNewsRiskLevel } from '../options/greeksIv.js';
 import { atmStrike } from '../options/nfoChain.js';
 import type { IntradayBar } from '../universe/types.js';
+import { readChart, type ChartRead } from './chart.js';
 import { istClock } from './clock.js';
 import type { ChainQuote } from './contracts.js';
 import {
@@ -66,6 +67,8 @@ export type IndexReading = {
   signals: Signal[];
   rsi: number | null;
   lastCandle: { pattern: CandlePatternName; side: OptionSide | null };
+  /** Chart reading: structure, levels, the signal candle and a stop and target per side. */
+  chart: ChartRead | null;
   spot: number | null;
   futuresPrice: number | null;
   vwap: number | null;
@@ -340,13 +343,27 @@ export function readIndex(
     Vote
   >;
   const levels = optionLevels(data.chain, data.spot, params.bigLevelBufferPct);
+  const chart = readChart(
+    {
+      bars: data.futuresBars,
+      todayYmd: clock.ymd,
+      spot: data.spot,
+      futuresPrice: data.futuresPrice,
+      callWall: levels.callWall,
+      putWall: levels.putWall,
+    },
+    params.chart,
+  );
   return {
     index: data.index,
     score: signals.reduce((sum, item) => sum + item.vote, 0),
     votes,
     signals,
     rsi: rsi(closes),
-    lastCandle: classifyLastCandles(data.futuresBars.slice(-3)),
+    lastCandle: chart
+      ? { pattern: chart.candle.pattern, side: chart.candle.side }
+      : classifyLastCandles(todayBars.slice(-3)),
+    chart,
     spot: data.spot,
     futuresPrice: data.futuresPrice,
     vwap: data.futuresVwap,
