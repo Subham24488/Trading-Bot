@@ -387,8 +387,11 @@ export function buildContractPickMessages(input: {
   score: number;
   minutesToSquareOff: number;
   candidates: readonly ContractCandidate[];
+  /** Delta the rules prefer (candidates are ranked by it); 0.5 when not given. */
+  targetDelta?: number;
 }): Array<{ role: 'system' | 'user'; content: string }> {
   const kind = input.side === 'CE' ? 'call' : 'put';
+  const targetDelta = input.targetDelta ?? 0.5;
   return [
     {
       role: 'system',
@@ -396,7 +399,7 @@ export function buildContractPickMessages(input: {
         `You pick ONE NSE index option for an intraday ${kind} buy on ${input.index}. ` +
         'The decision to buy and the direction are already final; do not question them. ' +
         'Choose only a symbol from candidates[]. Prefer a tight bid-ask spread, deep open interest and volume, ' +
-        'delta near 0.5, a lower ivToHv (cheaper option), and a premium that can realistically move before the forced exit ' +
+        `delta near ${targetDelta}, a lower ivToHv (cheaper option), and a premium that can realistically move before the forced exit ` +
         `in ${input.minutesToSquareOff} minutes. ` +
         'Reply with JSON only: {"symbol": string, "reason": string}. reason: one plain-English sentence under 25 words. /no_think',
     },

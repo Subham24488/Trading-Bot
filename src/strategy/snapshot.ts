@@ -23,6 +23,8 @@ const chartSchema = z.object({
   }),
   support: nullableNumber,
   resistance: nullableNumber,
+  /** Distance from VWAP or the 21-bar average, in ATRs (pullback entries). */
+  valueGapAtr: nullableNumber.optional(),
 });
 
 /** Stop, target and money at risk for the contract bought (contracts.ts `ContractPlan`). */
@@ -39,6 +41,8 @@ const entryPlanSchema = z.object({
   lockPrice: z.number(),
   maxLossInr: z.number(),
   lockedProfitInr: z.number(),
+  targetPrice: nullableNumber.optional(),
+  targetProfitInr: nullableNumber.optional(),
 });
 
 /**

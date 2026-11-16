@@ -53,6 +53,10 @@ export type ContractPlan = {
   maxLossInr: number;
   /** Profit on 1 lot if sold at `lockPrice`, after charges. */
   lockedProfitInr: number;
+  /** Buy price + the ₹ take-profit; null when there is no take-profit. */
+  targetPrice: number | null;
+  /** Profit on 1 lot if sold at `targetPrice`, after charges. */
+  targetProfitInr: number | null;
 };
 
 export type PlanRejectionCode = 'target-out-of-reach' | 'risk-too-wide';
@@ -98,9 +102,11 @@ function formatRupees(value: number): string {
 }
 
 /**
- * The ₹ profit-lock check and the loss limit for one contract. The option must be able to gain
- * `profitLockInr` before the target (and the move that needs must be a normal one), and the
- * loss at the chart stop must stay within `maxRiskPerUnitInr`.
+ * The ₹ room check and the loss limit for one contract. The move the ₹ take-profit (or the ₹
+ * profit lock without one) needs must be of normal size, and outside pullback mode the option
+ * must also be able to gain it before the next level. The stop is fixed at `stopLossInr` below
+ * the buy price; with `stopLossInr` 0 it comes from the chart stop and must stay within
+ * `maxRiskPerUnitInr`.
  */
 function planContract(
   row: { ask: number; bid: number; lotSize: number },
@@ -110,25 +116,29 @@ function planContract(
 ): { plan: ContractPlan } | { code: PlanRejectionCode; reason: string } {
   const spread = row.ask - row.bid;
   const rewardPerUnit = delta * plan.rewardPoints - spread;
-  if (rewardPerUnit < params.profitLockInr) {
+  const needed = params.takeProfitInr > 0 ? params.takeProfitInr : params.profitLockInr;
+  // Pullback entries are bought just after the price turned at value, with the swing it came
+  // from close ahead; only a dead market (the move below) stops them.
+  if (params.entryMode !== 'pullback' && rewardPerUnit < needed) {
     return {
       code: 'target-out-of-reach',
       reason:
         `the next level is worth only about ${formatRupees(Math.max(rewardPerUnit, 0))} on it, ` +
-        `short of the ₹${params.profitLockInr} target`,
+        `short of the ₹${needed} target`,
     };
   }
-  const pointsForLock = (params.profitLockInr + spread) / delta;
-  if (pointsForLock > params.chart.maxTargetAtr * plan.atr) {
+  const pointsForTarget = (needed + spread) / delta;
+  if (pointsForTarget > params.chart.maxTargetAtr * plan.atr) {
     return {
       code: 'target-out-of-reach',
       reason:
-        `₹${params.profitLockInr} needs a ${Math.round(pointsForLock)}-point move, more than ` +
+        `₹${needed} needs a ${Math.round(pointsForTarget)}-point move, more than ` +
         `${params.chart.maxTargetAtr} normal 5-minute swings`,
     };
   }
-  const riskPerUnit = delta * plan.riskPoints + spread;
-  if (riskPerUnit > params.maxRiskPerUnitInr) {
+  const fixedStop = params.stopLossInr > 0;
+  const riskPerUnit = fixedStop ? params.stopLossInr : delta * plan.riskPoints + spread;
+  if (!fixedStop && riskPerUnit > params.maxRiskPerUnitInr) {
     return {
       code: 'risk-too-wide',
       reason:
@@ -137,9 +147,20 @@ function planContract(
     };
   }
   const widest = row.ask * (1 - params.stopLossPct / 100);
-  const onTick = Math.floor((row.ask - riskPerUnit) / TICK + 1e-6) * TICK;
+  // A fixed ₹ stop rounds up to the tick so the loss never exceeds it; a chart stop rounds down.
+  const ticks = (row.ask - riskPerUnit) / TICK;
+  const onTick = (fixedStop ? Math.ceil(ticks - 1e-6) : Math.floor(ticks + 1e-6)) * TICK;
   const premiumStop = round2(Math.max(widest, onTick));
   const lockPrice = round2(row.ask + params.profitLockInr);
+  const targetPrice = params.takeProfitInr > 0 ? round2(row.ask + params.takeProfitInr) : null;
+  const atTarget =
+    targetPrice === null
+      ? null
+      : estimateOptionsRoundTripCost({
+          buyPremium: row.ask,
+          sellPremium: targetPrice,
+          quantity: row.lotSize,
+        });
   const atStop = estimateOptionsRoundTripCost({
     buyPremium: row.ask,
     sellPremium: premiumStop,
@@ -162,6 +183,11 @@ function planContract(
       lockPrice,
       maxLossInr: round2((row.ask - premiumStop) * row.lotSize + atStop.totalInr),
       lockedProfitInr: round2((lockPrice - row.ask) * row.lotSize - atLock.totalInr),
+      targetPrice,
+      targetProfitInr:
+        targetPrice === null || atTarget === null
+          ? null
+          : round2((targetPrice - row.ask) * row.lotSize - atTarget.totalInr),
     },
   };
 }
@@ -183,7 +209,7 @@ function moneynessOf(side: OptionSide, strike: number, atm: number): Moneyness {
 
 /**
  * Liquid, fairly priced contracts near the money for the side the rules chose,
- * best first: delta closest to 0.5, then tightest spread, then deepest open interest.
+ * best first: delta closest to `targetDelta`, then tightest spread, then deepest open interest.
  * With a chart `plan`, each contract also needs room for the ₹ profit lock and a loss at the
  * chart stop within the limit; those rejections carry a `code`.
  */
@@ -308,7 +334,7 @@ export function buildCandidates(
 
   accepted.sort(
     (left, right) =>
-      Math.abs(left.delta - 0.5) - Math.abs(right.delta - 0.5) ||
+      Math.abs(left.delta - params.targetDelta) - Math.abs(right.delta - params.targetDelta) ||
       left.spreadPct - right.spreadPct ||
       right.oi - left.oi,
   );

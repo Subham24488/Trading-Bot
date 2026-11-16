@@ -395,7 +395,13 @@ type StoredRow = Record<string, unknown> & {
     exit?: { reason: string };
     readings?: Array<{ index: string; chart?: { atr: number } | null }>;
     entry?: {
-      plan?: { stopSpot: number; premiumStop: number; maxLossInr: number; lockPrice: number };
+      plan?: {
+        stopSpot: number;
+        premiumStop: number;
+        maxLossInr: number;
+        lockPrice: number;
+        targetPrice?: number | null;
+      };
     };
     position?: { stopSpot?: number | null; premiumStop?: number | null };
   };
@@ -471,7 +477,8 @@ async function optionsAdvisorScenario() {
         quotes[key] = {
           ...base,
           lastPrice: futuresPrice,
-          vwap: futuresPrice - 30,
+          // Just above today's average price: the trend has come back to value (a pullback).
+          vwap: futuresPrice - 5,
           oi: 10_000_000,
         };
       } else if (key.startsWith('NFO:NIFTY26OCT')) {
@@ -626,6 +633,10 @@ describe('LlmTradeAdvisorService safety', () => {
       // The chart plan: a stop under the setup, a loss within ₹15 a unit, the ₹10 lock.
       const plan = (stored.marketSnapshot as StoredRow['marketSnapshot']).entry?.plan;
       expect(plan?.lockPrice).toBeCloseTo(ask + 10, 2);
+      expect(plan?.targetPrice).toBeCloseTo(ask + 15, 2);
+      // The fixed ₹10 stop, on the ₹0.05 tick.
+      expect(ask - (plan?.premiumStop ?? 0)).toBeLessThanOrEqual(10 + 1e-9);
+      expect(ask - (plan?.premiumStop ?? 0)).toBeGreaterThan(9.95 - 1e-9);
       expect(plan?.premiumStop).toBeLessThan(ask);
       expect(plan?.premiumStop).toBeGreaterThanOrEqual(ask - 15);
       expect(plan?.maxLossInr).toBeLessThan(15 * 65 + 100);
@@ -724,9 +735,10 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       const [buy] = storedRows();
       expect(buy).toMatchObject({ action: 'BUY', symbol: 'NIFTY26OCT25000CE' });
 
-      // In profit, so no exit rule fires. 14:45 is after the last entry time, where a flat
-      // book would store a SKIP; with the trade open it must be a HOLD.
-      setOptionPriceFactor(1.1);
+      // In profit (+8%: past the ₹10 lock, short of the ₹15 target), so no exit rule fires.
+      // 14:45 is after the last entry time, where a flat book would store a SKIP; with the
+      // trade open it must be a HOLD.
+      setOptionPriceFactor(1.08);
       for (const time of ['10:31', '12:00', '14:45']) {
         vi.setSystemTime(ist('2026-10-21', time));
         await advisor.runDecisionCycle();
@@ -788,7 +800,7 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       const stopSpot = storedRows()[0]?.marketSnapshot.entry?.plan?.stopSpot ?? NaN;
       // Under the low of the last two 5-minute candles by a quarter of a normal swing.
       expect(stopSpot).toBeCloseTo(24_982.72, 1);
-      expect(storedRows()[0]?.rationale).toContain('sell if NIFTY falls below 24,983');
+      expect(storedRows()[0]?.rationale).toContain('or earlier if NIFTY falls below 24,983');
 
       setNiftySpot(24_984);
       vi.setSystemTime(ist('2026-10-21', '10:31'));
@@ -952,6 +964,27 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
     }
   });
 
+  it('keeps trading after a smaller win, below the ₹1,500 day target', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      const { advisor, setOptionPriceFactor } = await optionsAdvisorScenario();
+      await advisor.startDecisionLoop(['NIFTY']);
+      advisor.stop();
+      // +10% is about +₹15.4: the ₹15 target sells it, roughly ₹930 after charges.
+      setOptionPriceFactor(1.1);
+      vi.setSystemTime(ist('2026-10-21', '10:31'));
+      await advisor.runDecisionCycle();
+      expect(storedRows()[1]?.marketSnapshot.exit?.reason).toBe('target-reached');
+      setOptionPriceFactor(1);
+      vi.setSystemTime(ist('2026-10-21', '11:05'));
+      await advisor.runDecisionCycle();
+      expect(storedRows()[2]).toMatchObject({ action: 'BUY' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stops buying for the day once a closed trade leaves the day in profit', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
@@ -960,18 +993,16 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
 
-      // Best +30%, then back to +10%: the trailing stop sells at a profit.
+      // A +30% jump sells at once on the ₹15 target, about ₹2,900 on the lot after charges.
       setOptionPriceFactor(1.3);
       vi.setSystemTime(ist('2026-10-21', '10:31'));
       await advisor.runDecisionCycle();
-      setOptionPriceFactor(1.1);
-      vi.setSystemTime(ist('2026-10-21', '10:32'));
-      await advisor.runDecisionCycle();
-      const exit = storedRows()[2];
-      expect(exit?.marketSnapshot.exit?.reason).toBe('trailing-stop');
-      expect(Number(exit?.sellPrice)).toBeGreaterThan(Number(exit?.buyPrice));
+      const exit = storedRows()[1];
+      expect(exit?.marketSnapshot.exit?.reason).toBe('target-reached');
+      expect(Number(exit?.sellPrice) - Number(exit?.buyPrice)).toBeGreaterThanOrEqual(15);
 
-      // Past the cool-down, the same market would buy again; the green day stays green.
+      // Past the cool-down, the same market would buy again; the day is up over ₹1,500.
+      setOptionPriceFactor(1);
       vi.setSystemTime(ist('2026-10-21', '11:15'));
       await advisor.runDecisionCycle();
       expect(storedRows().at(-1)).toMatchObject({
@@ -979,7 +1010,7 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
         marketSnapshot: { blockedBy: ['day-in-profit'] },
       });
       expect(storedRows().at(-1)?.rationale).toContain(
-        "today's closed trades are already in profit",
+        "today's closed trades are already up more than ₹1,500.00",
       );
     } finally {
       vi.useRealTimers();

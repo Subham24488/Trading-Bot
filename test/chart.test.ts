@@ -9,7 +9,7 @@ import {
   swingPoints,
   trailStopSpot,
 } from '../src/strategy/chart.js';
-import { classifyLastCandles } from '../src/strategy/indicators.js';
+import { classifyLastCandles, ema } from '../src/strategy/indicators.js';
 import { DEFAULT_STRATEGY } from '../src/strategy/params.js';
 import type { IntradayBar } from '../src/universe/types.js';
 import { fiveMinuteBars, ist, steppingBars } from './marketFixtures.js';
@@ -31,14 +31,25 @@ function fromHighsLows(highs: readonly number[], lows: readonly number[]): Intra
  * A slide from 25,100 to 25,000 yesterday, then six rising bars today to 25,030; every bar is
  * 10 points tall, so the ATR is exactly 10. Futures trade 50 above spot (24,980).
  */
-function risingMorning(lastBar?: readonly [number, number, number, number, number?]) {
+function risingMorning(
+  lastBar?: readonly [number, number, number, number, number?],
+  vwap: number | null = null,
+) {
   const today = steppingBars(DAY, '09:15', 25_000, 5, 6);
   const bars = [...steppingBars(PREV, '09:15', 25_100, -5, 20), ...today];
   if (lastBar) {
     bars[bars.length - 1] = fiveMinuteBars(DAY, '09:40', [lastBar])[0]!;
   }
   return readChart(
-    { bars, todayYmd: DAY, spot: 24_980, futuresPrice: 25_030, callWall: null, putWall: null },
+    {
+      bars,
+      todayYmd: DAY,
+      spot: 24_980,
+      futuresPrice: 25_030,
+      callWall: null,
+      putWall: null,
+      vwap,
+    },
     params,
   );
 }
@@ -168,6 +179,26 @@ describe('readChart', () => {
     const today = [...bars, ...steppingBars(DAY, '09:15', 25_000, 5, 2)];
     expect(readChart({ ...base, bars: today }, params)).not.toBeNull();
     expect(readChart({ ...base, bars: today, spot: null }, params)).toBeNull();
+  });
+
+  it('measures how far the price is from value: the nearer of VWAP and the 21-bar average', () => {
+    expect(risingMorning()?.valueGapAtr).toBeNull();
+    // VWAP 3 points under the futures price, with a 10-point ATR.
+    expect(risingMorning(undefined, 25_027)?.valueGapAtr).toBeCloseTo(0.3);
+    const closes = [
+      ...steppingBars(PREV, '09:15', 25_100, -5, 20),
+      ...steppingBars(DAY, '09:15', 25_000, 5, 6),
+    ].map((bar) => bar.c);
+    // A VWAP far away leaves the 21-bar average as the nearer value.
+    expect(risingMorning(undefined, 24_800)?.valueGapAtr).toBeCloseTo(
+      Math.abs(25_030 - ema(closes, 21)!) / 10,
+    );
+  });
+
+  it('confirms the candle shape without the volume for pullback entries', () => {
+    const quiet = risingMorning([25_025, 25_032.5, 25_022.5, 25_030, 500]);
+    expect(quiet?.candle).toMatchObject({ confirms: null, shapeConfirms: 'CE', volumeRatio: 0.5 });
+    expect(risingMorning([25_025, 25_032.5, 25_022.5, 25_027])?.candle.shapeConfirms).toBeNull();
   });
 
   it('trails a stop only from swings that formed after the entry', () => {

@@ -120,8 +120,8 @@ export function indexPath(rows: readonly ReviewRow[], after: Date, index: string
 
 /**
  * Rough option price path: premium + delta × index move (time decay ignored), run through
- * the stop-loss, profit floor (₹ profit lock, break-even lock and stepped trailing stop), time
- * stop and square-off rules.
+ * the stop-loss (the fixed ₹ stop when set), the ₹ take-profit, the profit floor (₹ profit
+ * lock, break-even lock and stepped trailing stop), time stop and square-off rules.
  */
 export function simulateExitRules(
   start: { premium: number; delta: number; side: OptionSide; spot: number; at: Date },
@@ -132,6 +132,11 @@ export function simulateExitRules(
     return null;
   }
   const direction = start.side === 'CE' ? 1 : -1;
+  const fixedStopPct =
+    params.stopLossInr > 0 ? (params.stopLossInr / start.premium) * 100 : Infinity;
+  const stopPct = Math.min(params.stopLossPct, fixedStopPct);
+  const targetPct =
+    params.takeProfitInr > 0 ? (params.takeProfitInr / start.premium) * 100 : Infinity;
   let peak = start.premium;
   let latestPct = 0;
   for (const point of path) {
@@ -142,8 +147,11 @@ export function simulateExitRules(
     peak = Math.max(peak, estimate);
     latestPct = pctChange(start.premium, estimate) ?? 0;
     const bestPct = pctChange(start.premium, peak) ?? 0;
-    if (latestPct <= -params.stopLossPct) {
+    if (latestPct <= -stopPct) {
       return { pnlPct: latestPct, bestPct, reason: 'stop-loss' };
+    }
+    if (latestPct >= targetPct) {
+      return { pnlPct: latestPct, bestPct, reason: 'target-reached' };
     }
     const floor = profitFloor(bestPct, params, false, start.premium);
     if (floor && latestPct < floor.floorPct) {

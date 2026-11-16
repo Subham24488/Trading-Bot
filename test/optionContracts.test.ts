@@ -7,8 +7,14 @@ import {
   nearestFuture,
   parseNfoIndexOptions,
 } from '../src/options/nfoChain.js';
-import { buildCandidates, type ChainQuote } from '../src/strategy/contracts.js';
-import { DEFAULT_STRATEGY } from '../src/strategy/params.js';
+import { estimateOptionsRoundTripCost } from '../src/llm/optionTradeCosts.js';
+import {
+  buildCandidates,
+  type ChainQuote,
+  type TradePlanInput,
+} from '../src/strategy/contracts.js';
+import { DEFAULT_STRATEGY, type StrategyParams } from '../src/strategy/params.js';
+import { MOMENTUM_RULES } from './marketFixtures.js';
 
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 
@@ -32,7 +38,11 @@ function callQuote(strike: number, overrides: Partial<ChainQuote> = {}): ChainQu
   };
 }
 
-function candidatesFor(chain: ChainQuote[]) {
+function candidatesFor(
+  chain: ChainQuote[],
+  params: StrategyParams = DEFAULT_STRATEGY,
+  plan?: TradePlanInput,
+) {
   return buildCandidates(
     {
       chain,
@@ -42,10 +52,13 @@ function candidatesFor(chain: ChainQuote[]) {
       step: 50,
       todayYmd: '2026-10-21',
       indexDaily: [],
+      ...(plan ? { plan } : {}),
     },
-    DEFAULT_STRATEGY,
+    params,
   );
 }
+
+const nearMoney = () => [24_900, 24_950, 25_000, 25_050, 25_100].map((strike) => callQuote(strike));
 
 describe('expiry and futures selection', () => {
   it('can skip a contract that expires today', () => {
@@ -101,15 +114,18 @@ describe('expiry and futures selection', () => {
 });
 
 describe('buildCandidates', () => {
-  it('keeps liquid, fairly priced strikes near the money, closest to at-the-money first', () => {
-    const { candidates, rejected } = candidatesFor([
-      callQuote(24_850),
-      callQuote(24_900),
-      callQuote(24_950, { bid: 150, ask: 160 }),
-      callQuote(25_000),
-      callQuote(25_050, { oi: 500 }),
-      callQuote(25_100),
-    ]);
+  it('keeps liquid, fairly priced strikes near the money, at-the-money first under the earlier rules', () => {
+    const { candidates, rejected } = candidatesFor(
+      [
+        callQuote(24_850),
+        callQuote(24_900),
+        callQuote(24_950, { bid: 150, ask: 160 }),
+        callQuote(25_000),
+        callQuote(25_050, { oi: 500 }),
+        callQuote(25_100),
+      ],
+      MOMENTUM_RULES,
+    );
     expect(candidates[0]).toMatchObject({
       symbol: 'NIFTY26OCT25000CE',
       moneyness: 'at the money',
@@ -125,6 +141,74 @@ describe('buildCandidates', () => {
         { symbol: 'NIFTY26OCT25050CE', reason: 'too little trading interest' },
       ]),
     );
+  });
+});
+
+describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
+  const plan: TradePlanInput = {
+    stopSpot: 24_980,
+    targetSpot: 25_080,
+    riskPoints: 20,
+    rewardPoints: 80,
+    atr: 15,
+  };
+
+  it('ranks the strike with delta nearest 0.40 first: one strike out of the money', () => {
+    const { candidates } = candidatesFor(nearMoney(), DEFAULT_STRATEGY, plan);
+    expect(candidates[0]).toMatchObject({
+      symbol: 'NIFTY26OCT25100CE',
+      moneyness: 'out of the money',
+    });
+    expect(candidates[0]!.delta).toBeGreaterThan(0.38);
+    expect(candidates[0]!.delta).toBeLessThan(0.46);
+  });
+
+  it('puts the stop ₹10 under the buy price on the tick, and the target ₹15 over it', () => {
+    const { candidates } = candidatesFor(nearMoney(), DEFAULT_STRATEGY, plan);
+    for (const candidate of candidates) {
+      const stopped = candidate.plan!;
+      // Rounded up to the ₹0.05 tick, so the loss is at most ₹10.
+      expect(candidate.ask - stopped.premiumStop).toBeLessThanOrEqual(10 + 1e-9);
+      expect(candidate.ask - stopped.premiumStop).toBeGreaterThan(9.95 - 1e-9);
+      expect(Math.round(stopped.premiumStop * 20)).toBeCloseTo(stopped.premiumStop * 20, 6);
+      expect(stopped.riskPerUnit).toBe(10);
+      expect(stopped.targetPrice).toBeCloseTo(candidate.ask + 15, 2);
+      const atStop = estimateOptionsRoundTripCost({
+        buyPremium: candidate.ask,
+        sellPremium: stopped.premiumStop,
+        quantity: 65,
+      });
+      expect(stopped.maxLossInr).toBeCloseTo(
+        (candidate.ask - stopped.premiumStop) * 65 + atStop.totalInr,
+        1,
+      );
+      expect(stopped.targetProfitInr).toBeGreaterThan(15 * 65 - 100);
+    }
+  });
+
+  it('needs a normal-sized move for ₹15; a near level or a far chart stop no longer rejects', () => {
+    // Pullback entries: 13 points to the next level is fine (the 11-13 winners went through).
+    const near = candidatesFor(nearMoney(), DEFAULT_STRATEGY, { ...plan, rewardPoints: 13 });
+    expect(near.candidates.length).toBeGreaterThan(0);
+    // The earlier vote-led rules still want room: 30 points is about ₹13, short of ₹15.
+    const momentumTarget = { ...MOMENTUM_RULES, takeProfitInr: 15 };
+    const short = candidatesFor(nearMoney(), momentumTarget, { ...plan, rewardPoints: 30 });
+    expect(short.rejected.find((item) => item.symbol === 'NIFTY26OCT25100CE')).toMatchObject({
+      code: 'target-out-of-reach',
+      reason: expect.stringContaining('short of the ₹15 target'),
+    });
+    // A dead market: ₹15 needs ~36 points, more than 3 swings of 10.
+    const quiet = candidatesFor(nearMoney(), DEFAULT_STRATEGY, { ...plan, atr: 10 });
+    expect(quiet.rejected.find((item) => item.symbol === 'NIFTY26OCT25100CE')).toMatchObject({
+      code: 'target-out-of-reach',
+      reason: expect.stringContaining('normal 5-minute swings'),
+    });
+    // A 60-point chart stop is beyond the ₹15 limit under the earlier rules, but not with ₹10.
+    const far = { ...plan, riskPoints: 60 };
+    expect(candidatesFor(nearMoney(), DEFAULT_STRATEGY, far).candidates.length).toBeGreaterThan(0);
+    expect(candidatesFor(nearMoney(), MOMENTUM_RULES, far).rejected[0]).toMatchObject({
+      code: 'risk-too-wide',
+    });
   });
 });
 

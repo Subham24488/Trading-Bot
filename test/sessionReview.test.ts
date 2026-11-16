@@ -28,8 +28,10 @@ const { buildSkipEpisodes, buildTrades, simulateExitRules } =
 const { evaluateRules, ruleMinSamples } = await import('../src/review/enhancementRules.js');
 const { emptyLedger, planLedgerUpdate } = await import('../src/review/enhancementLedger.js');
 const { reviewTradingSessions } = await import('../src/review/sessionReview.js');
+const { MOMENTUM_RULES } = await import('./marketFixtures.js');
 
-const params = DEFAULT_STRATEGY;
+/** The analyses below were written for the earlier rules; the last what-if uses the defaults. */
+const params = MOMENTUM_RULES;
 
 function ist(time: string, ymd = '2026-10-21'): Date {
   return new Date(`${ymd}T${time}:00+05:30`);
@@ -264,6 +266,26 @@ describe('simulateExitRules', () => {
         params,
       ),
     ).toMatchObject({ reason: 'breakeven-stop' });
+  });
+});
+
+describe('simulateExitRules with the fixed ₹10 stop and ₹15 take-profit', () => {
+  const start = { premium: 150, delta: 0.5, side: 'CE' as const, spot: 25_000, at: ist('10:00') };
+  const path = (moves: Array<[string, number]>) =>
+    moves.map(([time, spot]) => ({ at: ist(time), spot }));
+
+  it('sells at +₹15 and at −₹10, whatever the percentage', () => {
+    // Index +32 points: the option is about ₹16 up, past the ₹15 target.
+    expect(simulateExitRules(start, path([['10:05', 25_032]]), DEFAULT_STRATEGY)).toMatchObject({
+      reason: 'target-reached',
+    });
+    // Index −20 points: ₹10 down, −6.7%, well inside the −20% limit but at the ₹10 stop.
+    expect(simulateExitRules(start, path([['10:05', 24_980]]), DEFAULT_STRATEGY)).toMatchObject({
+      reason: 'stop-loss',
+    });
+    expect(simulateExitRules(start, path([['10:05', 24_980]]), params)).toMatchObject({
+      reason: 'end-of-day data',
+    });
   });
 });
 

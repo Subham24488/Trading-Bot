@@ -1150,6 +1150,7 @@ export class LlmTradeAdvisorService {
         score: entry.score,
         minutesToSquareOff: this.params.squareOffMinute - istClock(now).minute,
         candidates,
+        targetDelta: this.params.targetDelta,
       },
       this.logger,
     );
@@ -1534,6 +1535,7 @@ export class LlmTradeAdvisorService {
             stopSpot: plan.stopSpot,
             premiumStop: plan.premiumStop,
             lockPrice: plan.lockPrice,
+            targetPrice: plan.targetPrice,
             maxLossInr: plan.maxLossInr,
             rewardToRisk: plan.rewardToRisk,
           }
@@ -1877,6 +1879,7 @@ export class LlmTradeAdvisorService {
               },
               support: round(reading.chart.support?.price ?? null),
               resistance: round(reading.chart.resistance?.price ?? null),
+              valueGapAtr: round(reading.chart.valueGapAtr),
             }
           : null,
       })),

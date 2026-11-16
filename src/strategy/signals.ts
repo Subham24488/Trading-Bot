@@ -351,6 +351,7 @@ export function readIndex(
       futuresPrice: data.futuresPrice,
       callWall: levels.callWall,
       putWall: levels.putWall,
+      vwap: data.futuresVwap,
     },
     params.chart,
   );

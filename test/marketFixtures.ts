@@ -1,4 +1,19 @@
+import { DEFAULT_STRATEGY, type StrategyParams } from '../src/strategy/params.js';
 import type { IntradayBar } from '../src/universe/types.js';
+
+/**
+ * The rules before 2026-11-16, still available through the parameters: the 8 votes pick the
+ * side, the stop comes from the chart, there is no take-profit, ranking prefers delta 0.5 and
+ * one green trade ends the day.
+ */
+export const MOMENTUM_RULES: StrategyParams = {
+  ...DEFAULT_STRATEGY,
+  entryMode: 'momentum',
+  stopLossInr: 0,
+  takeProfitInr: 0,
+  targetDelta: 0.5,
+  dayProfitLockInr: 0,
+};
 
 export function ist(ymd: string, hhmm: string): Date {
   return new Date(`${ymd}T${hhmm}:00+05:30`);

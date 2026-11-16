@@ -31,9 +31,17 @@ import {
   type SignalName,
   type Vote,
 } from '../src/strategy/signals.js';
-import { fiveMinuteBars, ist, steppingBars, uptrendFuturesBars } from './marketFixtures.js';
+import {
+  fiveMinuteBars,
+  ist,
+  MOMENTUM_RULES,
+  steppingBars,
+  uptrendFuturesBars,
+} from './marketFixtures.js';
 
-const params = DEFAULT_STRATEGY;
+/** Most suites check the earlier vote-led rules; the pullback suites use the defaults. */
+const params = MOMENTUM_RULES;
+const current = DEFAULT_STRATEGY;
 const JARGON = /\b(VWAP|EMA|RSI|PCR|OI|delta|IV)\b/i;
 
 function chainRow(
@@ -398,6 +406,7 @@ function chartRead(
       pattern: 'bull_marubozu',
       side: 'CE',
       confirms: 'CE',
+      shapeConfirms: 'CE',
       closeLocation: 0.9,
       rangeAtr: 1.1,
       volumeRatio: 1.4,
@@ -408,6 +417,7 @@ function chartRead(
     plans: { CE: sidePlan('CE'), PE: sidePlan('PE') },
     basis: 60,
     swings: { highs: [], lows: [] },
+    valueGapAtr: 0.3,
     ...rest,
   };
 }
@@ -512,6 +522,17 @@ describe('chart gates', () => {
     );
     // Stop above the last two candles is ~64 points away; the put wall is 55 points down.
     expect(decision).toMatchObject({ action: 'SKIP', blockedBy: ['chasing', 'low-reward'] });
+    // The pullback rules skip it too: no clear 15-minute trend, and nothing came back to value.
+    const pullback = decideEntry(
+      {
+        now: ist('2026-11-09', '10:45'),
+        readings: [reading({ spot: 24_855.15, rsi: 33, putWall: 24_800, callWall: 25_000, chart })],
+        day: quietDay,
+        vixPct: -6,
+      },
+      current,
+    );
+    expect(pullback.action === 'SKIP' && pullback.blockedBy).toContain('no-pullback');
   });
 
   it('does not buy the 2026-11-11 call three points under the hour’s high', () => {
@@ -560,6 +581,120 @@ describe('chart gates', () => {
       params,
     );
     expect(decision).toMatchObject({ action: 'SKIP', blockedBy: ['near-chart-level'] });
+    const pullback = decideEntry(
+      {
+        now: ist('2026-11-11', '11:20'),
+        readings: [reading({ spot: 25_384.5, callWall: 25_500, putWall: 25_300, chart })],
+        day: quietDay,
+        vixPct: 0,
+      },
+      current,
+    );
+    expect(pullback.action === 'SKIP' && pullback.blockedBy).toContain('no-pullback');
+  });
+});
+
+describe('pullback entries (the defaults)', () => {
+  const now = ist('2026-11-13', '10:55');
+  /** 11-13 10:55: the 15-minute trend was down and NIFTY had bounced back to its average. */
+  const bounceInDowntrend = (
+    chart: Partial<Omit<ChartRead, 'candle'>> & {
+      candle?: Partial<ChartRead['candle']>;
+    } = {},
+  ) =>
+    chartRead({
+      higherTrend: 'down',
+      structure: 'up',
+      valueGapAtr: 0.2,
+      burstAtr: -0.5,
+      ...chart,
+      candle: {
+        pattern: 'bear_marubozu',
+        side: 'PE',
+        confirms: null,
+        shapeConfirms: 'PE',
+        volumeRatio: 0.45,
+        ...chart.candle,
+      },
+    });
+  // The bounce turned the price votes up: +5, the way the real 10:55 reading looked.
+  const bullishVotes = {
+    averagePrice: 1,
+    trend: 1,
+    openingRange: 1,
+    volume: 1,
+    optionFlow: 1,
+    futuresPositioning: 0,
+    breadth: 0,
+    globalMood: 0,
+  } as const;
+  const decide = (chart: ChartRead, votes: Partial<Record<SignalName, Vote>> = bullishVotes) =>
+    decideEntry(
+      {
+        now,
+        readings: [
+          reading({
+            votes,
+            rsi: 55,
+            chart,
+            lastCandle: { pattern: chart.candle.pattern, side: chart.candle.side },
+          }),
+        ],
+        day: quietDay,
+        vixPct: 0,
+      },
+      current,
+    );
+
+  it('buys a put on a bounce to value in a 15-minute downtrend, whatever the price votes say', () => {
+    // Swings up and below-usual volume no longer block a pullback.
+    expect(decide(bounceInDowntrend())).toMatchObject({ action: 'BUY', side: 'PE' });
+  });
+
+  it.each([
+    ['without a clear 15-minute trend', bounceInDowntrend({ higherTrend: 'flat' }), 'no-pullback'],
+    ['before the price is back near value', bounceInDowntrend({ valueGapAtr: 0.8 }), 'no-pullback'],
+    [
+      'without a candle turning back down',
+      bounceInDowntrend({ candle: { shapeConfirms: null } }),
+      'no-candle-confirmation',
+    ],
+    ['on a climax run down', bounceInDowntrend({ burstAtr: -3 }), 'chasing'],
+  ] as const)('skips %s', (_label, chart, gate) => {
+    const decision = decide(chart);
+    expect(decision.action === 'SKIP' && decision.blockedBy).toContain(gate);
+  });
+
+  it('ignores a swing level just ahead and a short room to it', () => {
+    // 11-13 10:55: a swing low 13 points below; the put still reached +₹15.
+    const crowded = bounceInDowntrend({
+      plan: {
+        nearLevel: { price: 24_998, kind: 'swing-low' },
+        rewardPoints: 13,
+        rewardToRisk: 0.6,
+      },
+    });
+    expect(decide(crowded)).toMatchObject({ action: 'BUY', side: 'PE' });
+  });
+
+  it('lets only the market backdrop votes block it: two against is too many', () => {
+    // Option flow already points up; large stocks rising as well makes two against the put.
+    expect(decide(bounceInDowntrend(), { ...bullishVotes, breadth: 1 })).toMatchObject({
+      action: 'SKIP',
+      blockedBy: ['too-many-opposing'],
+    });
+    expect(decide(bounceInDowntrend(), bullishVotes)).toMatchObject({ action: 'BUY' });
+  });
+
+  it('records the trend side as the leaning and says so in plain words', () => {
+    const decision = decide(bounceInDowntrend({ valueGapAtr: 0.8 }));
+    expect(decision).toMatchObject({ action: 'SKIP', leaning: { side: 'PE' } });
+    if (decision.action === 'SKIP') {
+      const text = describeSkip({ now, ...decision, params: current });
+      expect(text).toContain('The 15-minute trend for NIFTY points down');
+      expect(text).toContain('come back to its average');
+      expect(text).not.toMatch(JARGON);
+    }
   });
 });
 
@@ -778,6 +913,55 @@ describe('checkPositionExit', () => {
   });
 });
 
+describe('checkPositionExit with the ₹15 take-profit and pullback rules', () => {
+  const position: OpenPosition = {
+    symbol: 'NIFTY26N1725150PE',
+    index: 'NIFTY',
+    side: 'PE',
+    strike: 25_150,
+    expiry: '2026-11-17',
+    token: 1,
+    entryPrice: 120.3,
+    enteredAt: ist('2026-11-13', '10:55'),
+    peakPrice: 120.3,
+    troughPrice: 120.3,
+    lotSize: 65,
+    entryDelta: 0.41,
+    entrySpot: 25_225,
+    stopSpot: 25_260,
+    premiumStop: 110.3,
+  };
+  const at = (time: string, price: number, reading: IndexReading | null = null) =>
+    checkPositionExit(
+      {
+        now: ist('2026-11-13', time),
+        position: { ...position, peakPrice: Math.max(120.3, price) },
+        price,
+        spot: 25_200,
+        reading,
+      },
+      current,
+    );
+
+  it('takes profit once the bid reaches the buy price + ₹15', () => {
+    expect(at('11:05', 135.25)).toEqual({ action: 'HOLD' });
+    expect(at('11:05', 135.3)).toEqual({ action: 'EXIT', reason: 'target-reached' });
+  });
+
+  it('sells at the fixed ₹10 stop', () => {
+    expect(at('11:05', 110.35)).toEqual({ action: 'HOLD' });
+    expect(at('11:05', 110.3)).toEqual({ action: 'EXIT', reason: 'stop-loss' });
+  });
+
+  it('reverses only when the 15-minute trend turns, not on the price votes', () => {
+    const bullishVotes = reading({ chart: chartRead({ higherTrend: 'down' }) });
+    // All 8 votes point up after the minimum hold, but the 15-minute trend is still down.
+    expect(at('11:15', 118, bullishVotes)).toEqual({ action: 'HOLD' });
+    const turned = reading({ chart: chartRead({ higherTrend: 'up' }) });
+    expect(at('11:15', 118, turned)).toEqual({ action: 'EXIT', reason: 'trend-reversal' });
+  });
+});
+
 describe('profitFloor', () => {
   it('locks break-even from +8%, trails from +10% and keeps more of bigger gains', () => {
     expect(profitFloor(7.9, params)).toBeNull();
@@ -965,6 +1149,8 @@ describe('plain-English rationale', () => {
       lockPrice: 130.2,
       maxLossInr: 657.4,
       lockedProfitInr: 576.3,
+      targetPrice: null,
+      targetProfitInr: null,
     };
     const chartReading = reading({ chart: chartRead() });
     const buy = describeBuy({
@@ -1036,6 +1222,65 @@ describe('plain-English rationale', () => {
     expect(chartExit).toContain('NIFTY fell below 24,983, past the low that supported the trade');
     expect(chartExit).toMatch(/The planned loss limit was about ₹\d/);
     for (const text of [armed, early, lockExit, chartExit]) {
+      expect(text).not.toMatch(JARGON);
+    }
+  });
+
+  it('states the ₹10 stop, the ₹15 target and the pullback on a BUY with the defaults', () => {
+    const plan = {
+      stopSpot: 24_983.4,
+      targetSpot: 25_060,
+      riskPoints: 16.6,
+      rewardPoints: 60,
+      rewardPerUnit: 30.8,
+      riskPerUnit: 10,
+      premiumStop: 110.2,
+      lockPrice: 130.2,
+      maxLossInr: 721.4,
+      lockedProfitInr: 576.3,
+      targetPrice: 135.2,
+      targetProfitInr: 900.1,
+    };
+    const buy = describeBuy({
+      now,
+      candidate: { ...candidate, plan },
+      fillPrice: 120.2,
+      reading: reading({ chart: chartRead() }),
+      pickedBy: 'llm',
+      candidateCount: 3,
+      params: current,
+    });
+    expect(buy).not.toMatch(JARGON);
+    expect(buy.length).toBeLessThanOrEqual(1200);
+    expect(buy.endsWith('…')).toBe(false);
+    expect(buy).toContain(
+      'Plan: sell if the option falls to ₹110.20 (₹10 below the buy price), a planned loss of about ₹721.40 on 1 lot after charges, or earlier if NIFTY falls below 24,983',
+    );
+    expect(buy).toContain(
+      'Take profit at ₹135.20 (₹15 above the buy price), about ₹900.10 after charges; once it reaches ₹130.20 (₹10 above the buy price), the exit moves up to ₹130.20.',
+    );
+    expect(buy).toContain(
+      'Chart: the 15-minute trend is up and NIFTY came back to its average price; the last 5-minute candles show a strong up candle',
+    );
+    const hold = describeHold({
+      position: { ...position, peakPrice: 125, stopSpot: 24_983.4, premiumStop: 110.2 },
+      price: 124,
+      netPnlInr: 180,
+      reading: null,
+      params: current,
+    });
+    expect(hold).toContain('or the option falls to ₹110.20');
+    expect(hold).toContain('takes profit at ₹135.20');
+    const exit = describeExit({
+      now: ist('2026-10-21', '10:50'),
+      position: { ...position, peakPrice: 135.3 },
+      exitPrice: 135.3,
+      reason: 'target-reached',
+      netPnlInr: 905,
+      params: current,
+    });
+    expect(exit).toContain('the option reached our ₹15 profit target at ₹135.20');
+    for (const text of [hold, exit]) {
       expect(text).not.toMatch(JARGON);
     }
   });

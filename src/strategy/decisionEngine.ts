@@ -2,7 +2,8 @@ import type { IndexOptionName } from '../instruments/kiteIndexUnderlyings.js';
 import { istClock, minutesBetween } from './clock.js';
 import { pctChange, type OptionSide } from './indicators.js';
 import type { StrategyParams } from './params.js';
-import type { IndexReading } from './signals.js';
+import type { IndexReading, SignalName } from './signals.js';
+import type { ChartRead } from './chart.js';
 
 export const GATE_IDS = [
   'entry-window',
@@ -27,6 +28,7 @@ export const GATE_IDS = [
   'chart-trend-disagrees',
   'target-out-of-reach',
   'risk-too-wide',
+  'no-pullback',
 ] as const;
 
 export type GateId = (typeof GATE_IDS)[number];
@@ -45,6 +47,7 @@ export const EXIT_REASONS = [
   'level-reached',
   'chart-stop',
   'profit-lock',
+  'target-reached',
 ] as const;
 
 export type ExitReason = (typeof EXIT_REASONS)[number];
@@ -102,6 +105,34 @@ function sideOf(score: number): OptionSide | null {
   return score > 0 ? 'CE' : score < 0 ? 'PE' : null;
 }
 
+/**
+ * Votes about the market backdrop rather than the last few candles. A pullback moves the price
+ * votes against the trend for a while, so in pullback mode only these can block an entry.
+ */
+const BACKDROP_VOTES: readonly SignalName[] = [
+  'futuresPositioning',
+  'optionFlow',
+  'breadth',
+  'globalMood',
+];
+
+/** Pullback entries need a chart; without one the earlier vote-led rules apply. */
+function usesPullback(reading: IndexReading, params: StrategyParams): boolean {
+  return params.entryMode === 'pullback' && reading.chart !== null;
+}
+
+/** The side the 15-minute trend points to; null when it is flat or unknown. */
+function trendSide(chart: ChartRead): OptionSide | null {
+  return chart.higherTrend === 'up' ? 'CE' : chart.higherTrend === 'down' ? 'PE' : null;
+}
+
+/** The side a reading would trade: the 15-minute trend in pullback mode, else the votes. */
+function entrySide(reading: IndexReading, params: StrategyParams): OptionSide | null {
+  return usesPullback(reading, params) && reading.chart
+    ? trendSide(reading.chart)
+    : sideOf(reading.score);
+}
+
 function isNearBigLevel(reading: IndexReading, side: OptionSide, params: StrategyParams): boolean {
   const { spot, callWall, putWall } = reading;
   if (spot === null) {
@@ -141,21 +172,33 @@ function readingGates(
   if (reading.expiryToday && minute > params.expiryDayLastEntryMinute) {
     gates.push('expiry-day-cutoff');
   }
-  if (side === null || Math.abs(reading.score) < params.minEntryScore) {
+  const { chart } = reading;
+  const pullback = usesPullback(reading, params);
+  if (pullback) {
+    // A clear 15-minute trend and the price back near value (VWAP or the 21-bar average).
+    const gap = chart?.valueGapAtr ?? null;
+    if (side === null || gap === null || gap > params.chart.maxValueGapAtr) {
+      gates.push('no-pullback');
+    }
+  } else if (side === null || Math.abs(reading.score) < params.minEntryScore) {
     gates.push('weak-signal');
   }
   if (side === null) {
     return gates;
   }
   const direction = side === 'CE' ? 1 : -1;
-  if (reading.votes.averagePrice !== direction || reading.votes.trend !== direction) {
+  if (
+    !pullback &&
+    (reading.votes.averagePrice !== direction || reading.votes.trend !== direction)
+  ) {
     gates.push('trend-disagrees');
   }
-  const opposing = Object.values(reading.votes).filter((vote) => vote === -direction).length;
-  if (opposing > params.maxOpposingVotes) {
+  const counted = pullback
+    ? BACKDROP_VOTES.map((name) => reading.votes[name])
+    : Object.values(reading.votes);
+  if (counted.filter((vote) => vote === -direction).length > params.maxOpposingVotes) {
     gates.push('too-many-opposing');
   }
-  const { chart } = reading;
   const stretched =
     reading.rsi !== null &&
     (side === 'CE'
@@ -167,9 +210,12 @@ function readingGates(
   if (stretched || burst) {
     gates.push('chasing');
   }
+  // Pullback entries check the candle's shape only: volume against earlier days' same slot
+  // swings too much (all six 11-13 pullback winners traded at 0.4–0.6× of it).
+  const confirmed = pullback ? chart?.candle.shapeConfirms : chart?.candle.confirms;
   if (reading.lastCandle.side !== null && reading.lastCandle.side !== side) {
     gates.push('opposite-candle');
-  } else if (chart && chart.candle.confirms !== side) {
+  } else if (chart && confirmed !== side) {
     gates.push('no-candle-confirmation');
   }
   if (side === 'CE' && vixPct !== null && vixPct >= params.maxVixRiseForCallsPct) {
@@ -186,6 +232,12 @@ function readingGates(
     if (room !== null && room < params.minRewardToRisk * params.indexStopPct) {
       gates.push('low-reward');
     }
+    return gates;
+  }
+  if (pullback) {
+    // The 15-minute trend already picked the side and a pullback forms 5-minute swings against
+    // it. Swings of the last two sessions sit every few points, so a nearby level is not a
+    // reason to skip either: the 11-13 pullback winners went through levels 13–30 points away.
     return gates;
   }
   const plan = chart.plans[side];
@@ -312,7 +364,7 @@ export function decideEntry(
   const evaluated = [...input.readings]
     .sort((left, right) => Math.abs(right.score) - Math.abs(left.score))
     .map((reading) => {
-      const side = sideOf(reading.score);
+      const side = entrySide(reading, params);
       return {
         reading,
         side,
@@ -335,8 +387,13 @@ export function decideEntry(
   if (!strongest) {
     return { action: 'SKIP', blockedBy: [...common, 'data-missing'], leaning: null, reading: null };
   }
+  // In pullback mode the market leans the way the 15-minute trend points.
+  const leans =
+    strongest.side !== null &&
+    (usesPullback(strongest.reading, params) ||
+      Math.abs(strongest.reading.score) >= LEANING_MIN_SCORE);
   const leaning =
-    strongest.side && Math.abs(strongest.reading.score) >= LEANING_MIN_SCORE
+    leans && strongest.side
       ? { index: strongest.reading.index, side: strongest.side, score: strongest.reading.score }
       : null;
   return { action: 'SKIP', blockedBy: strongest.gates, leaning, reading: strongest.reading };
@@ -344,10 +401,10 @@ export function decideEntry(
 
 /**
  * Open position, checked in order: stale position, end-of-day square-off, the planned premium
- * stop, the chart stop on the index (or the fixed index move without one), the profit floor
- * (₹ profit lock, break-even lock, stepped trailing stop, tighter at a big level on cycle
- * checks), time stop; then (cycle only, after the minimum hold) trend reversal and major news
- * while losing.
+ * stop, the chart stop on the index (or the fixed index move without one), the ₹ take-profit,
+ * the profit floor (₹ profit lock, break-even lock, stepped trailing stop, tighter at a big
+ * level on cycle checks), time stop; then (cycle only, after the minimum hold) trend reversal
+ * (the 15-minute trend in pullback mode, the votes otherwise) and major news while losing.
  */
 export function checkPositionExit(
   input: {
@@ -387,6 +444,12 @@ export function checkPositionExit(
   if (price === null || pnlPct === null) {
     return { action: 'HOLD' };
   }
+  if (
+    params.takeProfitInr > 0 &&
+    price + ROUNDING_SLACK >= position.entryPrice + params.takeProfitInr
+  ) {
+    return { action: 'EXIT', reason: 'target-reached' };
+  }
   const reading = input.reading;
   const peakGainPct = pctChange(position.entryPrice, Math.max(position.peakPrice, price)) ?? 0;
   const floor = profitFloor(
@@ -404,9 +467,14 @@ export function checkPositionExit(
   }
   if (reading && heldMinutes >= params.minHoldMinutes) {
     const direction = position.side === 'CE' ? 1 : -1;
-    const trendFlipped =
-      reading.votes.averagePrice === -direction && reading.votes.trend === -direction;
-    if (trendFlipped || reading.score * direction <= -params.reversalScore) {
+    // A pullback is bought while the price votes still point the other way, so only the
+    // 15-minute trend turning against the trade counts as a reversal in pullback mode.
+    const reversed =
+      params.entryMode === 'pullback'
+        ? reading.chart?.higherTrend === (direction > 0 ? 'down' : 'up')
+        : (reading.votes.averagePrice === -direction && reading.votes.trend === -direction) ||
+          reading.score * direction <= -params.reversalScore;
+    if (reversed) {
       return { action: 'EXIT', reason: 'trend-reversal' };
     }
     if (reading.newsLevel === 'high' && pnlPct < 0) {

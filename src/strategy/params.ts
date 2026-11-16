@@ -49,12 +49,22 @@ export type ChartParams = {
   trendEmaPeriod: number;
   /** Target when no level lies ahead of the price, in ATRs. */
   targetFallbackAtr: number;
-  /** The index move the ₹ profit lock needs must be within this many ATRs (else a dead market). */
+  /** The index move the ₹ target needs must be within this many ATRs (else a dead market). */
   maxTargetAtr: number;
+  /** Pullback entries: the price must be back within this many ATRs of VWAP or the 21-bar EMA. */
+  maxValueGapAtr: number;
 };
+
+/**
+ * `pullback`: the 15-minute trend picks the side and a BUY waits for the price to come back to
+ * value with a confirming candle; only the market-backdrop votes can block it. `momentum`: the
+ * earlier rules, where the 8 votes pick the side and must agree.
+ */
+export type EntryMode = 'pullback' | 'momentum';
 
 /** Every number the decision engine uses. Times are minutes after midnight IST. */
 export type StrategyParams = {
+  entryMode: EntryMode;
   entryStartMinute: number;
   lastEntryMinute: number;
   expiryDayLastEntryMinute: number;
@@ -84,8 +94,12 @@ export type StrategyParams = {
    * moves up to buy price + this, so the gain is kept.
    */
   profitLockInr: number;
-  /** ₹ per unit: the most a trade may lose at its chart stop, spread included. */
+  /** ₹ per unit: the most a trade may lose at its chart stop, spread included (`stopLossInr` 0). */
   maxRiskPerUnitInr: number;
+  /** ₹ per unit: fixed stop on the option price, buy price − this; 0 uses the chart stop. */
+  stopLossInr: number;
+  /** ₹ per unit: sell once the option is this much above its buy price; 0 means no target. */
+  takeProfitInr: number;
   /** Once the best gain reaches this %, the exit moves up to cost plus `breakevenLockPct`. */
   breakevenActivatePct: number;
   /** Gain (%) the break-even exit keeps, enough to cover charges and the spread. */
@@ -104,6 +118,8 @@ export type StrategyParams = {
   strikeBand: number;
   minDelta: number;
   maxDelta: number;
+  /** Contracts are ranked by how close their delta is to this. */
+  targetDelta: number;
   maxIvToHv: number;
   maxSpreadPct: number;
   minPremium: number;
@@ -113,6 +129,8 @@ export type StrategyParams = {
 };
 
 export const DEFAULT_STRATEGY: StrategyParams = {
+  // Replays of 10-22, 11-11 and 11-13: vote-led entries won 38% at ₹10/₹10, pullbacks 60–80%.
+  entryMode: 'pullback',
   entryStartMinute: 9 * 60 + 30,
   lastEntryMinute: 14 * 60 + 30,
   expiryDayLastEntryMinute: 13 * 60 + 30,
@@ -127,7 +145,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   minRewardToRisk: 2,
   maxTradesPerDay: 3,
   maxLosingTradesPerDay: 2,
-  dayProfitLockInr: 0,
+  // With ₹10–15 targets, keep trading after a winner until the day is up this much.
+  dayProfitLockInr: 1_500,
   cooldownMinutes: 30,
   // Stopped trades never showed a profit; the one deep dip that recovered bottomed at −16%.
   stopLossPct: 20,
@@ -138,6 +157,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   profitLockInr: 10,
   // About ₹1,050 on a 65-unit NIFTY lot with charges; past stopped trades lost ₹1,650–3,340.
   maxRiskPerUnitInr: 15,
+  stopLossInr: 10,
+  takeProfitInr: 15,
   // Three trades reached +9% to +15% and still closed at a loss before this lock existed.
   breakevenActivatePct: 8,
   breakevenLockPct: 2,
@@ -156,6 +177,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   strikeBand: 2,
   minDelta: 0.35,
   maxDelta: 0.65,
+  // One strike out of the money: a ₹10 stop leaves ~25 index points instead of ~20 at 0.5.
+  targetDelta: 0.4,
   maxIvToHv: 1.4,
   maxSpreadPct: 1,
   minPremium: 20,
@@ -195,6 +218,7 @@ export const DEFAULT_STRATEGY: StrategyParams = {
     trendEmaPeriod: 20,
     targetFallbackAtr: 2,
     maxTargetAtr: 3,
+    maxValueGapAtr: 0.5,
   },
 };
 

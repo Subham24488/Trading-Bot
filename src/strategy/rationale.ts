@@ -88,7 +88,10 @@ const GATE_TEXT: Record<GateId, (params: StrategyParams) => string> = {
     `the signals are not strong enough (we need at least ${p.minEntryScore} of 8 pointing the same way)`,
   'trend-disagrees': () =>
     "the price is not clearly moving one way against today's average price and the short-term trend",
-  'too-many-opposing': () => 'too many signals point the other way',
+  'too-many-opposing': (p) =>
+    p.entryMode === 'pullback'
+      ? 'the wider market (big traders in futures, option sellers, large stocks or global mood) points the other way'
+      : 'too many signals point the other way',
   chasing: () => 'the move has already run too far, too fast, and buying now would be chasing it',
   'opposite-candle': () => 'the last 5-minute candle pushed strongly the other way',
   'fear-spike': (p) =>
@@ -103,16 +106,18 @@ const GATE_TEXT: Record<GateId, (params: StrategyParams) => string> = {
     `the next level where the price may turn back is too close: the possible gain is less than ${p.chart.minRewardToRisk}× the loss at our stop`,
   'day-in-profit': (p) =>
     `today's closed trades are already ${p.dayProfitLockInr > 0 ? `up more than ${formatInr(p.dayProfitLockInr)}` : 'in profit'}, so we stop for the day to keep it`,
-  'no-candle-confirmation': () =>
-    'the last 5-minute candle did not confirm the move (we wait for one that closes strongly past the candle before it, on at least the usual volume)',
+  'no-candle-confirmation': (p) =>
+    `the last 5-minute candle did not confirm the move (we wait for one that closes strongly past the candle before it${p.entryMode === 'pullback' ? '' : ', on at least the usual volume'})`,
   'near-chart-level': () =>
     'the price is right at a level where it turned back before, so we wait for a clear break through it',
   'chart-trend-disagrees': () =>
     "the chart's bigger picture points the other way (the 15-minute trend or the run of highs and lows)",
   'target-out-of-reach': (p) =>
-    `no option could gain ₹${p.profitLockInr} before the next level where the price may turn back`,
+    `no option could gain ₹${p.takeProfitInr > 0 ? p.takeProfitInr : p.profitLockInr} before the next level where the price may turn back`,
   'risk-too-wide': (p) =>
     `the stop the chart calls for is too far away: the loss there would be more than ₹${p.maxRiskPerUnitInr} a unit`,
+  'no-pullback': () =>
+    "we buy only in a clear 15-minute trend once the price has come back to its average (today's average price or the 21-candle average), and it has not",
 };
 
 /** Where a target level comes from, in everyday words. */
@@ -149,8 +154,12 @@ const PATTERN_TEXT: Partial<Record<CandlePatternName, string>> = {
   three_bar_push_down: 'three falling closes in a row',
 };
 
-/** "Chart: the last 5-minute candles show …; the 15-minute trend agrees." Empty without a chart. */
-function chartText(reading: IndexReading, side: OptionSide): string {
+/**
+ * "Chart: the last 5-minute candles show …; the 15-minute trend agrees." In pullback mode:
+ * "Chart: the 15-minute trend is down and NIFTY came back to its average price; the last …".
+ * Empty without a chart.
+ */
+function chartText(reading: IndexReading, side: OptionSide, params: StrategyParams): string {
   const chart = reading.chart;
   if (!chart) {
     return '';
@@ -161,6 +170,12 @@ function chartText(reading: IndexReading, side: OptionSide): string {
   const shape = pattern
     ? `candles show ${pattern}`
     : `candle closed near its ${up ? 'high' : 'low'}, ${up ? 'above' : 'below'} the candle before`;
+  if (params.entryMode === 'pullback') {
+    return (
+      `Chart: the 15-minute trend is ${up ? 'up' : 'down'} and ${reading.index} came back to its ` +
+      `average price; the last 5-minute ${shape}, turning ${up ? 'up' : 'down'} again. `
+    );
+  }
   const volume =
     candle.volumeRatio === null
       ? ''
@@ -184,16 +199,28 @@ function planText(input: {
     input.targetKind === 'projection'
       ? `Nothing on the chart stands in the way up to ${wholeNumber.format(plan.targetSpot)} (${LEVEL_TEXT.projection})`
       : `Next level: ${wholeNumber.format(plan.targetSpot)} (${LEVEL_TEXT[input.targetKind]})`;
-  return (
-    `Plan: sell if ${input.index} ${up ? 'falls below' : 'rises above'} ${wholeNumber.format(plan.stopSpot)} ` +
-    `(${up ? 'under the low' : 'over the high'} of the last two 5-minute candles) or the option falls to ` +
-    `${formatInr(plan.premiumStop)}, a planned loss of about ${formatInr(plan.maxLossInr)} on 1 lot after charges. ` +
+  const indexStop =
+    `${input.index} ${up ? 'falls below' : 'rises above'} ${wholeNumber.format(plan.stopSpot)} ` +
+    `(${up ? 'under the low' : 'over the high'} of the last two 5-minute candles)`;
+  const loss = `a planned loss of about ${formatInr(plan.maxLossInr)} on 1 lot after charges`;
+  const stop =
+    params.stopLossInr > 0
+      ? `Plan: sell if the option falls to ${formatInr(plan.premiumStop)} (₹${params.stopLossInr} below the buy price), ` +
+        `${loss}, or earlier if ${indexStop}. `
+      : `Plan: sell if ${indexStop} or the option falls to ${formatInr(plan.premiumStop)}, ${loss}. `;
+  const room =
     `${target}, ${Math.round(plan.rewardPoints)} points away, worth about ${formatInr(plan.rewardPerUnit)} ` +
-    `on this option (${input.rewardToRisk.toFixed(1)}× the risk). ` +
-    `Once it reaches ${formatInr(plan.lockPrice)} (₹${params.profitLockInr} above the buy price), the exit moves up to ` +
-    `${formatInr(plan.lockPrice)}, locking about ${formatInr(plan.lockedProfitInr)} after charges; bigger gains keep ` +
-    `a growing share. Sell by ${formatClockTime(params.squareOffMinute)} at the latest.`
-  );
+    `on this option${params.stopLossInr > 0 ? '' : ` (${input.rewardToRisk.toFixed(1)}× the risk)`}. `;
+  const lock =
+    `${formatInr(plan.lockPrice)} (₹${params.profitLockInr} above the buy price), the exit moves up to ` +
+    formatInr(plan.lockPrice);
+  const profit =
+    plan.targetPrice !== null
+      ? `Take profit at ${formatInr(plan.targetPrice)} (₹${params.takeProfitInr} above the buy price), about ` +
+        `${formatInr(plan.targetProfitInr ?? 0)} after charges; once it reaches ${lock}. `
+      : `Once it reaches ${lock}, locking about ${formatInr(plan.lockedProfitInr)} after charges; bigger gains keep ` +
+        'a growing share. ';
+  return `${stop}${room}${profit}Sell by ${formatClockTime(params.squareOffMinute)} at the latest.`;
 }
 
 /** " or if NIFTY falls to 24,963 (0.15% against us)"; empty when the entry spot is unknown. */
@@ -257,7 +284,7 @@ export function describeBuy(input: {
     return finish(
       opening +
         `Why: ${joinReasons(supportingReasons(input.reading, candidate.side, 3))}. ` +
-        `${chartText(input.reading, candidate.side)}${pick} ` +
+        `${chartText(input.reading, candidate.side, params)}${pick} ` +
         planText({
           index: candidate.index,
           side: candidate.side,
@@ -298,9 +325,13 @@ export function describeSkip(input: {
   detail?: string;
 }): string {
   const reasons = input.blockedBy.slice(0, 3).map((gate) => describeGate(gate, input.params));
+  const byTrend = input.params.entryMode === 'pullback' && Boolean(input.reading?.chart);
   const situation = input.leaning
-    ? `${input.leaning.index} is leaning ${input.leaning.side === 'CE' ? 'upward' : 'downward'} ` +
-      `(${Math.abs(input.leaning.score)} of 8 signals agree), but we held back because ${joinReasons(reasons)}.`
+    ? byTrend
+      ? `The 15-minute trend for ${input.leaning.index} points ${input.leaning.side === 'CE' ? 'up' : 'down'}, ` +
+        `but we held back because ${joinReasons(reasons)}.`
+      : `${input.leaning.index} is leaning ${input.leaning.side === 'CE' ? 'upward' : 'downward'} ` +
+        `(${Math.abs(input.leaning.score)} of 8 signals agree), but we held back because ${joinReasons(reasons)}.`
     : `The market shows no clear direction, and we held back because ${joinReasons(reasons)}.`;
   const seen =
     input.leaning && input.reading
@@ -365,9 +396,13 @@ export function describeHold(input: {
       : input.reading
         ? ' Signals are mixed, so the safety rules stay in charge.'
         : '';
+  const takeProfit =
+    params.takeProfitInr > 0
+      ? `takes profit at ${formatInr(position.entryPrice + params.takeProfitInr)}; `
+      : '';
   return finish(
     `Holding ${contract}. Bought at ${formatInr(position.entryPrice)}, now ${formatInr(input.price)} ` +
-      `(${formatPct(pnlPct)}${money}).${trend} ${exits}; ${protection}; ` +
+      `(${formatPct(pnlPct)}${money}).${trend} ${exits}; ${protection}; ${takeProfit}` +
       `sells by ${formatClockTime(params.squareOffMinute)} at the latest.`,
   );
 }
@@ -388,7 +423,10 @@ const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, position: OpenPosit
     `the price fell back from its best level of ${formatInr(position.peakPrice)}, so we locked in part of the gain`,
   'time-stop': (p) =>
     `the option had not gained after ${p.timeStopMinutes} minutes, and options lose value as time passes`,
-  'trend-reversal': () => 'the market turned against the trade',
+  'trend-reversal': (p) =>
+    p.entryMode === 'pullback'
+      ? 'the 15-minute trend turned against the trade'
+      : 'the market turned against the trade',
   'news-risk': () => 'major market-moving news came out while the trade was losing',
   unrestorable: () => UNRESTORABLE_TEXT,
   'index-stop': (p) =>
@@ -404,6 +442,8 @@ const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, position: OpenPosit
         `past the ${position.side === 'CE' ? 'low' : 'high'} that supported the trade, so the chart no longer backed it`,
   'profit-lock': (p, position) =>
     `the option had gained ₹${p.profitLockInr} and slipped back to the profit lock at ${formatInr(position.entryPrice + p.profitLockInr)}, so the gain was kept`,
+  'target-reached': (p, position) =>
+    `the option reached our ₹${p.takeProfitInr} profit target at ${formatInr(position.entryPrice + p.takeProfitInr)}`,
 };
 
 /** Planned loss on 1 lot at the premium stop, charges included; null without a planned stop. */

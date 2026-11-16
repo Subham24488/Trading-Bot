@@ -29,6 +29,8 @@ const MIN_LAST_HOUR_BARS = 6;
 const PATTERN_BARS = 8;
 /** The bigger-picture average must have moved over this many of its bars. */
 const TREND_SLOPE_BARS = 3;
+/** The 5-minute average a pullback comes back to, alongside VWAP (the slow EMA of the votes). */
+const VALUE_EMA_PERIOD = 21;
 
 export type Structure = 'up' | 'down' | 'unclear';
 export type HigherTrend = 'up' | 'down' | 'flat';
@@ -61,6 +63,8 @@ export type SignalCandle = {
   side: OptionSide | null;
   /** Side the candle confirms: direction, a strong close, size, volume and follow-through. */
   confirms: OptionSide | null;
+  /** The same test without the volume condition (used by pullback entries). */
+  shapeConfirms: OptionSide | null;
   /** Where the close sits in the candle's range: 0 at the low, 1 at the high. */
   closeLocation: number;
   rangeAtr: number;
@@ -98,6 +102,11 @@ export type ChartRead = {
   basis: number;
   /** Confirmed swings of today and the previous session (futures terms, oldest first). */
   swings: { highs: SwingPoint[]; lows: SwingPoint[] };
+  /**
+   * How far the futures price is from value, the nearer of VWAP and the 21-bar EMA, in ATRs;
+   * null without a VWAP.
+   */
+  valueGapAtr: number | null;
 };
 
 type Ohlc = { o: number; h: number; l: number; c: number };
@@ -253,16 +262,17 @@ function signalCandle(
   const closeLocation = range > 0 ? (last.c - last.l) / range : 0.5;
   const rangeAtr = range / atr;
   const volumeRatio = volumeRatioOf(bars, clocks, today);
-  const solid =
-    rangeAtr >= params.minSignalRangeAtr &&
-    (volumeRatio === null || volumeRatio >= params.minSignalVolumeRatio);
-  let confirms: OptionSide | null = null;
-  if (solid && last.c > last.o && closeLocation >= params.confirmCloseLocation) {
-    confirms = !prior || last.c > prior.h || pattern.side === 'CE' ? 'CE' : null;
-  } else if (solid && last.c < last.o && 1 - closeLocation >= params.confirmCloseLocation) {
-    confirms = !prior || last.c < prior.l || pattern.side === 'PE' ? 'PE' : null;
+  let shapeConfirms: OptionSide | null = null;
+  if (rangeAtr >= params.minSignalRangeAtr) {
+    if (last.c > last.o && closeLocation >= params.confirmCloseLocation) {
+      shapeConfirms = !prior || last.c > prior.h || pattern.side === 'CE' ? 'CE' : null;
+    } else if (last.c < last.o && 1 - closeLocation >= params.confirmCloseLocation) {
+      shapeConfirms = !prior || last.c < prior.l || pattern.side === 'PE' ? 'PE' : null;
+    }
   }
-  return { ...pattern, confirms, closeLocation, rangeAtr, volumeRatio };
+  const usualVolume = volumeRatio === null || volumeRatio >= params.minSignalVolumeRatio;
+  const confirms = usualVolume ? shapeConfirms : null;
+  return { ...pattern, confirms, shapeConfirms, closeLocation, rangeAtr, volumeRatio };
 }
 
 /**
@@ -392,6 +402,8 @@ export function readChart(
     futuresPrice: number | null;
     callWall: number | null;
     putWall: number | null;
+    /** Today's futures VWAP; without it there is no value gap. */
+    vwap?: number | null;
   },
   params: ChartParams,
 ): ChartRead | null {
@@ -432,6 +444,18 @@ export function readChart(
       .sort((left, right) => Math.abs(left.price - spot) - Math.abs(right.price - spot))[0] ?? null;
   const setup = bars.slice(-2);
   const plan = (side: OptionSide) => sidePlan({ side, spot, atr, basis, setup, levels, params });
+  const average = ema(
+    bars.map((bar) => bar.c),
+    VALUE_EMA_PERIOD,
+  );
+  const vwap = input.vwap ?? null;
+  const valueGapAtr =
+    vwap === null
+      ? null
+      : Math.min(
+          Math.abs(futuresPrice - vwap),
+          average === null ? Infinity : Math.abs(futuresPrice - average),
+        ) / atr;
   return {
     atr,
     structure: structureOf(swings),
@@ -446,6 +470,7 @@ export function readChart(
     plans: { CE: plan('CE'), PE: plan('PE') },
     basis,
     swings,
+    valueGapAtr,
   };
 }
 

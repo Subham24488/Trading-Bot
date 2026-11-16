@@ -31,6 +31,7 @@ export async function pickContract(
     score: number;
     minutesToSquareOff: number;
     candidates: readonly ContractCandidate[];
+    targetDelta?: number;
   },
   logger: SessionLogger,
 ): Promise<ContractPickResult> {
