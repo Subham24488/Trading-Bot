@@ -3,7 +3,7 @@ trades/*.json
 universe/*.json
 simulations/
 # Raw Kite candle downloads (large; re-download any time).
-src/History/
+History/
 !universe/.gitkeep
 .kite-session.json
 node_modules/

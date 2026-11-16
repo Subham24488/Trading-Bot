@@ -422,7 +422,7 @@ application.post(
     schema: {
       tags: ['llm'],
       summary:
-        'Start live options decision loop (rules decide BUY/HOLD/EXIT/SKIP; the LLM only picks the strike; flat cycles every LLM_DECISION_INTERVAL_MINUTES, an open position is reviewed every minute with a break-even lock and stepped trailing stop; positions sold by 15:15 IST; store-only)',
+        'Start live options decision loop (rules decide BUY/HOLD/EXIT/SKIP and a BUY takes the top-ranked strike, with no AI model; flat cycles every LLM_DECISION_INTERVAL_MINUTES, an open position is reviewed every 5 minutes with its stop-loss order checked every 15 seconds; positions sold by 15:15 IST; store-only)',
       security: [{ adminToken: [] }],
       body: {
         type: 'object',

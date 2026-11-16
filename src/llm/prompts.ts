@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 
 import type { SymbolNews } from '../news/NewsService.js';
-import type { ContractCandidate } from '../strategy/contracts.js';
 import type { UniverseCandidate } from '../universe/types.js';
 import type { QuoteLogSnapshot } from './quoteLogReader.js';
 import { greeksIvCatalogForPrompt } from '../options/greeksIv.js';
@@ -13,7 +12,6 @@ import { compactPlaybookForPrompt, type PlaybookSignal } from './tradePlaybook.j
  * before writing JSON. Still small enough that input+output stays under typical 40k context.
  */
 export const UNIVERSE_MAX_OUTPUT_TOKENS = 1500;
-export const CONTRACT_PICK_MAX_OUTPUT_TOKENS = 1024;
 
 export function hashPrompt(parts: unknown): string {
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
@@ -373,58 +371,6 @@ export function buildDecisionMessages(
     {
       role: 'user',
       content: JSON.stringify(userPayload),
-    },
-  ];
-}
-
-/**
- * Strike selection only. The rules have already decided to buy, the index and the side;
- * the model sees nothing but the pre-filtered candidates (no headlines, no free text).
- */
-export function buildContractPickMessages(input: {
-  index: string;
-  side: 'CE' | 'PE';
-  score: number;
-  minutesToSquareOff: number;
-  candidates: readonly ContractCandidate[];
-  /** Delta the rules prefer (candidates are ranked by it); 0.5 when not given. */
-  targetDelta?: number;
-}): Array<{ role: 'system' | 'user'; content: string }> {
-  const kind = input.side === 'CE' ? 'call' : 'put';
-  const targetDelta = input.targetDelta ?? 0.5;
-  return [
-    {
-      role: 'system',
-      content:
-        `You pick ONE NSE index option for an intraday ${kind} buy on ${input.index}. ` +
-        'The decision to buy and the direction are already final; do not question them. ' +
-        'Choose only a symbol from candidates[]. Prefer a tight bid-ask spread, deep open interest and volume, ' +
-        `delta near ${targetDelta}, a lower ivToHv (cheaper option), and a premium that can realistically move before the forced exit ` +
-        `in ${input.minutesToSquareOff} minutes. ` +
-        'Reply with JSON only: {"symbol": string, "reason": string}. reason: one plain-English sentence under 25 words. /no_think',
-    },
-    {
-      role: 'user',
-      content: JSON.stringify({
-        index: input.index,
-        side: input.side,
-        signalScore: input.score,
-        minutesToSquareOff: input.minutesToSquareOff,
-        candidates: input.candidates.map((candidate) => ({
-          s: candidate.symbol,
-          strike: candidate.strike,
-          moneyness: candidate.moneyness,
-          ask: candidate.ask,
-          spreadPct: candidate.spreadPct,
-          oi: candidate.oi,
-          volume: candidate.volume,
-          delta: candidate.delta,
-          ivToHv: candidate.ivToHv,
-          lotSize: candidate.lotSize,
-          feeInr: candidate.feeInr,
-          rank: candidate.rank,
-        })),
-      }),
     },
   ];
 }

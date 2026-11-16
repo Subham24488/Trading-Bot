@@ -147,6 +147,19 @@ export class ReplayBroker implements MarketDataBroker {
     );
   }
 
+  /** The instrument's 1-minute bars from `fromIst` that had finished by the simulator's clock. */
+  public getMinuteCandles(instrumentToken: number, fromIst: string): Promise<IntradayBar[]> {
+    const from = fromIstWallClock(fromIst);
+    const nowMs = this.now().getTime();
+    const series = [...this.series.values()].find((item) => item.token === instrumentToken);
+    return Promise.resolve(
+      (series?.minuteBars ?? []).filter((bar) => {
+        const start = Date.parse(bar.t);
+        return start >= from && start + MINUTE_MS <= nowMs;
+      }),
+    );
+  }
+
   public getDailyCandles(
     instrumentToken: number,
     fromYmd: string,

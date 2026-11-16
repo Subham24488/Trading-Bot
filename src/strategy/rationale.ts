@@ -85,6 +85,8 @@ const GATE_TEXT: Record<GateId, (params: StrategyParams) => string> = {
   'data-missing': () => 'some market data we rely on was not available',
   'expiry-day-cutoff': (p) =>
     `today is an expiry day and it is past ${formatClockTime(p.expiryDayLastEntryMinute)}, when prices often get stuck near popular levels`,
+  'against-day-average': (p) =>
+    `we buy calls only while the index is above its ${p.trendAverageDays}-day average price and puts only while it is below, and it is on the other side`,
   'weak-signal': (p) =>
     `the signals are not strong enough (we need at least ${p.minEntryScore} of 8 pointing the same way)`,
   'trend-disagrees': () =>
@@ -208,9 +210,9 @@ function planText(input: {
   const loss = `a planned loss of about ${formatInr(plan.maxLossInr)} on 1 lot after charges`;
   const stop =
     params.stopLossInr > 0
-      ? `Plan: sell if the option falls to ${formatInr(plan.premiumStop)} (₹${params.stopLossInr} below the buy price), ` +
-        `${loss}, or earlier if ${indexStop}. `
-      : `Plan: sell if ${indexStop} or the option falls to ${formatInr(plan.premiumStop)}, ${loss}. `;
+      ? `Plan: a stop-loss order sells if the option trades at ${formatInr(plan.premiumStop)} (₹${params.stopLossInr} below the buy price), ` +
+        `${loss}, or we sell earlier if ${indexStop}. `
+      : `Plan: sell if ${indexStop}; a stop-loss order sells if the option trades at ${formatInr(plan.premiumStop)}, ${loss}. `;
   const room =
     `${target}, ${Math.round(plan.rewardPoints)} points away, worth about ${formatInr(plan.rewardPerUnit)} ` +
     `on this option${params.stopLossInr > 0 ? '' : ` (${input.rewardToRisk.toFixed(1)}× the risk)`}. `;
@@ -270,7 +272,7 @@ export function describeBuy(input: {
   candidate: ContractCandidate;
   fillPrice: number;
   reading: IndexReading;
-  pickedBy: 'llm' | 'only-candidate' | 'fallback';
+  /** Contracts that passed the checks; the best-ranked one was bought. */
   candidateCount: number;
   params: StrategyParams;
 }): string {
@@ -280,13 +282,11 @@ export function describeBuy(input: {
   const opening =
     `Bought 1 lot (${candidate.lotSize} units) of ${describeContract(candidate)} at ${formatInr(fillPrice)} ` +
     `at ${formatIstTime(input.now)}, betting that ${candidate.index} will ${direction}. `;
+  const pick =
+    input.candidateCount === 1
+      ? 'It was the only option that passed our checks for price, trading costs and ease of trading.'
+      : `It was the best-ranked of ${input.candidateCount} options that passed our checks.`;
   if (candidate.plan && chartPlan) {
-    const pick =
-      input.pickedBy === 'llm'
-        ? `The AI assistant chose this strike from ${input.candidateCount} that passed our checks.`
-        : input.pickedBy === 'only-candidate'
-          ? 'It was the only option that passed our checks.'
-          : `It was the best-ranked of ${input.candidateCount} options that passed our checks.`;
     return finish(
       opening +
         `Why: ${joinReasons(supportingReasons(input.reading, candidate.side, 3))}. ` +
@@ -305,12 +305,6 @@ export function describeBuy(input: {
   const protectFrom = fillPrice * (1 + params.breakevenActivatePct / 100);
   const lockAt = fillPrice * (1 + params.breakevenLockPct / 100);
   const indexStop = indexStopText(candidate.index, candidate.side, input.reading.spot, params);
-  const pick =
-    input.pickedBy === 'llm'
-      ? `The AI assistant chose this strike from ${input.candidateCount} options that passed our checks.`
-      : input.pickedBy === 'only-candidate'
-        ? 'It was the only option that passed our checks for price, trading costs and ease of trading.'
-        : `It was the best-ranked of ${input.candidateCount} options that passed our checks.`;
   return finish(
     opening +
       `Why: ${joinReasons(supportingReasons(input.reading, candidate.side))}. ` +
@@ -366,7 +360,7 @@ export function describeHold(input: {
   if (input.price === null || pnlPct === null) {
     return finish(
       `Holding ${contract}, bought at ${formatInr(position.entryPrice)}. The latest price was not ` +
-        `available; the safety exit at ${formatInr(stopPrice)} and the ${formatClockTime(params.squareOffMinute)} sell-off still apply.`,
+        `available; the stop-loss order at ${formatInr(stopPrice)} and the ${formatClockTime(params.squareOffMinute)} sell-off still apply.`,
     );
   }
   const money =
@@ -395,7 +389,7 @@ export function describeHold(input: {
   const exits =
     position.stopSpot !== null
       ? `Exit if ${position.index} ${position.side === 'CE' ? 'falls below' : 'rises above'} ` +
-        `${wholeNumber.format(position.stopSpot)} or the option falls to ${formatInr(stopPrice)}`
+        `${wholeNumber.format(position.stopSpot)}; the stop-loss order sells if the option trades at ${formatInr(stopPrice)}`
       : `Safety exit at ${formatInr(stopPrice)}` +
         indexStopText(position.index, position.side, position.entrySpot, params);
   const support = input.reading ? supportingReasons(input.reading, position.side, 1) : [];
@@ -426,8 +420,8 @@ const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, position: OpenPosit
     'this position was left open from an earlier day, so it was closed at the first chance',
   'stop-loss': (p, position) =>
     position.premiumStop !== null
-      ? `the price fell to our planned loss limit of ${formatInr(position.premiumStop)}`
-      : `the price fell to our safety limit (−${p.stopLossPct}% from the buy price)`,
+      ? `the option traded at our planned loss limit of ${formatInr(position.premiumStop)}, so the stop-loss order sold it at the next price`
+      : `the option traded at our safety limit (−${p.stopLossPct}% from the buy price), so the stop-loss order sold it at the next price`,
   'trailing-stop': (_, position) =>
     `the price fell back from its best level of ${formatInr(position.peakPrice)}, so we locked in part of the gain`,
   'time-stop': (p) =>

@@ -1,5 +1,7 @@
 import type { IndexOptionName } from '../instruments/kiteIndexUnderlyings.js';
+import type { IntradayBar } from '../universe/types.js';
 import { istClock, minutesBetween } from './clock.js';
+import { TICK } from './contracts.js';
 import { pctChange, type OptionSide } from './indicators.js';
 import type { StrategyParams } from './params.js';
 import type { IndexReading, SignalName } from './signals.js';
@@ -30,6 +32,7 @@ export const GATE_IDS = [
   'risk-too-wide',
   'no-pullback',
   'signals-disagree',
+  'against-day-average',
 ] as const;
 
 export type GateId = (typeof GATE_IDS)[number];
@@ -93,11 +96,21 @@ export type OpenPosition = {
    * puts, tightened as new swings form. Null: the `indexStopPct` move from entry applies.
    */
   stopSpot: number | null;
-  /** Option price that ends the trade, the planned loss limit. Null: `stopLossPct` applies. */
+  /**
+   * Option price that triggers the stop-loss order, the planned loss limit. Null: `stopLossPct`
+   * applies.
+   */
   premiumStop: number | null;
 };
 
 export type ExitCheck = { action: 'EXIT'; reason: ExitReason } | { action: 'HOLD' };
+
+export type StopOrderCheck =
+  | ExitCheck
+  /** The stop-loss order filled at `price`. */
+  | { action: 'SOLD'; price: number }
+  /** Triggered, but the price is under the order's limit: it waits to be re-priced to the bid. */
+  | { action: 'UNFILLED' };
 
 /** A SKIP records which way the market leaned once at least this many net votes agree. */
 const LEANING_MIN_SCORE = 2;
@@ -172,6 +185,14 @@ function readingGates(
   }
   if (reading.expiryToday && minute > params.expiryDayLastEntryMinute) {
     gates.push('expiry-day-cutoff');
+  }
+  // Calls only while the index is above its 20-day average close, puts only while below it.
+  const { spot, dayAverage } = reading;
+  if (side !== null && spot !== null && dayAverage !== null) {
+    const rightSide = side === 'CE' ? spot > dayAverage : spot < dayAverage;
+    if (!rightSide) {
+      gates.push('against-day-average');
+    }
   }
   const { chart } = reading;
   const pullback = usesPullback(reading, params);
@@ -442,11 +463,12 @@ export function decideEntry(
 
 /**
  * Open position, checked in order: stale position, end-of-day square-off; once the ratcheting ₹
- * profit lock has armed, only that lock; otherwise the planned premium
- * stop, the chart stop on the index (or the fixed index move without one), the ₹ take-profit,
- * the profit floor (₹ profit lock, break-even lock, stepped trailing stop, tighter at a big
- * level on cycle checks), time stop; then (cycle only, after the minimum hold) trend reversal
- * (the 15-minute trend in pullback mode, the votes otherwise) and major news while losing.
+ * profit lock has armed, only that lock; otherwise the chart stop on the index (or the fixed
+ * index move without one), the ₹ take-profit, the profit floor (₹ profit lock, break-even lock,
+ * stepped trailing stop, tighter at a big level on cycle checks), time stop; then (cycle only,
+ * after the minimum hold) trend reversal (the 15-minute trend in pullback mode, the votes
+ * otherwise) and major news while losing. The stop on the option price is not here: it is the
+ * stop-loss order in `checkStopOrder`.
  */
 export function checkPositionExit(
   input: {
@@ -487,10 +509,6 @@ export function checkPositionExit(
     }
   }
   const pnlPct = pctChange(position.entryPrice, price);
-  const premiumStop = position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
-  if (price !== null && price <= premiumStop + ROUNDING_SLACK) {
-    return { action: 'EXIT', reason: 'stop-loss' };
-  }
   const spot = input.spot ?? null;
   if (position.stopSpot !== null) {
     const broken =
@@ -545,16 +563,36 @@ export function checkPositionExit(
   return { action: 'HOLD' };
 }
 
+/** The option price that triggers the trade's stop-loss order. */
+export function stopTriggerPrice(position: OpenPosition, params: StrategyParams): number {
+  return position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
+}
+
 /**
- * The stop placed at BUY, checked between full reviews (the 15-second monitor): stale position,
- * the square-off, and the bid at or under the premium stop while the ₹ profit lock has not
- * armed. Every other exit waits for the full review in `checkPositionExit`.
+ * The stop-loss limit order that rests in the market from the moment the BUY fills until the
+ * trade is sold, checked every 15 seconds and before each full review. A stale position and the
+ * square-off come first. The order triggers when the option trades at or under its stop and
+ * sells with a limit `stopLimitGapInr` below it.
+ *
+ * The sale is priced at the first trade at or under the stop, not at the stop itself: one tick
+ * under it when a candle traded down through it, the candle's open when it opened below it, or
+ * the last traded price when only the quote shows it. A sell gets the bid, so the gap between
+ * the last trade and the bid comes off. A price under the limit leaves the order unfilled; once
+ * it has waited `stopRepriceSeconds` (`reprice`), it is sold at the bid.
  */
-export function checkStandingStop(
-  input: { now: Date; position: OpenPosition; price: number | null },
+export function checkStopOrder(
+  input: {
+    now: Date;
+    position: OpenPosition;
+    /** The option's 1-minute candles that began since the last check, oldest first. */
+    bars: readonly IntradayBar[];
+    lastPrice: number | null;
+    bid: number | null;
+    reprice: boolean;
+  },
   params: StrategyParams,
-): ExitCheck {
-  const { now, position, price } = input;
+): StopOrderCheck {
+  const { now, position, lastPrice, bid } = input;
   const clock = istClock(now);
   if (istClock(position.enteredAt).ymd < clock.ymd) {
     return { action: 'EXIT', reason: 'stale-position' };
@@ -562,12 +600,19 @@ export function checkStandingStop(
   if (clock.minute >= params.squareOffMinute) {
     return { action: 'EXIT', reason: 'square-off' };
   }
-  const armed = profitLockLevelInr(position.entryPrice, position.peakPrice, params) !== null;
-  const premiumStop = position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
-  if (!armed && price !== null && price <= premiumStop + ROUNDING_SLACK) {
-    return { action: 'EXIT', reason: 'stop-loss' };
+  const trigger = stopTriggerPrice(position, params);
+  const crossed = input.bars.find((bar) => bar.l <= trigger + ROUNDING_SLACK);
+  const quoteCrossed = lastPrice !== null && lastPrice <= trigger + ROUNDING_SLACK;
+  if (!crossed && !quoteCrossed) {
+    return { action: 'HOLD' };
   }
-  return { action: 'HOLD' };
+  const firstTrade = crossed ? Math.min(crossed.o, trigger - TICK) : lastPrice!;
+  const spread = lastPrice !== null && bid !== null ? Math.max(lastPrice - bid, 0) : 0;
+  const price = Math.floor((firstTrade - spread) / TICK + ROUNDING_SLACK) * TICK;
+  if (price >= trigger - params.stopLimitGapInr - ROUNDING_SLACK) {
+    return { action: 'SOLD', price: Number(price.toFixed(2)) };
+  }
+  return input.reprice && bid !== null ? { action: 'SOLD', price: bid } : { action: 'UNFILLED' };
 }
 
 export type DayRow = {

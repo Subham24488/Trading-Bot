@@ -68,6 +68,8 @@ export const decisionSnapshotSchema = z.object({
       putWall: nullableNumber,
       pcr: nullableNumber,
       expiryToday: z.boolean(),
+      /** The index's 20-day average close; absent on rows from before the filter existed. */
+      dayAverage: nullableNumber.optional(),
       chart: chartSchema.nullable().optional(),
     }),
   ),
@@ -98,7 +100,8 @@ export const decisionSnapshotSchema = z.object({
       side: sideSchema,
       score: z.number(),
       chosen: z.string(),
-      pickedBy: z.enum(['llm', 'only-candidate', 'fallback']),
+      /** `llm` and `fallback` are on rows from when the AI assistant picked the strike. */
+      pickedBy: z.enum(['top-ranked', 'only-candidate', 'llm', 'fallback']),
       pickerNote: z.string(),
       candidates: z.array(
         z.object({
@@ -141,8 +144,11 @@ export const decisionSnapshotSchema = z.object({
   exit: z
     .object({
       reason: z.enum(EXIT_REASONS),
-      /** `square-off-candle`: a position left open overnight, priced at its own day's 3:15 PM. */
-      priceSource: z.enum(['bid', 'last-trade', 'last-known', 'square-off-candle']),
+      /**
+       * `stop-order`: the stop-loss order's fill. `square-off-candle`: a position left open
+       * overnight, priced at its own day's 3:15 PM.
+       */
+      priceSource: z.enum(['bid', 'last-trade', 'last-known', 'square-off-candle', 'stop-order']),
     })
     .optional(),
   fees: z.object({ totalInr: z.number(), lotSize: z.number() }).optional(),

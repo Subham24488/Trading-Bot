@@ -72,6 +72,16 @@ export type StrategyParams = {
   entryStartMinute: number;
   lastEntryMinute: number;
   expiryDayLastEntryMinute: number;
+  /**
+   * New trades use the nearest expiry at least this many trading days away: with 2, expiry day
+   * and the trading day before it use the next contract.
+   */
+  minTradingDaysToExpiry: number;
+  /**
+   * Calls are bought only above the index's average close of this many days, puts only below
+   * it; 0 turns the filter off.
+   */
+  trendAverageDays: number;
   squareOffMinute: number;
   minEntryScore: number;
   maxOpposingVotes: number;
@@ -104,9 +114,13 @@ export type StrategyParams = {
   maxRiskPerUnitInr: number;
   /** ₹ per unit: fixed stop on the option price, buy price − this; 0 uses the chart stop. */
   stopLossInr: number;
+  /** ₹ per unit: the stop-loss order sells with a limit this far below its trigger price. */
+  stopLimitGapInr: number;
+  /** A triggered stop-loss order still unfilled after this many seconds is re-priced to the bid. */
+  stopRepriceSeconds: number;
   /**
    * Minutes between full reviews of an open trade (ratchet, chart stop, time stop, reversal);
-   * the stop placed at BUY is still checked every 15 seconds in between.
+   * the stop-loss order placed at BUY is still checked every 15 seconds in between.
    */
   openPositionCycleMinutes: number;
   /** ₹ per unit: sell once the option is this much above its buy price; 0 means no target. */
@@ -151,6 +165,10 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   entryStartMinute: 9 * 60 + 30,
   lastEntryMinute: 14 * 60 + 30,
   expiryDayLastEntryMinute: 13 * 60 + 30,
+  // 39-day backtest: skipping a contract's last two sessions made +₹1,480 on weekly prices.
+  minTradingDaysToExpiry: 2,
+  // 39-day backtest: the filter added ₹4,167 on real prices and ₹3,563 on weekly prices.
+  trendAverageDays: 20,
   squareOffMinute: 15 * 60 + 15,
   minEntryScore: 4,
   maxOpposingVotes: 1,
@@ -177,6 +195,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   // About ₹1,050 on a 65-unit NIFTY lot with charges; past stopped trades lost ₹1,650–3,340.
   maxRiskPerUnitInr: 15,
   stopLossInr: 10,
+  stopLimitGapInr: 5,
+  stopRepriceSeconds: 5,
   // 21 real days: reviewing every 5 minutes with the ₹10 stop checked in between made +₹8,888,
   // against +₹1,226 with 1-minute reviews (the ratchet stopped selling on small dips).
   openPositionCycleMinutes: 5,

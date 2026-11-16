@@ -102,7 +102,7 @@ import {
 } from '../strategy/contracts.js';
 import {
   checkPositionExit,
-  checkStandingStop,
+  checkStopOrder,
   profitLockLevelInr,
   decideEntry,
   summarizeDay,
@@ -133,7 +133,6 @@ import {
   SNAPSHOT_SCHEMA,
   type DecisionSnapshot,
 } from '../strategy/snapshot.js';
-import { pickContract, type ContractPickResult } from './contractPicker.js';
 import { estimateOptionsRoundTripCost } from './optionTradeCosts.js';
 
 /** Read-only Kite access; order placement is deliberately not part of this type. */
@@ -144,6 +143,7 @@ export type MarketDataBroker = Pick<
   | 'getDailyCandles'
   | 'getDayInstruments'
   | 'getFiveMinuteCandles'
+  | 'getMinuteCandles'
 >;
 
 export type LlmTradeAdvisorOptions = {
@@ -159,7 +159,7 @@ export type LlmTradeAdvisorOptions = {
   runLock?: DecisionRunLock;
 };
 
-/** Stops are checked this often between cycles, so a fast move is sold close to its level. */
+/** The stop-loss order is checked this often between cycles. */
 const MONITOR_INTERVAL_MS = 15_000;
 
 /**
@@ -175,7 +175,13 @@ const KEEP_ALIVE_MARGIN_MINUTES = 15;
 const SQUARE_OFF_LOOKBACK_MS = 30 * 60_000;
 
 /** The single open trade; `tuuid` ties its BUY, HOLDs and EXIT rows together. */
-type OpenTrade = OpenPosition & { tuuid: string };
+type OpenTrade = OpenPosition & {
+  tuuid: string;
+  /** The stop-loss order has seen every trade before this time. */
+  stopCheckedFrom: Date;
+  /** When the stop-loss order triggered without filling; null while it rests or once sold. */
+  stopTriggeredAt: Date | null;
+};
 
 const EMPTY_BACKDROP: DecisionSnapshot['market'] = {
   vixPct: null,
@@ -201,7 +207,7 @@ export function storedNetPnlInr(
   return round((row.sellPrice - row.buyPrice) * snapshot.fees.lotSize - snapshot.fees.totalInr);
 }
 
-/** Stops compare against the bid (what a sell would get), falling back to the last trade. */
+/** Exit rules compare against the bid (what a sell would get), falling back to the last trade. */
 function exitCheckPrice(quote: MarketQuote | null, lastPrice: number | null): number | null {
   return quote?.bid && quote.bid > 0 ? quote.bid : lastPrice;
 }
@@ -863,10 +869,10 @@ export class LlmTradeAdvisorService {
   }
 
   /**
-   * Rules decide BUY/HOLD/EXIT/SKIP every cycle (aligned to the clock); the LLM only picks
-   * the strike for a BUY. A flat book cycles every LLM_DECISION_INTERVAL_MINUTES; an open
-   * position is fully reviewed every `openPositionCycleMinutes` and its stop placed at BUY is
-   * checked every 15 seconds. Store-only.
+   * Rules decide BUY/HOLD/EXIT/SKIP every cycle (aligned to the clock) and a BUY takes the
+   * top-ranked strike; no AI model is asked. A flat book cycles every
+   * LLM_DECISION_INTERVAL_MINUTES; an open position is fully reviewed every
+   * `openPositionCycleMinutes` and its stop-loss order is checked every 15 seconds. Store-only.
    */
   public async startDecisionLoop(
     indexes?: readonly IndexOptionName[],
@@ -912,7 +918,7 @@ export class LlmTradeAdvisorService {
         openSymbol: this.position?.symbol ?? null,
         paramsVersion: paramsVersion(this.params),
       },
-      'Started rules-based options decision loop (LLM picks the strike only). Store-only.',
+      'Started rules-based options decision loop (top-ranked strike, no AI model). Store-only.',
     );
     return this.getDecisionLoopStatus();
   }
@@ -965,7 +971,7 @@ export class LlmTradeAdvisorService {
     return run;
   }
 
-  /** Every minute while a trade is open; otherwise the .env interval. */
+  /** `openPositionCycleMinutes` while a trade is open; otherwise the .env interval. */
   private cycleIntervalMinutes(): number {
     return this.position
       ? this.params.openPositionCycleMinutes
@@ -990,8 +996,8 @@ export class LlmTradeAdvisorService {
   }
 
   /**
-   * A flat book keeps the .env cadence: a 1-minute slot booked while a trade was open, which
-   * the monitor has sold since, stores nothing and the next cycle falls on the .env interval.
+   * A flat book keeps the .env cadence: a slot booked while a trade was open, which the monitor
+   * has sold since, stores nothing unless it falls on the .env interval.
    */
   private async runScheduledCycle(slot: Date): Promise<number> {
     if (!this.position && istClock(slot).minute % config.llm.decisionIntervalMinutes !== 0) {
@@ -1002,8 +1008,9 @@ export class LlmTradeAdvisorService {
 
   /**
    * Replays one day on the simulator's virtual clock with the live cadence: a cycle on every
-   * slot (the .env interval while flat, `openPositionCycleMinutes` while a trade is open) and the 15-second
-   * stop check in between. `advanceTo` moves the clock that `now` reads. Store-only.
+   * slot (the .env interval while flat, `openPositionCycleMinutes` while a trade is open) and
+   * the 15-second stop-loss order check in between, sooner when a triggered order waits to be
+   * re-priced. `advanceTo` moves the clock that `now` reads. Store-only.
    */
   public async replayDay(input: {
     indexes: readonly IndexOptionName[];
@@ -1034,7 +1041,17 @@ export class LlmTradeAdvisorService {
       while (monitorAt <= this.now().getTime()) {
         monitorAt += MONITOR_INTERVAL_MS;
       }
+      const repriceAt = this.stopRepriceAt();
+      if (repriceAt !== null && repriceAt > this.now().getTime()) {
+        monitorAt = Math.min(monitorAt, repriceAt);
+      }
     }
+  }
+
+  /** When a triggered, unfilled stop-loss order is due to be re-priced to the bid; else null. */
+  private stopRepriceAt(): number | null {
+    const triggeredAt = this.position?.stopTriggeredAt;
+    return triggeredAt ? triggeredAt.getTime() + this.params.stopRepriceSeconds * 1_000 : null;
   }
 
   private async monitorTick(): Promise<void> {
@@ -1066,6 +1083,7 @@ export class LlmTradeAdvisorService {
     const view = await this.feed.load(indexes, now, {
       extraSymbols: open ? [open.symbol] : [],
       newsLookbackMinutes: this.params.newsLookbackMinutes,
+      minTradingDaysToExpiry: this.params.minTradingDaysToExpiry,
     });
     if (!open && !view.isTradingDay) {
       this.logger.info(
@@ -1144,19 +1162,8 @@ export class LlmTradeAdvisorService {
       });
     }
 
-    const pick = await pickContract(
-      this.llm,
-      {
-        index: entry.index,
-        side: entry.side,
-        score: entry.score,
-        minutesToSquareOff: this.params.squareOffMinute - istClock(now).minute,
-        candidates,
-        targetDelta: this.params.targetDelta,
-      },
-      this.logger,
-    );
-    return this.storeBuy({ view, readings, now, reading: entry.reading, pick, candidates });
+    // Candidates are ranked best first: the top one is the strike closest to `targetDelta`.
+    return this.storeBuy({ view, readings, now, reading: entry.reading, candidates });
   }
 
   private async todayRows(now: Date): Promise<DayRow[]> {
@@ -1216,6 +1223,19 @@ export class LlmTradeAdvisorService {
     now: Date,
   ): Promise<number> {
     const quote = view.extraQuotes[position.symbol] ?? null;
+    // The stop-loss order first: once it has triggered there is nothing else to review.
+    const sold = await this.checkStopOrderNow({
+      position,
+      quote,
+      now,
+      trigger: 'cycle',
+      spots: view.spots,
+      view,
+      readings,
+    });
+    if (sold !== null) {
+      return sold;
+    }
     const price = this.trackPrice(position, quote);
     const reading = readings.find((item) => item.index === position.index) ?? null;
     this.trailStop(position, reading);
@@ -1301,8 +1321,8 @@ export class LlmTradeAdvisorService {
   }
 
   /**
-   * 15-second monitor: only the stop placed at BUY (and stale/15:15). The start-up check of a
-   * restored position runs every exit rule.
+   * 15-second monitor: only the stop-loss order placed at BUY (and stale/15:15). The start-up
+   * check of a restored position runs every exit rule.
    */
   private async checkOpenPositionNow(trigger: 'monitor' | 'startup'): Promise<void> {
     const position = this.position;
@@ -1320,19 +1340,9 @@ export class LlmTradeAdvisorService {
     // A position from an earlier day is sold at once; today's prices must not move its best/worst.
     const stale = istClock(position.enteredAt).ymd < istClock(now).ymd;
     if (trigger === 'monitor') {
-      // Between full reviews only the stop placed at BUY is watched. The best price (and so the
+      // Between full reviews only the stop-loss order is watched. The best price (and so the
       // ratchet) moves only at the reviews, so small dips between them do not sell the trade.
-      const last = !stale && quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : null;
-      if (last !== null) {
-        this.lastQuotedPriceBySymbol[position.symbol] = last;
-      }
-      const standing = checkStandingStop(
-        { now, position, price: exitCheckPrice(quote, last) },
-        this.params,
-      );
-      if (standing.action === 'EXIT') {
-        await this.storeExit({ position, quote, reason: standing.reason, now, trigger, spots });
-      }
+      await this.checkStopOrderNow({ position, quote, now, trigger, spots });
       return;
     }
     const price = stale ? null : this.trackPrice(position, quote);
@@ -1349,6 +1359,79 @@ export class LlmTradeAdvisorService {
     if (check.action === 'EXIT') {
       await this.storeExit({ position, quote, reason: check.reason, now, trigger, spots });
     }
+  }
+
+  /**
+   * Checks the stop-loss order placed at BUY against every price traded since its last check.
+   * Returns null while the order rests; otherwise the rows stored: the sale, or 0 when the
+   * order triggered without filling and now waits to be re-priced to the bid.
+   */
+  private async checkStopOrderNow(input: {
+    position: OpenTrade;
+    quote: MarketQuote | null;
+    now: Date;
+    trigger: DecisionSnapshot['trigger'];
+    spots: Partial<Record<IndexOptionName, number>>;
+    view?: MarketView;
+    readings?: IndexReading[];
+  }): Promise<number | null> {
+    const { position, quote, now } = input;
+    const lastPrice = quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : null;
+    // A position from an earlier day is sold at once, whatever traded since.
+    const boughtToday = istClock(position.enteredAt).ymd === istClock(now).ymd;
+    const bars = boughtToday
+      ? await this.feed.minuteBarsSince(
+          position.symbol,
+          position.token,
+          position.stopCheckedFrom,
+          now,
+        )
+      : [];
+    const repriceAt = this.stopRepriceAt();
+    const check = checkStopOrder(
+      {
+        now,
+        position,
+        bars,
+        lastPrice,
+        bid: quote?.bid ?? null,
+        reprice: repriceAt !== null && now.getTime() >= repriceAt,
+      },
+      this.params,
+    );
+    if (check.action === 'EXIT') {
+      return this.storeExit({ ...input, reason: check.reason });
+    }
+    if (check.action === 'SOLD') {
+      return this.storeExit({ ...input, reason: 'stop-loss', stopFillPrice: check.price });
+    }
+    if (lastPrice !== null) {
+      this.lastQuotedPriceBySymbol[position.symbol] = lastPrice;
+    }
+    if (check.action === 'UNFILLED') {
+      if (position.stopTriggeredAt === null) {
+        position.stopTriggeredAt = now;
+        this.scheduleStopReprice();
+      }
+      return 0;
+    }
+    // The newest candle may still be forming, so the next check reads it again.
+    const newest = bars.at(-1);
+    if (newest) {
+      position.stopCheckedFrom = new Date(newest.t);
+    }
+    return null;
+  }
+
+  /** Live loop only: checks a triggered, unfilled stop-loss order again once it can be re-priced. */
+  private scheduleStopReprice(): void {
+    if (!this.running) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      void this.monitorTick();
+    }, this.params.stopRepriceSeconds * 1_000);
+    timer.unref?.();
   }
 
   /** Rebuilds the open position from the DB on start; closes it at once if it is from an earlier day. */
@@ -1387,6 +1470,9 @@ export class LlmTradeAdvisorService {
       // The latest HOLD carries the trailed stop; the BUY carries the planned one.
       stopSpot: latest?.stopSpot ?? buySnapshot?.entry?.plan?.stopSpot ?? null,
       premiumStop: latest?.premiumStop ?? buySnapshot?.entry?.plan?.premiumStop ?? null,
+      // The stop-loss order is checked again from the buy, in case it triggered while stopped.
+      stopCheckedFrom: trade.enteredAt,
+      stopTriggeredAt: null,
     };
     this.applyDecisionState('HOLD', trade.symbol, trade.instrumentToken);
     if (istClock(trade.enteredAt).ymd < istClock(this.now()).ymd) {
@@ -1446,7 +1532,7 @@ export class LlmTradeAdvisorService {
     readings: IndexReading[];
     now: Date;
     reading: IndexReading;
-    pick: ContractPickResult;
+    /** Contracts that passed every check, best first; the first one is bought. */
     candidates: ContractCandidate[];
   }): Promise<number> {
     if (this.position) {
@@ -1454,7 +1540,12 @@ export class LlmTradeAdvisorService {
         `A trade is already open (${this.position.symbol}, tuuid ${this.position.tuuid}); BUY refused.`,
       );
     }
-    const { candidate, pickedBy, note, llm } = input.pick;
+    const candidate = input.candidates[0];
+    if (!candidate) {
+      throw new Error('A BUY needs at least one contract that passed the checks.');
+    }
+    const onlyOne = input.candidates.length === 1;
+    const pickedBy = onlyOne ? 'only-candidate' : 'top-ranked';
     const fillPrice = candidate.ask;
     const position: OpenTrade = {
       tuuid: randomUUID(),
@@ -1473,6 +1564,9 @@ export class LlmTradeAdvisorService {
       entrySpot: input.view.spots[candidate.index] ?? input.reading.spot ?? null,
       stopSpot: candidate.plan?.stopSpot ?? null,
       premiumStop: candidate.plan?.premiumStop ?? null,
+      // The stop-loss order is placed the moment the buy fills.
+      stopCheckedFrom: input.now,
+      stopTriggeredAt: null,
     };
     const chartPlan = input.reading.chart?.plans[candidate.side];
     const plan =
@@ -1488,15 +1582,11 @@ export class LlmTradeAdvisorService {
       candidate,
       fillPrice,
       reading: input.reading,
-      pickedBy,
       candidateCount: input.candidates.length,
       params: this.params,
     });
     const meta: DecisionMeta = {
       confidence: Math.abs(input.reading.score) / SIGNAL_NAMES.length,
-      ...(llm
-        ? { model: llm.model, promptHash: llm.promptHash, rawCompletion: llm.rawCompletion }
-        : {}),
     };
     const stored = await this.persist({
       asOf: input.now,
@@ -1520,7 +1610,9 @@ export class LlmTradeAdvisorService {
             score: input.reading.score,
             chosen: candidate.symbol,
             pickedBy,
-            pickerNote: note,
+            pickerNote: onlyOne
+              ? 'Only one contract passed the checks.'
+              : `Top-ranked of ${input.candidates.length}: the strike closest to delta ${this.params.targetDelta}.`,
             candidates: input.candidates.map((item) => ({
               symbol: item.symbol,
               strike: item.strike,
@@ -1649,22 +1741,32 @@ export class LlmTradeAdvisorService {
     spots: Partial<Record<IndexOptionName, number>>;
     view?: MarketView;
     readings?: IndexReading[];
+    /** The price the stop-loss order filled at; the sale is recorded at it. */
+    stopFillPrice?: number;
   }): Promise<number> {
     const { position } = input;
     const squareOffPrice =
       input.reason === 'stale-position' ? await this.squareOffPrice(position) : null;
+    const stopFillPrice = input.stopFillPrice ?? null;
     const last = input.quote?.lastPrice && input.quote.lastPrice > 0 ? input.quote.lastPrice : null;
     const bid = input.quote?.bid ?? null;
     const exitPrice =
-      squareOffPrice ?? bid ?? last ?? this.lastQuotedPriceBySymbol[position.symbol] ?? null;
+      squareOffPrice ??
+      stopFillPrice ??
+      bid ??
+      last ??
+      this.lastQuotedPriceBySymbol[position.symbol] ??
+      null;
     const priceSource =
       squareOffPrice !== null
         ? 'square-off-candle'
-        : bid !== null
-          ? 'bid'
-          : last !== null
-            ? 'last-trade'
-            : 'last-known';
+        : stopFillPrice !== null
+          ? 'stop-order'
+          : bid !== null
+            ? 'bid'
+            : last !== null
+              ? 'last-trade'
+              : 'last-known';
     // Held until the square-off of the day it was bought when priced from that day's candle.
     const exitAt =
       squareOffPrice !== null
@@ -1895,6 +1997,7 @@ export class LlmTradeAdvisorService {
         putWall: reading.putWall,
         pcr: reading.pcr,
         expiryToday: reading.expiryToday,
+        dayAverage: round(reading.dayAverage),
         chart: reading.chart
           ? {
               atr: Number(reading.chart.atr.toFixed(2)),

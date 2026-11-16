@@ -5,7 +5,7 @@ import { msUntilNextCycle } from '../src/strategy/clock.js';
 import type { ChainQuote, ContractCandidate } from '../src/strategy/contracts.js';
 import {
   checkPositionExit,
-  checkStandingStop,
+  checkStopOrder,
   decideEntry,
   levelRoomPct,
   profitFloor,
@@ -82,6 +82,7 @@ function bullishMarket(): { data: IndexMarketData; backdrop: MarketBackdrop } {
       futuresPrice,
       futuresVwap: futuresPrice - 30,
       futuresBars,
+      dailyBars: [],
       chain: [
         ...strikes.map((strike) => chainRow('CE', strike, 5_000_000, 100_000)),
         ...strikes.map((strike) => chainRow('PE', strike, 5_000_000, 800_000)),
@@ -120,6 +121,7 @@ function reading(
     lastCandle: { pattern: 'none', side: null },
     chart: null,
     spot: 25_000,
+    dayAverage: null,
     futuresPrice: 25_060,
     vwap: 25_030,
     callWall: 25_300,
@@ -274,6 +276,25 @@ describe('decideEntry', () => {
     expect(decision).toMatchObject({ action: 'BUY', index: 'NIFTY', side: 'CE', score: 8 });
   });
 
+  it('buys puts only below the 20-day average, and either side while it is unknown', () => {
+    const bearish = Object.fromEntries(SIGNAL_NAMES.map((name) => [name, -1])) as Record<
+      SignalName,
+      Vote
+    >;
+    const decide = (dayAverage: number | null) =>
+      decideEntry(
+        { now, readings: [reading({ votes: bearish, dayAverage })], day: quietDay, vixPct: 0 },
+        params,
+      );
+    // NIFTY is at 25,000.
+    expect(decide(25_100)).toMatchObject({ action: 'BUY', side: 'PE' });
+    expect(decide(null)).toMatchObject({ action: 'BUY', side: 'PE' });
+    expect(decide(24_900)).toMatchObject({
+      action: 'SKIP',
+      blockedBy: ['against-day-average'],
+    });
+  });
+
   it.each([
     ['outside the entry window', { now: ist('2026-10-21', '09:20') }, 'entry-window'],
     [
@@ -292,11 +313,13 @@ describe('decideEntry', () => {
     ['with two opposing signals', { votes: { breadth: -1, globalMood: -1 } }, 'too-many-opposing'],
     ['against the trend', { votes: { trend: -1 } }, 'trend-disagrees'],
     ['when chasing a stretched move', { rsi: 80 }, 'chasing'],
+    ['a call while NIFTY is below its 20-day average', { dayAverage: 25_100 }, 'against-day-average'],
   ] as const)('skips %s', (_label, scenario, gate) => {
     const scenarioReading = reading({
       expiryToday: 'expiry' in scenario,
       ...('votes' in scenario ? { votes: scenario.votes } : {}),
       ...('rsi' in scenario ? { rsi: scenario.rsi } : {}),
+      ...('dayAverage' in scenario ? { dayAverage: scenario.dayAverage } : {}),
     });
     const decision = decideEntry(
       {
@@ -774,7 +797,6 @@ describe('checkPositionExit', () => {
       { enteredAt: ist('2026-10-20', '14:00'), now: '09:30', price: 100 },
       'stale-position',
     ],
-    ['stop-loss', { now: '10:20', price: 74 }, 'stop-loss'],
     [
       'trailing stop after a big gain',
       { now: '10:40', price: 119, peakPrice: 140 },
@@ -836,13 +858,8 @@ describe('checkPositionExit', () => {
       null,
     ],
     [
-      'planned premium stop once the bid reaches the loss limit',
+      'hold at the planned loss limit: that sale belongs to the stop-loss order',
       { now: '10:10', price: 92, spot: 24_990, stopSpot: 24_985, premiumStop: 92 },
-      'stop-loss',
-    ],
-    [
-      'hold a cent above the planned premium stop',
-      { now: '10:10', price: 92.05, spot: 24_990, stopSpot: 24_985, premiumStop: 92 },
       null,
     ],
   ] as const)('%s', (_label, scenario, reason) => {
@@ -1021,28 +1038,8 @@ describe('checkPositionExit with the ₹5-step profit ratchet and pullback rules
     expect(check(140.15, 140.25)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
   });
 
-  it('between reviews watches only the ₹10 stop placed at BUY (plus stale and 3:15 PM)', () => {
-    const standing = (
-      time: string,
-      price: number,
-      peakPrice = 120.3,
-      enteredAt = position.enteredAt,
-    ) =>
-      checkStandingStop(
-        { now: ist('2026-11-13', time), position: { ...position, peakPrice, enteredAt }, price },
-        current,
-      );
-    expect(standing('11:05', 110.3)).toEqual({ action: 'EXIT', reason: 'stop-loss' });
-    expect(standing('11:05', 110.35)).toEqual({ action: 'HOLD' });
-    // Once the ratchet has armed, a dip waits for the next full review.
-    expect(standing('11:05', 105, 131)).toEqual({ action: 'HOLD' });
-    // No ratchet, time stop or chart stop between reviews: a fall back from +₹15 holds.
-    expect(standing('12:30', 121, 120.3)).toEqual({ action: 'HOLD' });
-    expect(standing('15:15', 125)).toEqual({ action: 'EXIT', reason: 'square-off' });
-    expect(standing('09:20', 125, 120.3, ist('2026-11-12', '14:00'))).toEqual({
-      action: 'EXIT',
-      reason: 'stale-position',
-    });
+  it('leaves the ₹10 stop to the stop-loss order: a review holds at that price', () => {
+    expect(at('11:05', 110.3)).toEqual({ action: 'HOLD' });
   });
 
   it('lets only the ratchet and the 3:15 PM square-off close an armed trade', () => {
@@ -1052,17 +1049,129 @@ describe('checkPositionExit with the ₹5-step profit ratchet and pullback rules
     expect(at('15:15', 131, turned, 132)).toEqual({ action: 'EXIT', reason: 'square-off' });
   });
 
-  it('sells at the fixed ₹10 stop', () => {
-    expect(at('11:05', 110.35)).toEqual({ action: 'HOLD' });
-    expect(at('11:05', 110.3)).toEqual({ action: 'EXIT', reason: 'stop-loss' });
-  });
-
   it('reverses only when the 15-minute trend turns, not on the price votes', () => {
     const bullishVotes = reading({ chart: chartRead({ higherTrend: 'down' }) });
     // All 8 votes point up after the minimum hold, but the 15-minute trend is still down.
     expect(at('11:15', 118, bullishVotes)).toEqual({ action: 'HOLD' });
     const turned = reading({ chart: chartRead({ higherTrend: 'up' }) });
     expect(at('11:15', 118, turned)).toEqual({ action: 'EXIT', reason: 'trend-reversal' });
+  });
+});
+
+describe('20-day average', () => {
+  it('is the average close of the last 20 days, and unknown with fewer', () => {
+    const { data, backdrop } = bullishMarket();
+    const now = ist('2026-10-21', '10:30');
+    // 25 daily closes: 24,000, 24,010 … 24,240. The last 20 average 24,145.
+    const dailyBars = Array.from({ length: 25 }, (_, day) => {
+      const close = 24_000 + day * 10;
+      return { d: `2026-09-${String(day + 1).padStart(2, '0')}`, o: close, h: close, l: close, c: close, v: 0 };
+    });
+    expect(readIndex({ ...data, dailyBars }, backdrop, current, now).dayAverage).toBeCloseTo(24_145);
+    expect(
+      readIndex({ ...data, dailyBars: dailyBars.slice(0, 19) }, backdrop, current, now).dayAverage,
+    ).toBeNull();
+  });
+});
+
+describe('checkStopOrder: the stop-loss order placed at BUY', () => {
+  // Bought at ₹120.30: the order triggers at ₹110.30 and sells with a limit of ₹105.30.
+  const position: OpenPosition = {
+    symbol: 'NIFTY26N1725150PE',
+    index: 'NIFTY',
+    side: 'PE',
+    strike: 25_150,
+    expiry: '2026-11-17',
+    token: 1,
+    entryPrice: 120.3,
+    enteredAt: ist('2026-11-13', '10:55'),
+    peakPrice: 120.3,
+    troughPrice: 120.3,
+    lotSize: 65,
+    entryDelta: 0.41,
+    entrySpot: 25_225,
+    stopSpot: 25_260,
+    premiumStop: 110.3,
+  };
+  const candle = (open: number, low: number, close: number) => ({
+    t: ist('2026-11-13', '11:04').toISOString(),
+    o: open,
+    h: Math.max(open, close),
+    l: low,
+    c: close,
+    v: 1_000,
+  });
+  const check = (input: {
+    time?: string;
+    bars?: ReturnType<typeof candle>[];
+    lastPrice: number;
+    bid: number;
+    reprice?: boolean;
+    enteredAt?: Date;
+    peakPrice?: number;
+  }) =>
+    checkStopOrder(
+      {
+        now: ist('2026-11-13', input.time ?? '11:05'),
+        position: {
+          ...position,
+          enteredAt: input.enteredAt ?? position.enteredAt,
+          peakPrice: input.peakPrice ?? position.peakPrice,
+        },
+        bars: input.bars ?? [],
+        lastPrice: input.lastPrice,
+        bid: input.bid,
+        reprice: input.reprice ?? false,
+      },
+      current,
+    );
+
+  it('rests while the option trades above the stop', () => {
+    expect(check({ bars: [candle(118, 110.35, 116)], lastPrice: 116, bid: 115.9 })).toEqual({
+      action: 'HOLD',
+    });
+  });
+
+  it('sells one tick under the stop, at the bid, when a candle traded down through it', () => {
+    // The low touched ₹110.00 and the price came back to ₹116: the order had already sold.
+    expect(check({ bars: [candle(118, 110, 116)], lastPrice: 116, bid: 115.9 })).toEqual({
+      action: 'SOLD',
+      price: 110.15,
+    });
+  });
+
+  it('sells at the open, not at the stop, when a candle opened below it', () => {
+    expect(check({ bars: [candle(108, 107, 107.5)], lastPrice: 107.5, bid: 107.4 })).toEqual({
+      action: 'SOLD',
+      price: 107.9,
+    });
+  });
+
+  it('sells at the bid when only the quote shows a trade at the stop', () => {
+    expect(check({ lastPrice: 110.3, bid: 110.2 })).toEqual({ action: 'SOLD', price: 110.2 });
+  });
+
+  it('stays unfilled under its ₹5 limit, then is re-priced to the bid', () => {
+    const gapped = { bars: [candle(103, 102, 104)], lastPrice: 104, bid: 103.9 };
+    expect(check(gapped)).toEqual({ action: 'UNFILLED' });
+    expect(check({ ...gapped, reprice: true })).toEqual({ action: 'SOLD', price: 103.9 });
+  });
+
+  it('keeps resting after the profit lock has armed', () => {
+    expect(check({ lastPrice: 110.3, bid: 110.2, peakPrice: 131 })).toEqual({
+      action: 'SOLD',
+      price: 110.2,
+    });
+  });
+
+  it('closes a trade at 3:15 PM and one left open from an earlier day', () => {
+    expect(check({ time: '15:15', lastPrice: 125, bid: 124.9 })).toEqual({
+      action: 'EXIT',
+      reason: 'square-off',
+    });
+    expect(
+      check({ time: '09:20', lastPrice: 125, bid: 124.9, enteredAt: ist('2026-11-12', '14:00') }),
+    ).toEqual({ action: 'EXIT', reason: 'stale-position' });
   });
 });
 
@@ -1144,7 +1253,6 @@ describe('plain-English rationale', () => {
         candidate,
         fillPrice: 120.2,
         reading: marketReading,
-        pickedBy: 'llm',
         candidateCount: 3,
         params,
       }),
@@ -1196,7 +1304,6 @@ describe('plain-English rationale', () => {
       candidate,
       fillPrice: 120.2,
       reading: marketReading,
-      pickedBy: 'llm',
       candidateCount: 3,
       params,
     });
@@ -1262,7 +1369,6 @@ describe('plain-English rationale', () => {
       candidate: { ...candidate, plan },
       fillPrice: 120.2,
       reading: chartReading,
-      pickedBy: 'llm',
       candidateCount: 3,
       params,
     });
@@ -1270,7 +1376,7 @@ describe('plain-English rationale', () => {
     expect(buy.length).toBeLessThanOrEqual(1200);
     expect(buy.endsWith('…')).toBe(false);
     expect(buy).toContain(
-      'Plan: sell if NIFTY falls below 24,983 (under the low of the last two 5-minute candles) or the option falls to ₹111.15, a planned loss of about ₹657.40 on 1 lot after charges.',
+      'Plan: sell if NIFTY falls below 24,983 (under the low of the last two 5-minute candles); a stop-loss order sells if the option trades at ₹111.15, a planned loss of about ₹657.40 on 1 lot after charges.',
     );
     expect(buy).toContain(
       'Next level: 25,060 (a recent high where it turned back), 60 points away',
@@ -1291,7 +1397,9 @@ describe('plain-English rationale', () => {
       reading: null,
       params,
     });
-    expect(armed).toContain('Exit if NIFTY falls below 24,983 or the option falls to ₹111.15');
+    expect(armed).toContain(
+      'Exit if NIFTY falls below 24,983; the stop-loss order sells if the option trades at ₹111.15',
+    );
     expect(armed).toContain('the ₹10 profit lock is on, so it sells below ₹130.20');
     const early = describeHold({
       position: { ...stops, peakPrice: 123 },
@@ -1350,7 +1458,6 @@ describe('plain-English rationale', () => {
       candidate: { ...candidate, plan },
       fillPrice: 120.2,
       reading: reading({ chart: chartRead() }),
-      pickedBy: 'llm',
       candidateCount: 3,
       params: current,
     });
@@ -1358,7 +1465,7 @@ describe('plain-English rationale', () => {
     expect(buy.length).toBeLessThanOrEqual(1200);
     expect(buy.endsWith('…')).toBe(false);
     expect(buy).toContain(
-      'Plan: sell if the option falls to ₹110.20 (₹10 below the buy price), a planned loss of about ₹721.40 on 1 lot after charges, or earlier if NIFTY falls below 24,983',
+      'Plan: a stop-loss order sells if the option trades at ₹110.20 (₹10 below the buy price), a planned loss of about ₹721.40 on 1 lot after charges, or we sell earlier if NIFTY falls below 24,983',
     );
     expect(buy).toContain(
       'Once it reaches ₹130.20 (₹10 above the buy price), the exit moves up to ₹130.20 (about ₹576.30 after charges) and then ₹5 higher for every further ₹5 gain; it is never sold at a target.',
@@ -1373,7 +1480,8 @@ describe('plain-English rationale', () => {
       reading: null,
       params: current,
     });
-    expect(hold).toContain('or the option falls to ₹110.20');
+    expect(hold).toContain('the stop-loss order sells if the option trades at ₹110.20');
+    expect(buy).toContain('It was the best-ranked of 3 options that passed our checks.');
     expect(hold).not.toContain('takes profit');
     const armed = describeHold({
       position: { ...position, peakPrice: 137 },

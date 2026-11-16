@@ -202,15 +202,3 @@ export function clampDecisionsToAllowed(
   }
   return { batch: { ...batch, decisions: kept }, dropped };
 }
-
-/** The LLM's only job in the decision loop: name one contract from the candidate list. */
-export const contractPickSchema = z.object({
-  symbol: z
-    .string()
-    .trim()
-    .min(1)
-    .transform((value) => value.toUpperCase()),
-  reason: z.string().trim().min(1).max(400),
-});
-
-export type ContractPick = z.infer<typeof contractPickSchema>;

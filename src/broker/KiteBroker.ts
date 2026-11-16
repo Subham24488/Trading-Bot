@@ -538,7 +538,10 @@ export class KiteBroker implements BrokerAdapter {
     return this.intradayCandles(instrumentToken, '5minute', fromIst, toIst, options);
   }
 
-  /** 1-minute bars between IST wall-clock datetimes; used to record a day for a simulation. */
+  /**
+   * 1-minute bars between IST wall-clock datetimes: the prices the stop-loss order is checked
+   * against, and a whole day when recording it for a simulation.
+   */
   public async getMinuteCandles(
     instrumentToken: number,
     fromIst: string,

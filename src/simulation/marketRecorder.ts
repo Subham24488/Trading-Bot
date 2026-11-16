@@ -22,6 +22,7 @@ import {
   VIX_KEY,
   spotKey,
 } from '../services/LiveMarketFeed.js';
+import { DEFAULT_STRATEGY } from '../strategy/params.js';
 import { addCalendarDays, istYmd } from '../universe/dates.js';
 import type { DailyBar, IntradayBar } from '../universe/types.js';
 
@@ -256,10 +257,11 @@ export async function recordMarketDay(input: {
       continue;
     }
     const own = contracts.filter((contract) => contract.name === index);
+    // The same expiry the decision loop trades that day.
     const expiry = chooseTradingExpiry(
       own.map((contract) => contract.expiry),
       date,
-      MIN_DAYS_TO_EXPIRY,
+      DEFAULT_STRATEGY.minTradingDaysToExpiry,
     );
     if (!expiry) {
       gaps.push(`${index} options: no listed expiry after ${date}`);

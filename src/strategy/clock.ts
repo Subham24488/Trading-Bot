@@ -51,6 +51,32 @@ export function formatIstTime(date: Date): string {
   return formatClockTime(istClock(date).minute);
 }
 
+/**
+ * NSE trading holidays that fall on a weekday, from the exchange's yearly holiday list. Add each
+ * new year's dates when the exchange publishes them.
+ */
+export const MARKET_HOLIDAYS: ReadonlySet<string> = new Set([
+  '2026-10-02',
+  '2026-10-20',
+  '2026-11-10',
+  '2026-11-24',
+  '2026-12-25',
+]);
+
+/** Trading days after `fromYmd` up to and including `toYmd`; 0 when `toYmd` is not later. */
+export function tradingDaysUntil(fromYmd: string, toYmd: string): number {
+  const end = Date.parse(`${toYmd}T00:00:00Z`);
+  let days = 0;
+  for (let at = Date.parse(`${fromYmd}T00:00:00Z`) + DAY_MS; at <= end; at += DAY_MS) {
+    const date = new Date(at);
+    const weekend = date.getUTCDay() === 0 || date.getUTCDay() === 6;
+    if (!weekend && !MARKET_HOLIDAYS.has(date.toISOString().slice(0, 10))) {
+      days += 1;
+    }
+  }
+  return days;
+}
+
 export function minutesBetween(from: Date, to: Date): number {
   return Math.max(0, Math.floor((to.getTime() - from.getTime()) / 60_000));
 }

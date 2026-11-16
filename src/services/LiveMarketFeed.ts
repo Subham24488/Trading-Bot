@@ -10,9 +10,11 @@ import type { NewsItem, NewsService } from '../news/NewsService.js';
 import { scoreOptionNewsRisk, type OptionNewsRiskLevel } from '../options/greeksIv.js';
 import {
   filterNearestWeeklyAtmBand,
+  indexExpiries,
   nearestFuture,
   parseNfoIndexOptions,
   type FutureContract,
+  type IndexExpiry,
   type KiteRawInstrument,
   type NfoOptionContract,
 } from '../options/nfoChain.js';
@@ -25,7 +27,11 @@ import type { DailyBar, IntradayBar } from '../universe/types.js';
 
 export type MarketDataSource = Pick<
   KiteBroker,
-  'getQuotes' | 'getDayInstruments' | 'getFiveMinuteCandles' | 'getDailyCandles'
+  | 'getQuotes'
+  | 'getDayInstruments'
+  | 'getFiveMinuteCandles'
+  | 'getMinuteCandles'
+  | 'getDailyCandles'
 >;
 
 export type HeadlineSource = Pick<NewsService, 'fetchIndexNews'>;
@@ -47,7 +53,7 @@ export type MarketView = {
 
 export const VIX_KEY = 'NSE:INDIA VIX';
 export const CHAIN_WINGS = 5;
-/** New positions never use a contract that expires today. */
+/** Futures prices never come from a contract that expires today. */
 export const MIN_DAYS_TO_EXPIRY = 1;
 export const FUTURES_LOOKBACK_DAYS = 7;
 export const DAILY_LOOKBACK_DAYS = 45;
@@ -110,8 +116,11 @@ export class LiveMarketFeed {
       unavailable: new Set<InstrumentExchange>(),
       indexDaily: {} as Partial<Record<IndexOptionName, DailyBar[]>>,
       firstOi: new Map<string, number>(),
-      /** Parsed index option contracts by requested indexes; the dump is fixed for the day. */
-      contracts: new Map<string, NfoOptionContract[]>(),
+      /**
+       * Parsed index option contracts and each index's expiry dates, by requested indexes; the
+       * dump is fixed for the day.
+       */
+      contracts: new Map<string, { contracts: NfoOptionContract[]; expiries: IndexExpiry[] }>(),
       /** Futures bars from earlier days by instrument token; only today's bars are re-fetched. */
       futuresHistory: new Map<number, IntradayBar[]>(),
     };
@@ -120,7 +129,11 @@ export class LiveMarketFeed {
   public async load(
     indexes: readonly IndexOptionName[],
     now: Date,
-    options: { extraSymbols?: readonly string[]; newsLookbackMinutes: number },
+    options: {
+      extraSymbols?: readonly string[];
+      newsLookbackMinutes: number;
+      minTradingDaysToExpiry: number;
+    },
   ): Promise<MarketView> {
     const clock = istClock(now);
     if (this.day.ymd !== clock.ymd) {
@@ -167,14 +180,12 @@ export class LiveMarketFeed {
       }
     }
 
-    const contractsKey = [...indexes].sort().join(',');
-    let contracts = this.day.contracts.get(contractsKey);
-    if (!contracts) {
-      contracts = parseNfoIndexOptions(nfoRows, indexes);
-      if (nfoRows.length > 0) {
-        this.day.contracts.set(contractsKey, contracts);
-      }
-    }
+    const { contracts, expiries } = this.listedContracts(
+      nfoRows,
+      indexes,
+      clock.ymd,
+      options.minTradingDaysToExpiry,
+    );
     const steps = Object.fromEntries(
       wanted.map((row) => [row.tradingsymbol, row.strikeStep]),
     ) as Partial<Record<IndexOptionName, number>>;
@@ -184,7 +195,7 @@ export class LiveMarketFeed {
       steps,
       clock.ymd,
       CHAIN_WINGS,
-      MIN_DAYS_TO_EXPIRY,
+      options.minTradingDaysToExpiry,
     );
     const extraSymbols = [...new Set(options.extraSymbols ?? [])];
     const chainQuotes = await this.quotes(
@@ -209,7 +220,8 @@ export class LiveMarketFeed {
       const futureQuote = future
         ? readQuote(marketQuotes, `NFO:${future.tradingsymbol}`)
         : undefined;
-      indexDaily[index] = await this.dailyBars(row, clock.ymd, gaps);
+      const dailyBars = await this.dailyBars(row, clock.ymd, gaps);
+      indexDaily[index] = dailyBars;
       indexData.push({
         index,
         spot: spots[index] ?? null,
@@ -218,10 +230,9 @@ export class LiveMarketFeed {
         futuresPrice: futureQuote?.lastPrice ?? null,
         futuresVwap: futureQuote?.vwap ?? null,
         futuresBars: await this.futuresBars(index, future, now, gaps),
+        dailyBars,
         chain: chain.filter((quote) => quote.index === index),
-        expiryToday: contracts.some(
-          (contract) => contract.name === index && contract.expiry === clock.ymd,
-        ),
+        expiryToday: expiries.some((item) => item.index === index && item.expiryToday),
         newsLevel: 'none',
       });
     }
@@ -267,7 +278,67 @@ export class LiveMarketFeed {
     };
   }
 
-  /** One quote call for the open option plus the index spots (used every minute). */
+  /**
+   * Today's index option contracts and each selected index's own expiry dates, read from the
+   * exchange's instrument list the first time the day's list arrives and logged then. Weekly or
+   * monthly, and moved for a holiday or not, the dates are whatever the exchange lists.
+   */
+  private listedContracts(
+    nfoRows: readonly KiteRawInstrument[],
+    indexes: readonly IndexOptionName[],
+    ymd: string,
+    minTradingDaysToExpiry: number,
+  ): { contracts: NfoOptionContract[]; expiries: IndexExpiry[] } {
+    const key = [...indexes].sort().join(',');
+    const cached = this.day.contracts.get(key);
+    if (cached) {
+      return cached;
+    }
+    const contracts = parseNfoIndexOptions(nfoRows, indexes);
+    const listed = {
+      contracts,
+      expiries: indexExpiries(contracts, indexes, ymd, minTradingDaysToExpiry),
+    };
+    if (nfoRows.length > 0) {
+      this.day.contracts.set(key, listed);
+      this.logger.info(
+        { date: ymd, expiries: listed.expiries },
+        'Checked expiry dates for the selected indexes from the exchange instrument list.',
+      );
+    }
+    return listed;
+  }
+
+  /**
+   * The option's 1-minute candles that began at or after `since`, oldest first, so the stop-loss
+   * order sees every price traded between two checks. Empty when they cannot be read.
+   */
+  public async minuteBarsSince(
+    symbol: string,
+    token: number | null,
+    since: Date,
+    now: Date,
+  ): Promise<IntradayBar[]> {
+    if (token === null || token <= 0) {
+      return [];
+    }
+    try {
+      const bars = await this.kite.getMinuteCandles(
+        token,
+        formatIstWallClock(since),
+        formatIstWallClock(now),
+      );
+      return bars.filter((bar) => Date.parse(bar.t) >= since.getTime());
+    } catch (error: unknown) {
+      this.logger.warn(
+        { err: error, symbol },
+        'Option 1-minute candles failed; the stop-loss order is checked on the quote alone.',
+      );
+      return [];
+    }
+  }
+
+  /** One quote call for the open option plus the index spots (used every 15 seconds). */
   public async quotePosition(
     symbol: string,
   ): Promise<{ quote: MarketQuote | null; spots: Partial<Record<IndexOptionName, number>> }> {

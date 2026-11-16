@@ -14,6 +14,7 @@ vi.mock('../src/config.js', () => ({
 }));
 
 import { GroqClient } from '../src/llm/groqClient.js';
+import { completeJsonWithRetry } from '../src/llm/llmChatClient.js';
 
 function fakeFetch() {
   return vi.fn(async (url: string | URL | Request) => {
@@ -51,5 +52,22 @@ describe('GroqClient', () => {
   it('omits reasoning_effort for non-reasoning models', async () => {
     const body = await requestBody('llama-3.1-8b-instant');
     expect(body).not.toHaveProperty('reasoning_effort');
+  });
+});
+
+describe('completeJsonWithRetry', () => {
+  it('retries with a larger budget when the model runs out of tokens before writing JSON', async () => {
+    const llm = {
+      getModel: () => 'test-model',
+      completeJson: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('Groq chat completion failed (400 ): json_validate_failed'))
+        .mockResolvedValueOnce({ text: '{"watchlist":[]}', parsed: { watchlist: [] } }),
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const result = await completeJsonWithRetry(llm, [], 1024, logger, 'universe');
+    expect(result.parsed).toEqual({ watchlist: [] });
+    expect(llm.completeJson).toHaveBeenCalledTimes(2);
+    expect(llm.completeJson.mock.calls[1]?.[1]).toEqual({ maxTokens: 4096 });
   });
 });

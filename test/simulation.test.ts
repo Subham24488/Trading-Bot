@@ -239,12 +239,12 @@ function recordedDay(): MarketRecording {
 }
 
 const logger = () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() });
-const pickLlm = () =>
+/** The replayed day buys the top-ranked strike, closest to delta 0.40. */
+const BOUGHT = 'NIFTY26OCT25100CE';
+/** The AI model is not part of a replayed decision; any call to it fails the run. */
+const unusedLlm = () =>
   ({
-    completeJson: vi.fn().mockResolvedValue({
-      text: '{"symbol":"NIFTY26OCT25000CE","reason":"Closest to the current price."}',
-      parsed: { symbol: 'NIFTY26OCT25000CE', reason: 'Closest to the current price.' },
-    }),
+    completeJson: vi.fn().mockRejectedValue(new Error('The AI model must not be asked.')),
     getModel: () => 'test-model',
   }) as never;
 
@@ -300,6 +300,12 @@ describe('ReplayBroker', () => {
     expect(bars.at(-1)?.t).toBe(new Date(ist(DAY, '10:30')).toISOString());
     expect(await broker.getDailyCandles(NIFTY_TOKEN, '2026-09-01', '2026-10-20')).toHaveLength(1);
     expect(await broker.getDayInstruments('CDS')).toEqual([]);
+    // 1-minute candles for the stop-loss order: from the asked time, finished ones only.
+    const minutes = await broker.getMinuteCandles(optionToken(25_100, 'CE'), '2026-10-21 10:28:00');
+    expect(minutes.map((item) => item.t)).toEqual([
+      ist(DAY, '10:28').toISOString(),
+      ist(DAY, '10:29').toISOString(),
+    ]);
   });
 });
 
@@ -343,7 +349,7 @@ describe('simulated replay of a day', () => {
     const day = recordedDay();
     const clock = new SimulationClock(new Date(ist(DAY, '09:15').getTime() + 20_000));
     const advisor = new LlmTradeAdvisorService({
-      llm: pickLlm(),
+      llm: unusedLlm(),
       kite: new ReplayBroker(day, clock.now),
       news: new ReplayHeadlines(day, clock.now),
       logger: logger(),
@@ -373,7 +379,7 @@ describe('simulated replay of a day', () => {
       ),
     );
     const buyIndex = actions.indexOf('BUY');
-    expect(rows[buyIndex]).toMatchObject({ symbol: 'NIFTY26OCT25000CE' });
+    expect(rows[buyIndex]).toMatchObject({ symbol: BOUGHT });
     expect(rows[buyIndex]?.decidedAt).toEqual(new Date(ist(DAY, '10:50').getTime() + 20_000));
     // The open trade is fully reviewed every 5 minutes until it is sold.
     const exitIndex = actions.indexOf('EXIT');
@@ -404,7 +410,7 @@ describe('simulated replay of a day', () => {
     const clock = new SimulationClock(new Date(ist(DAY, '09:15').getTime() + 20_000));
     const log = logger();
     const advisor = new LlmTradeAdvisorService({
-      llm: pickLlm(),
+      llm: unusedLlm(),
       kite: new ReplayBroker(day, clock.now),
       news: new ReplayHeadlines(day, clock.now),
       logger: log,
@@ -426,7 +432,7 @@ describe('simulated replay of a day', () => {
     const firstHold = decisionLines.find(([details]) => details.action === 'HOLD')?.[0];
     expect(firstHold).toMatchObject({
       simulationId: '00000000-0000-4000-8000-000000000002',
-      symbol: 'NIFTY26OCT25000CE',
+      symbol: BOUGHT,
       at: '2026-10-21 10:55:20',
     });
     expect(firstHold).toHaveProperty('pnlPct');
@@ -471,7 +477,7 @@ function recorderBroker(day: MarketRecording) {
 describe('SimulationService', () => {
   const service = (lock = new DecisionRunLock(), kite = recorderBroker(recordedDay())) =>
     new SimulationService({
-      llm: pickLlm(),
+      llm: unusedLlm(),
       kite,
       news: { fetchIndexNewsOn: vi.fn().mockResolvedValue([]) },
       logger: logger(),
@@ -491,7 +497,7 @@ describe('SimulationService', () => {
       expect(saved.series.some((item) => item.key === 'NFO:NIFTY26OCT25000CE')).toBe(true);
       expect(first.decisions.BUY).toBeGreaterThan(0);
       expect(first.trades[0]).toMatchObject({
-        symbol: 'NIFTY26OCT25000CE',
+        symbol: BOUGHT,
         buyAt: new Date(ist(DAY, '10:50').getTime() + 20_000).toISOString(),
       });
       expect(first.trades[0]?.exitReason).not.toBeNull();
@@ -546,7 +552,7 @@ describe('SimulationService', () => {
 
       lock.acquire('simulation');
       const live = new LlmTradeAdvisorService({
-        llm: pickLlm(),
+        llm: unusedLlm(),
         kite: recorderBroker(recordedDay()) as never,
         news: { fetchIndexNews: vi.fn().mockResolvedValue([]) } as never,
         logger: logger(),

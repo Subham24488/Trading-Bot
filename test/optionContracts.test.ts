@@ -1,12 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import { pickContract } from '../src/llm/contractPicker.js';
 import { blackScholesPrice } from '../src/options/greeksIv.js';
 import {
   chooseTradingExpiry,
+  indexExpiries,
   nearestFuture,
   parseNfoIndexOptions,
 } from '../src/options/nfoChain.js';
+import { tradingDaysUntil } from '../src/strategy/clock.js';
 import { estimateOptionsRoundTripCost } from '../src/llm/optionTradeCosts.js';
 import {
   buildCandidates,
@@ -15,8 +16,6 @@ import {
 } from '../src/strategy/contracts.js';
 import { DEFAULT_STRATEGY, type StrategyParams } from '../src/strategy/params.js';
 import { MOMENTUM_RULES } from './marketFixtures.js';
-
-const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 
 function callQuote(strike: number, overrides: Partial<ChainQuote> = {}): ChainQuote {
   const ltp = Number(blackScholesPrice(25_000, strike, 6 / 365, 0.065, 0.12, 'CE').toFixed(2));
@@ -64,6 +63,59 @@ describe('expiry and futures selection', () => {
   it('can skip a contract that expires today', () => {
     expect(chooseTradingExpiry(['2026-10-28', '2026-10-21'], '2026-10-21')).toBe('2026-10-21');
     expect(chooseTradingExpiry(['2026-10-28', '2026-10-21'], '2026-10-21', 1)).toBe('2026-10-28');
+  });
+
+  it('counts trading days without weekends and market holidays', () => {
+    // Fri 20 Nov to Mon 23 Nov is one trading day; Tue 24 Nov is a holiday.
+    expect(tradingDaysUntil('2026-11-20', '2026-11-23')).toBe(1);
+    expect(tradingDaysUntil('2026-11-23', '2026-11-25')).toBe(1);
+    expect(tradingDaysUntil('2026-11-16', '2026-11-16')).toBe(0);
+  });
+
+  it('uses next week from the day before expiry: at least 2 trading days away', () => {
+    // The exchange lists Mon 23 Nov because Tue 24 Nov is a holiday.
+    const expiries = ['2026-11-17', '2026-11-23', '2026-12-01'];
+    const expiryOn = (day: string) => chooseTradingExpiry(expiries, day, 2);
+    expect(expiryOn('2026-11-13')).toBe('2026-11-17');
+    expect(expiryOn('2026-11-16')).toBe('2026-11-23');
+    expect(expiryOn('2026-11-17')).toBe('2026-11-23');
+    expect(expiryOn('2026-11-19')).toBe('2026-11-23');
+    expect(expiryOn('2026-11-20')).toBe('2026-12-01');
+    expect(expiryOn('2026-11-23')).toBe('2026-12-01');
+  });
+
+  it("reads each index's own expiry dates from the listed contracts", () => {
+    const option = (name: string, expiry: string, token: number) => ({
+      instrument_token: token,
+      tradingsymbol: `${name}${token}CE`,
+      name,
+      expiry,
+      strike: 25_000,
+      instrument_type: 'CE',
+      lot_size: 65,
+    });
+    // NIFTY has weekly expiries; BANKNIFTY only the monthly one.
+    const contracts = parseNfoIndexOptions([
+      option('NIFTY', '2026-11-17', 1),
+      option('NIFTY', '2026-11-23', 2),
+      option('BANKNIFTY', '2026-11-23', 3),
+      option('BANKNIFTY', '2026-12-29', 4),
+    ]);
+    expect(indexExpiries(contracts, ['NIFTY', 'BANKNIFTY'], '2026-11-17', 2)).toEqual([
+      { index: 'NIFTY', nextExpiry: '2026-11-17', expiryToday: true, tradingExpiry: '2026-11-23' },
+      {
+        index: 'BANKNIFTY',
+        nextExpiry: '2026-11-23',
+        expiryToday: false,
+        tradingExpiry: '2026-11-23',
+      },
+    ]);
+    // Mon 23 Nov is expiry day for both, taken from the list, not from the weekday.
+    expect(
+      indexExpiries(contracts, ['NIFTY', 'BANKNIFTY'], '2026-11-23', 2).map(
+        (item) => item.expiryToday,
+      ),
+    ).toEqual([true, true]);
   });
 
   it('finds the nearest future and reads lot sizes from the instrument dump', () => {
@@ -211,89 +263,5 @@ describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
     expect(candidatesFor(nearMoney(), MOMENTUM_RULES, far).rejected[0]).toMatchObject({
       code: 'risk-too-wide',
     });
-  });
-});
-
-describe('pickContract', () => {
-  const { candidates } = candidatesFor([callQuote(24_900), callQuote(25_000), callQuote(25_100)]);
-  const input = {
-    index: 'NIFTY',
-    side: 'CE' as const,
-    score: 6,
-    minutesToSquareOff: 280,
-    candidates,
-  };
-
-  it('uses the LLM pick when it is one of the candidates', async () => {
-    const llm = {
-      getModel: () => 'test-model',
-      completeJson: vi.fn().mockResolvedValue({
-        text: '{"symbol":"nifty26oct25100ce","reason":"Cheaper with a tight spread."}',
-        parsed: { symbol: 'nifty26oct25100ce', reason: 'Cheaper with a tight spread.' },
-      }),
-    };
-    const result = await pickContract(llm, input, logger);
-    expect(result).toMatchObject({
-      pickedBy: 'llm',
-      note: 'Cheaper with a tight spread.',
-      candidate: { symbol: 'NIFTY26OCT25100CE' },
-      llm: { model: 'test-model' },
-    });
-    const userPayload = JSON.parse(llm.completeJson.mock.calls[0]?.[0]?.[1]?.content ?? '{}') as {
-      candidates: Array<{ s: string }>;
-    };
-    expect(userPayload.candidates.map((candidate) => candidate.s)).toEqual(
-      candidates.map((candidate) => candidate.symbol),
-    );
-  });
-
-  it('falls back to the top-ranked contract on an invalid answer or an LLM failure', async () => {
-    const invalid = {
-      getModel: () => 'test-model',
-      completeJson: vi.fn().mockResolvedValue({
-        text: '{}',
-        parsed: { symbol: 'BANKNIFTY26OCT55000CE', reason: 'Not offered.' },
-      }),
-    };
-    const failing = {
-      getModel: () => 'test-model',
-      completeJson: vi.fn().mockRejectedValue(new Error('timeout')),
-    };
-    await expect(pickContract(invalid, input, logger)).resolves.toMatchObject({
-      pickedBy: 'fallback',
-      candidate: { symbol: candidates[0]?.symbol },
-    });
-    await expect(pickContract(failing, input, logger)).resolves.toMatchObject({
-      pickedBy: 'fallback',
-      llm: null,
-    });
-  });
-
-  it('retries with a larger budget when the model runs out of tokens before writing JSON', async () => {
-    const llm = {
-      getModel: () => 'test-model',
-      completeJson: vi
-        .fn()
-        .mockRejectedValueOnce(new Error('Groq chat completion failed (400 ): json_validate_failed'))
-        .mockResolvedValueOnce({
-          text: '{"symbol":"NIFTY26OCT25000CE","reason":"At the money."}',
-          parsed: { symbol: 'NIFTY26OCT25000CE', reason: 'At the money.' },
-        }),
-    };
-    const result = await pickContract(llm, input, logger);
-    expect(result).toMatchObject({ pickedBy: 'llm', candidate: { symbol: 'NIFTY26OCT25000CE' } });
-    expect(llm.completeJson).toHaveBeenCalledTimes(2);
-    expect(llm.completeJson.mock.calls[1]?.[1]).toEqual({ maxTokens: 4096 });
-  });
-
-  it('does not call the LLM when only one contract qualifies', async () => {
-    const llm = { getModel: () => 'test-model', completeJson: vi.fn() };
-    const result = await pickContract(
-      llm,
-      { ...input, candidates: candidates.slice(0, 1) },
-      logger,
-    );
-    expect(result.pickedBy).toBe('only-candidate');
-    expect(llm.completeJson).not.toHaveBeenCalled();
   });
 });

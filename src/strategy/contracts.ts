@@ -91,7 +91,7 @@ export type ContractCandidate = {
 export type CandidateRejection = { symbol: string; reason: string; code?: PlanRejectionCode };
 
 /** Option prices move in ₹0.05 steps. */
-const TICK = 0.05;
+export const TICK = 0.05;
 
 function round2(value: number): number {
   return Number(value.toFixed(2));

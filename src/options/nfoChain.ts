@@ -1,5 +1,6 @@
-import { calendarDayDiff, istYmd } from '../universe/dates.js';
 import type { IndexOptionName } from '../instruments/kiteIndexUnderlyings.js';
+import { tradingDaysUntil } from '../strategy/clock.js';
+import { addCalendarDays, istYmd } from '../universe/dates.js';
 
 /** One row of a Kite instrument dump (NFO, CDS, MCX …); fields arrive loosely typed. */
 export type KiteRawInstrument = {
@@ -120,19 +121,58 @@ export function parseNfoIndexOptions(
   return out;
 }
 
+/** Trading days left until a contract expires, its expiry day included: 0 on expiry day. */
+function tradingDaysToExpiry(asOfYmd: string, expiry: string): number {
+  if (expiry <= asOfYmd) {
+    return expiry === asOfYmd ? 0 : -1;
+  }
+  return tradingDaysUntil(asOfYmd, addCalendarDays(expiry, -1)) + 1;
+}
+
 /**
- * Earliest expiry at least `minDaysToExpiry` calendar days away.
- * `minDaysToExpiry = 1` skips a contract that expires today.
+ * Earliest expiry at least `minTradingDays` trading days away: 1 skips a contract that expires
+ * today, 2 also skips one that expires on the next trading day. Expiry dates come from the
+ * exchange's instrument list, so a holiday that moves an expiry is already in them.
  */
 export function chooseTradingExpiry(
   expiries: readonly string[],
   asOfYmd: string,
-  minDaysToExpiry = 0,
+  minTradingDays = 0,
 ): string | null {
   const eligible = [...new Set(expiries)]
-    .filter((expiry) => calendarDayDiff(asOfYmd, expiry) >= minDaysToExpiry)
+    .filter((expiry) => tradingDaysToExpiry(asOfYmd, expiry) >= minTradingDays)
     .sort();
   return eligible[0] ?? null;
+}
+
+export type IndexExpiry = {
+  index: IndexOptionName;
+  /** The next listed expiry, today included; null when none is listed. */
+  nextExpiry: string | null;
+  expiryToday: boolean;
+  /** The expiry new trades use: the first one at least `minTradingDays` trading days away. */
+  tradingExpiry: string | null;
+};
+
+/** Each index's own expiry dates, read from the exchange's listed option contracts. */
+export function indexExpiries(
+  contracts: readonly NfoOptionContract[],
+  indexes: readonly IndexOptionName[],
+  asOfYmd: string,
+  minTradingDays: number,
+): IndexExpiry[] {
+  return indexes.map((index) => {
+    const expiries = contracts
+      .filter((contract) => contract.name === index)
+      .map((contract) => contract.expiry);
+    const nextExpiry = chooseTradingExpiry(expiries, asOfYmd);
+    return {
+      index,
+      nextExpiry,
+      expiryToday: nextExpiry === asOfYmd,
+      tradingExpiry: chooseTradingExpiry(expiries, asOfYmd, minTradingDays),
+    };
+  });
 }
 
 /** Nearest futures contract for an underlying name (e.g. NIFTY, USDINR, CRUDEOIL). */
@@ -140,7 +180,7 @@ export function nearestFuture(
   rows: readonly KiteRawInstrument[],
   name: string,
   asOfYmd: string,
-  minDaysToExpiry = 0,
+  minTradingDays = 0,
 ): FutureContract | null {
   const wanted = name.trim().toUpperCase();
   const futures: FutureContract[] = [];
@@ -175,7 +215,7 @@ export function nearestFuture(
   const expiry = chooseTradingExpiry(
     futures.map((future) => future.expiry),
     asOfYmd,
-    minDaysToExpiry,
+    minTradingDays,
   );
   return futures.find((future) => future.expiry === expiry) ?? null;
 }
@@ -190,7 +230,7 @@ export function filterNearestWeeklyAtmBand(
   steps: Partial<Record<IndexOptionName, number>>,
   asOfYmd: string,
   wings = 3,
-  minDaysToExpiry = 0,
+  minTradingDays = 0,
 ): NfoOptionContract[] {
   const picked: NfoOptionContract[] = [];
   const names = [...new Set(contracts.map((contract) => contract.name))];
@@ -203,7 +243,7 @@ export function filterNearestWeeklyAtmBand(
     const expiry = chooseTradingExpiry(
       contracts.filter((contract) => contract.name === name).map((contract) => contract.expiry),
       asOfYmd,
-      minDaysToExpiry,
+      minTradingDays,
     );
     if (!expiry) {
       continue;

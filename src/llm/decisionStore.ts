@@ -58,7 +58,7 @@ export async function writeUniverseFile(payload: StoredUniverseFile): Promise<st
 
 export const LLM_EXECUTION_BLOCKED_REASON = 'LLM decisions are never sent to the broker.';
 
-/** Optional audit fields: rule score as confidence, and the LLM call behind a strike pick. */
+/** Optional audit fields: rule score as confidence, and the AI model call behind a row, if any. */
 export type DecisionMeta = {
   confidence?: number;
   model?: string;

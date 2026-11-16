@@ -1,7 +1,7 @@
 import type { IndexOptionName } from '../instruments/kiteIndexUnderlyings.js';
 import type { OptionNewsRiskLevel } from '../options/greeksIv.js';
 import { atmStrike } from '../options/nfoChain.js';
-import type { IntradayBar } from '../universe/types.js';
+import type { DailyBar, IntradayBar } from '../universe/types.js';
 import { readChart, type ChartRead } from './chart.js';
 import { istClock } from './clock.js';
 import type { ChainQuote } from './contracts.js';
@@ -46,7 +46,10 @@ export type IndexMarketData = {
   futuresVwap: number | null;
   /** Completed 5-minute futures bars over several days, oldest first, with open interest. */
   futuresBars: IntradayBar[];
+  /** The index's daily bars before today, oldest first. */
+  dailyBars: DailyBar[];
   chain: ChainQuote[];
+  /** An option contract of this index expires today (from the exchange's instrument list). */
   expiryToday: boolean;
   newsLevel: OptionNewsRiskLevel;
 };
@@ -70,6 +73,8 @@ export type IndexReading = {
   /** Chart reading: structure, levels, the signal candle and a stop and target per side. */
   chart: ChartRead | null;
   spot: number | null;
+  /** Average close of the last `trendAverageDays` days; null with fewer days or the filter off. */
+  dayAverage: number | null;
   futuresPrice: number | null;
   vwap: number | null;
   /** Strike above the price with the most call open interest (a likely ceiling). */
@@ -317,6 +322,14 @@ function optionLevels(chain: readonly ChainQuote[], spot: number | null, bufferP
   };
 }
 
+/** Average close of the last `days` daily bars; null when there are fewer or `days` is 0. */
+function averageClose(bars: readonly DailyBar[], days: number): number | null {
+  if (days <= 0 || bars.length < days) {
+    return null;
+  }
+  return bars.slice(-days).reduce((sum, bar) => sum + bar.c, 0) / days;
+}
+
 /** Reads one index into eight votes plus the extra facts the entry gates need. */
 export function readIndex(
   data: IndexMarketData,
@@ -366,6 +379,7 @@ export function readIndex(
       : classifyLastCandles(todayBars.slice(-3)),
     chart,
     spot: data.spot,
+    dayAverage: averageClose(data.dailyBars, params.trendAverageDays),
     futuresPrice: data.futuresPrice,
     vwap: data.futuresVwap,
     ...levels,
