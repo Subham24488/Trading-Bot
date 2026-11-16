@@ -545,6 +545,31 @@ export function checkPositionExit(
   return { action: 'HOLD' };
 }
 
+/**
+ * The stop placed at BUY, checked between full reviews (the 15-second monitor): stale position,
+ * the square-off, and the bid at or under the premium stop while the ₹ profit lock has not
+ * armed. Every other exit waits for the full review in `checkPositionExit`.
+ */
+export function checkStandingStop(
+  input: { now: Date; position: OpenPosition; price: number | null },
+  params: StrategyParams,
+): ExitCheck {
+  const { now, position, price } = input;
+  const clock = istClock(now);
+  if (istClock(position.enteredAt).ymd < clock.ymd) {
+    return { action: 'EXIT', reason: 'stale-position' };
+  }
+  if (clock.minute >= params.squareOffMinute) {
+    return { action: 'EXIT', reason: 'square-off' };
+  }
+  const armed = profitLockLevelInr(position.entryPrice, position.peakPrice, params) !== null;
+  const premiumStop = position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
+  if (!armed && price !== null && price <= premiumStop + ROUNDING_SLACK) {
+    return { action: 'EXIT', reason: 'stop-loss' };
+  }
+  return { action: 'HOLD' };
+}
+
 export type DayRow = {
   action: string;
   decidedAt: Date;

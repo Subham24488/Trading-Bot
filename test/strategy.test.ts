@@ -5,6 +5,7 @@ import { msUntilNextCycle } from '../src/strategy/clock.js';
 import type { ChainQuote, ContractCandidate } from '../src/strategy/contracts.js';
 import {
   checkPositionExit,
+  checkStandingStop,
   decideEntry,
   levelRoomPct,
   profitFloor,
@@ -1018,6 +1019,30 @@ describe('checkPositionExit with the ₹5-step profit ratchet and pullback rules
     // Best +₹20.02: the lock is at ₹140.30. The bid is ₹140.22, the last trade ₹140.32.
     expect(check(140.22, 140.32)).toEqual({ action: 'HOLD' });
     expect(check(140.15, 140.25)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+  });
+
+  it('between reviews watches only the ₹10 stop placed at BUY (plus stale and 3:15 PM)', () => {
+    const standing = (
+      time: string,
+      price: number,
+      peakPrice = 120.3,
+      enteredAt = position.enteredAt,
+    ) =>
+      checkStandingStop(
+        { now: ist('2026-11-13', time), position: { ...position, peakPrice, enteredAt }, price },
+        current,
+      );
+    expect(standing('11:05', 110.3)).toEqual({ action: 'EXIT', reason: 'stop-loss' });
+    expect(standing('11:05', 110.35)).toEqual({ action: 'HOLD' });
+    // Once the ratchet has armed, a dip waits for the next full review.
+    expect(standing('11:05', 105, 131)).toEqual({ action: 'HOLD' });
+    // No ratchet, time stop or chart stop between reviews: a fall back from +₹15 holds.
+    expect(standing('12:30', 121, 120.3)).toEqual({ action: 'HOLD' });
+    expect(standing('15:15', 125)).toEqual({ action: 'EXIT', reason: 'square-off' });
+    expect(standing('09:20', 125, 120.3, ist('2026-11-12', '14:00'))).toEqual({
+      action: 'EXIT',
+      reason: 'stale-position',
+    });
   });
 
   it('lets only the ratchet and the 3:15 PM square-off close an armed trade', () => {

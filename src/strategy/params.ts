@@ -104,6 +104,11 @@ export type StrategyParams = {
   maxRiskPerUnitInr: number;
   /** ₹ per unit: fixed stop on the option price, buy price − this; 0 uses the chart stop. */
   stopLossInr: number;
+  /**
+   * Minutes between full reviews of an open trade (ratchet, chart stop, time stop, reversal);
+   * the stop placed at BUY is still checked every 15 seconds in between.
+   */
+  openPositionCycleMinutes: number;
   /** ₹ per unit: sell once the option is this much above its buy price; 0 means no target. */
   takeProfitInr: number;
   /**
@@ -172,6 +177,9 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   // About ₹1,050 on a 65-unit NIFTY lot with charges; past stopped trades lost ₹1,650–3,340.
   maxRiskPerUnitInr: 15,
   stopLossInr: 10,
+  // 21 real days: reviewing every 5 minutes with the ₹10 stop checked in between made +₹8,888,
+  // against +₹1,226 with 1-minute reviews (the ratchet stopped selling on small dips).
+  openPositionCycleMinutes: 5,
   // No target sell: the profit lock ratchets up instead (10-day replay +₹4,400 vs +₹3,751).
   takeProfitInr: 0,
   profitStepInr: 5,

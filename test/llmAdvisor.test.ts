@@ -1031,7 +1031,7 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
     }
   });
 
-  it('reviews an open trade every minute and returns to the .env interval once it is sold', async () => {
+  it('reviews an open trade every 5 minutes, watching only the stop in between', async () => {
     vi.useFakeTimers({
       toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
     });
@@ -1046,17 +1046,26 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       const { advisor, setOptionPriceFactor } = await optionsAdvisorScenario();
       stop = () => advisor.stop();
       const started = await advisor.startDecisionLoop(['NIFTY']);
-      expect(started).toMatchObject({ decisionIntervalMinutes: 5, currentIntervalMinutes: 1 });
+      expect(started).toMatchObject({ decisionIntervalMinutes: 5, currentIntervalMinutes: 5 });
       expect(storedRows().map((row) => row.action)).toEqual(['BUY']);
 
-      // The open trade gets its next full review a minute later, not at the 5-minute slot.
+      // A +₹15 spike and its fall back between reviews: the monitor watches only the ₹10 stop,
+      // so neither the ratchet nor any other rule sells, and no review row is stored yet.
+      setOptionPriceFactor(1.1);
       await advance(60_000);
+      setOptionPriceFactor(1);
+      await advance(60_000);
+      expect(storedRows().map((row) => row.action)).toEqual(['BUY']);
+
+      // The next full review comes at the 10:35 slot.
+      await advance(3 * 60_000);
       expect(storedRows()[1]).toMatchObject({
         action: 'HOLD',
-        asOf: new Date(ist('2026-10-21', '10:31').getTime() + 20_000),
+        asOf: new Date(ist('2026-10-21', '10:35').getTime() + 20_000),
+        marketSnapshot: { position: { profitLockPrice: null } },
       });
 
-      // The 15-second monitor sells on the stop-loss before the 10:32 review.
+      // The 15-second monitor sells on the ₹10 stop placed at BUY, without waiting for 10:40.
       setOptionPriceFactor(0.5);
       await advance(15_000);
       expect(storedRows()[2]).toMatchObject({
@@ -1065,15 +1074,13 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       });
       expect(advisor.getDecisionLoopStatus().currentIntervalMinutes).toBe(5);
 
-      // Flat again: the leftover 10:32 slot stores nothing; the next row is the 10:35 SKIP.
+      // Flat again: the next row is the 10:40 SKIP.
       setOptionPriceFactor(1);
-      await advance(60_000);
-      expect(storedRows()).toHaveLength(3);
-      await advance(3 * 60_000);
+      await advance(5 * 60_000);
       expect(storedRows()).toHaveLength(4);
       expect(storedRows()[3]).toMatchObject({
         action: 'SKIP',
-        asOf: new Date(ist('2026-10-21', '10:35').getTime() + 20_000),
+        asOf: new Date(ist('2026-10-21', '10:40').getTime() + 20_000),
       });
     } finally {
       stop?.();

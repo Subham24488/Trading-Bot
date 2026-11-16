@@ -375,7 +375,7 @@ describe('simulated replay of a day', () => {
     const buyIndex = actions.indexOf('BUY');
     expect(rows[buyIndex]).toMatchObject({ symbol: 'NIFTY26OCT25000CE' });
     expect(rows[buyIndex]?.decidedAt).toEqual(new Date(ist(DAY, '10:50').getTime() + 20_000));
-    // The open trade is reviewed every minute until it is sold.
+    // The open trade is fully reviewed every 5 minutes until it is sold.
     const exitIndex = actions.indexOf('EXIT');
     expect(exitIndex).toBeGreaterThan(buyIndex + 1);
     const holds = rows.slice(buyIndex + 1, exitIndex);
@@ -384,7 +384,7 @@ describe('simulated replay of a day', () => {
       holds.map(
         (row) => (row.decidedAt as Date).getTime() - (rows[buyIndex]!.decidedAt as Date).getTime(),
       ),
-    ).toEqual(holds.map((_, index) => (index + 1) * 60_000));
+    ).toEqual(holds.map((_, index) => (index + 1) * 5 * 60_000));
     expect(
       rows
         .filter((row) => row.tuuid === rows[buyIndex]?.tuuid)
@@ -427,7 +427,7 @@ describe('simulated replay of a day', () => {
     expect(firstHold).toMatchObject({
       simulationId: '00000000-0000-4000-8000-000000000002',
       symbol: 'NIFTY26OCT25000CE',
-      at: '2026-10-21 10:51:20',
+      at: '2026-10-21 10:55:20',
     });
     expect(firstHold).toHaveProperty('pnlPct');
     const firstSkip = decisionLines[0]?.[0];

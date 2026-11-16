@@ -102,6 +102,7 @@ import {
 } from '../strategy/contracts.js';
 import {
   checkPositionExit,
+  checkStandingStop,
   profitLockLevelInr,
   decideEntry,
   summarizeDay,
@@ -169,9 +170,6 @@ export const DB_KEEP_ALIVE_MS = 4 * 60_000;
 
 /** Pings start this long before the first entry time and stop this long after the square-off. */
 const KEEP_ALIVE_MARGIN_MINUTES = 15;
-
-/** While a trade is open it gets a full cycle (signals included) every minute. */
-const OPEN_POSITION_CYCLE_MINUTES = 1;
 
 /** Window searched for the last 5-minute bar before the square-off of a stale position. */
 const SQUARE_OFF_LOOKBACK_MS = 30 * 60_000;
@@ -867,7 +865,8 @@ export class LlmTradeAdvisorService {
   /**
    * Rules decide BUY/HOLD/EXIT/SKIP every cycle (aligned to the clock); the LLM only picks
    * the strike for a BUY. A flat book cycles every LLM_DECISION_INTERVAL_MINUTES; an open
-   * position is reviewed every minute and its stops checked every 15 seconds. Store-only.
+   * position is fully reviewed every `openPositionCycleMinutes` and its stop placed at BUY is
+   * checked every 15 seconds. Store-only.
    */
   public async startDecisionLoop(
     indexes?: readonly IndexOptionName[],
@@ -908,7 +907,7 @@ export class LlmTradeAdvisorService {
     this.logger.info(
       {
         intervalMinutes: config.llm.decisionIntervalMinutes,
-        openPositionIntervalMinutes: OPEN_POSITION_CYCLE_MINUTES,
+        openPositionIntervalMinutes: this.params.openPositionCycleMinutes,
         indexes: this.decisionIndexes,
         openSymbol: this.position?.symbol ?? null,
         paramsVersion: paramsVersion(this.params),
@@ -968,7 +967,9 @@ export class LlmTradeAdvisorService {
 
   /** Every minute while a trade is open; otherwise the .env interval. */
   private cycleIntervalMinutes(): number {
-    return this.position ? OPEN_POSITION_CYCLE_MINUTES : config.llm.decisionIntervalMinutes;
+    return this.position
+      ? this.params.openPositionCycleMinutes
+      : config.llm.decisionIntervalMinutes;
   }
 
   /** `generation` stops a cycle from a stopped-and-restarted loop scheduling a second timer. */
@@ -1001,7 +1002,7 @@ export class LlmTradeAdvisorService {
 
   /**
    * Replays one day on the simulator's virtual clock with the live cadence: a cycle on every
-   * slot (the .env interval while flat, every minute while a trade is open) and the 15-second
+   * slot (the .env interval while flat, `openPositionCycleMinutes` while a trade is open) and the 15-second
    * stop check in between. `advanceTo` moves the clock that `now` reads. Store-only.
    */
   public async replayDay(input: {
@@ -1299,7 +1300,10 @@ export class LlmTradeAdvisorService {
     }
   }
 
-  /** 15-second check (and start-up check) of the open position: stops, profit floor, time, 15:15. */
+  /**
+   * 15-second monitor: only the stop placed at BUY (and stale/15:15). The start-up check of a
+   * restored position runs every exit rule.
+   */
   private async checkOpenPositionNow(trigger: 'monitor' | 'startup'): Promise<void> {
     const position = this.position;
     if (!position) {
@@ -1315,6 +1319,22 @@ export class LlmTradeAdvisorService {
     }
     // A position from an earlier day is sold at once; today's prices must not move its best/worst.
     const stale = istClock(position.enteredAt).ymd < istClock(now).ymd;
+    if (trigger === 'monitor') {
+      // Between full reviews only the stop placed at BUY is watched. The best price (and so the
+      // ratchet) moves only at the reviews, so small dips between them do not sell the trade.
+      const last = !stale && quote?.lastPrice && quote.lastPrice > 0 ? quote.lastPrice : null;
+      if (last !== null) {
+        this.lastQuotedPriceBySymbol[position.symbol] = last;
+      }
+      const standing = checkStandingStop(
+        { now, position, price: exitCheckPrice(quote, last) },
+        this.params,
+      );
+      if (standing.action === 'EXIT') {
+        await this.storeExit({ position, quote, reason: standing.reason, now, trigger, spots });
+      }
+      return;
+    }
     const price = stale ? null : this.trackPrice(position, quote);
     const check = checkPositionExit(
       {
