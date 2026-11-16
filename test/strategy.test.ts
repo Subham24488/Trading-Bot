@@ -8,6 +8,7 @@ import {
   decideEntry,
   levelRoomPct,
   profitFloor,
+  profitLockLevelInr,
   summarizeDay,
   type DayRow,
   type DayStats,
@@ -958,7 +959,7 @@ describe('checkPositionExit', () => {
   });
 });
 
-describe('checkPositionExit with the ₹15 take-profit and pullback rules', () => {
+describe('checkPositionExit with the ₹5-step profit ratchet and pullback rules', () => {
   const position: OpenPosition = {
     symbol: 'NIFTY26N1725150PE',
     index: 'NIFTY',
@@ -976,21 +977,54 @@ describe('checkPositionExit with the ₹15 take-profit and pullback rules', () =
     stopSpot: 25_260,
     premiumStop: 110.3,
   };
-  const at = (time: string, price: number, reading: IndexReading | null = null) =>
+  const at = (
+    time: string,
+    price: number,
+    reading: IndexReading | null = null,
+    peakPrice = Math.max(120.3, price),
+    spot = 25_200,
+  ) =>
     checkPositionExit(
-      {
-        now: ist('2026-11-13', time),
-        position: { ...position, peakPrice: Math.max(120.3, price) },
-        price,
-        spot: 25_200,
-        reading,
-      },
+      { now: ist('2026-11-13', time), position: { ...position, peakPrice }, price, spot, reading },
       current,
     );
 
-  it('takes profit once the bid reaches the buy price + ₹15', () => {
-    expect(at('11:05', 135.25)).toEqual({ action: 'HOLD' });
-    expect(at('11:05', 135.3)).toEqual({ action: 'EXIT', reason: 'target-reached' });
+  it('locks buy + ₹10 at +₹10, then moves ₹5 higher for every further ₹5 gain', () => {
+    expect(profitLockLevelInr(120.3, 130.2, current)).toBeNull();
+    expect(profitLockLevelInr(120.3, 130.3, current)).toBe(10);
+    expect(profitLockLevelInr(120.3, 135.3, current)).toBe(15);
+    expect(profitLockLevelInr(120.3, 144.29, current)).toBe(20);
+    expect(profitLockLevelInr(120.3, 165.3, current)).toBe(45);
+    // Best ₹136 (+₹15.70): the lock is at ₹135.30.
+    expect(at('11:05', 135.3, null, 136)).toEqual({ action: 'HOLD' });
+    expect(at('11:05', 135.25, null, 136)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+    // Best ₹130.30: the lock is at ₹130.30, and there is no target sell however high it goes.
+    expect(at('11:05', 130.25, null, 130.3)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+    expect(at('11:05', 200)).toEqual({ action: 'HOLD' });
+  });
+
+  it('triggers the lock on the last traded price, like a GTT, not on a bid a few paise lower', () => {
+    const check = (bid: number, lastPrice: number) =>
+      checkPositionExit(
+        {
+          now: ist('2026-11-13', '11:05'),
+          position: { ...position, peakPrice: 140.32 },
+          price: bid,
+          lastPrice,
+          spot: 25_200,
+        },
+        current,
+      );
+    // Best +₹20.02: the lock is at ₹140.30. The bid is ₹140.22, the last trade ₹140.32.
+    expect(check(140.22, 140.32)).toEqual({ action: 'HOLD' });
+    expect(check(140.15, 140.25)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+  });
+
+  it('lets only the ratchet and the 3:15 PM square-off close an armed trade', () => {
+    const turned = reading({ chart: chartRead({ higherTrend: 'up' }), newsLevel: 'high' });
+    // 2 hours in, trend turned, major news, NIFTY above the chart stop: still held above the lock.
+    expect(at('12:55', 131, turned, 132, 25_300)).toEqual({ action: 'HOLD' });
+    expect(at('15:15', 131, turned, 132)).toEqual({ action: 'EXIT', reason: 'square-off' });
   });
 
   it('sells at the fixed ₹10 stop', () => {
@@ -1254,7 +1288,7 @@ describe('plain-English rationale', () => {
       params,
     });
     expect(lockExit).toContain(
-      'the option had gained ₹10 and slipped back to the profit lock at ₹130.20, so the gain was kept',
+      'the option had gained ₹10.80 and slipped back to its profit lock at ₹130.20 (₹10 above the buy price), so the gain was kept',
     );
     const chartExit = describeExit({
       now: ist('2026-10-21', '10:45'),
@@ -1271,7 +1305,7 @@ describe('plain-English rationale', () => {
     }
   });
 
-  it('states the ₹10 stop, the ₹15 target and the pullback on a BUY with the defaults', () => {
+  it('states the ₹10 stop, the ratcheting lock and the pullback on a BUY with the defaults', () => {
     const plan = {
       stopSpot: 24_983.4,
       targetSpot: 25_060,
@@ -1283,8 +1317,8 @@ describe('plain-English rationale', () => {
       lockPrice: 130.2,
       maxLossInr: 721.4,
       lockedProfitInr: 576.3,
-      targetPrice: 135.2,
-      targetProfitInr: 900.1,
+      targetPrice: null,
+      targetProfitInr: null,
     };
     const buy = describeBuy({
       now,
@@ -1302,7 +1336,7 @@ describe('plain-English rationale', () => {
       'Plan: sell if the option falls to ₹110.20 (₹10 below the buy price), a planned loss of about ₹721.40 on 1 lot after charges, or earlier if NIFTY falls below 24,983',
     );
     expect(buy).toContain(
-      'Take profit at ₹135.20 (₹15 above the buy price), about ₹900.10 after charges; once it reaches ₹130.20 (₹10 above the buy price), the exit moves up to ₹130.20.',
+      'Once it reaches ₹130.20 (₹10 above the buy price), the exit moves up to ₹130.20 (about ₹576.30 after charges) and then ₹5 higher for every further ₹5 gain; it is never sold at a target.',
     );
     expect(buy).toContain(
       'Chart: the 15-minute trend is up and NIFTY came back to its average price; the last 5-minute candles show a strong up candle',
@@ -1315,17 +1349,29 @@ describe('plain-English rationale', () => {
       params: current,
     });
     expect(hold).toContain('or the option falls to ₹110.20');
-    expect(hold).toContain('takes profit at ₹135.20');
-    const exit = describeExit({
-      now: ist('2026-10-21', '10:50'),
-      position: { ...position, peakPrice: 135.3 },
-      exitPrice: 135.3,
-      reason: 'target-reached',
-      netPnlInr: 905,
+    expect(hold).not.toContain('takes profit');
+    const armed = describeHold({
+      position: { ...position, peakPrice: 137 },
+      price: 136,
+      netPnlInr: 900,
+      reading: null,
       params: current,
     });
-    expect(exit).toContain('the option reached our ₹15 profit target at ₹135.20');
-    for (const text of [hold, exit]) {
+    expect(armed).toContain(
+      'the profit lock is at ₹135.20 (₹15 above the buy price) and rises ₹5 with every further ₹5 gain',
+    );
+    const exit = describeExit({
+      now: ist('2026-10-21', '10:50'),
+      position: { ...position, peakPrice: 142 },
+      exitPrice: 140.1,
+      reason: 'profit-lock',
+      netPnlInr: 1_210,
+      params: current,
+    });
+    expect(exit).toContain(
+      'the option had gained ₹21.80 and slipped back to its profit lock at ₹140.20 (₹20 above the buy price)',
+    );
+    for (const text of [hold, armed, exit]) {
       expect(text).not.toMatch(JARGON);
     }
   });

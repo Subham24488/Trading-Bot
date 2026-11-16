@@ -3,14 +3,15 @@ import type { IntradayBar } from '../src/universe/types.js';
 
 /**
  * The rules before 2026-11-16, still available through the parameters: the 8 votes pick the
- * side, the stop comes from the chart, there is no take-profit, ranking prefers delta 0.5 and
- * one green trade ends the day.
+ * side, the stop comes from the chart, there is no take-profit or ratchet (one ₹10 lock), ranking
+ * prefers delta 0.5 and one green trade ends the day.
  */
 export const MOMENTUM_RULES: StrategyParams = {
   ...DEFAULT_STRATEGY,
   entryMode: 'momentum',
   stopLossInr: 0,
   takeProfitInr: 0,
+  profitStepInr: 0,
   targetDelta: 0.5,
   dayProfitLockInr: 0,
 };

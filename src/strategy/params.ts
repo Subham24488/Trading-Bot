@@ -106,6 +106,12 @@ export type StrategyParams = {
   stopLossInr: number;
   /** ₹ per unit: sell once the option is this much above its buy price; 0 means no target. */
   takeProfitInr: number;
+  /**
+   * ₹ per unit: once `profitLockInr` is reached, the lock rises by this for each further step of
+   * profit (+10, +15, +20 …), and only the lock or the square-off can close the trade. 0 keeps a
+   * single lock at `profitLockInr`.
+   */
+  profitStepInr: number;
   /** Once the best gain reaches this %, the exit moves up to cost plus `breakevenLockPct`. */
   breakevenActivatePct: number;
   /** Gain (%) the break-even exit keeps, enough to cover charges and the spread. */
@@ -166,7 +172,9 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   // About ₹1,050 on a 65-unit NIFTY lot with charges; past stopped trades lost ₹1,650–3,340.
   maxRiskPerUnitInr: 15,
   stopLossInr: 10,
-  takeProfitInr: 15,
+  // No target sell: the profit lock ratchets up instead (10-day replay +₹4,400 vs +₹3,751).
+  takeProfitInr: 0,
+  profitStepInr: 5,
   // Three trades reached +9% to +15% and still closed at a loss before this lock existed.
   breakevenActivatePct: 8,
   breakevenLockPct: 2,

@@ -157,7 +157,10 @@ export function simulateExitRules(
     if (floor && latestPct < floor.floorPct) {
       return { pnlPct: latestPct, bestPct, reason: floorExitReason(floor) };
     }
+    // A ratcheting profit lock that has armed is the only exit besides the square-off.
+    const ratchetArmed = params.profitStepInr > 0 && floor?.kind === 'lock';
     if (
+      !ratchetArmed &&
       minutesBetween(start.at, point.at) >= params.timeStopMinutes &&
       latestPct < params.timeStopMinGainPct
     ) {

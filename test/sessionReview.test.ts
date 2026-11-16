@@ -269,16 +269,23 @@ describe('simulateExitRules', () => {
   });
 });
 
-describe('simulateExitRules with the fixed ₹10 stop and ₹15 take-profit', () => {
+describe('simulateExitRules with the fixed ₹10 stop and the ₹5-step profit ratchet', () => {
   const start = { premium: 150, delta: 0.5, side: 'CE' as const, spot: 25_000, at: ist('10:00') };
   const path = (moves: Array<[string, number]>) =>
     moves.map(([time, spot]) => ({ at: ist(time), spot }));
 
-  it('sells at +₹15 and at −₹10, whatever the percentage', () => {
-    // Index +32 points: the option is about ₹16 up, past the ₹15 target.
-    expect(simulateExitRules(start, path([['10:05', 25_032]]), DEFAULT_STRATEGY)).toMatchObject({
-      reason: 'target-reached',
-    });
+  it('ratchets the lock to +₹15 and sells at −₹10, whatever the percentage', () => {
+    // Index +32 points: about ₹16 up, so the lock is at +₹15; back to +₹13: sold on the lock.
+    const locked = simulateExitRules(
+      start,
+      path([
+        ['10:05', 25_032],
+        ['10:10', 25_026],
+      ]),
+      DEFAULT_STRATEGY,
+    );
+    expect(locked).toMatchObject({ reason: 'profit-lock' });
+    expect(locked?.bestPct).toBeCloseTo(10.67, 1);
     // Index −20 points: ₹10 down, −6.7%, well inside the −20% limit but at the ₹10 stop.
     expect(simulateExitRules(start, path([['10:05', 24_980]]), DEFAULT_STRATEGY)).toMatchObject({
       reason: 'stop-loss',

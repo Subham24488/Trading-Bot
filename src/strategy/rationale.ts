@@ -5,6 +5,7 @@ import type { ContractCandidate, ContractPlan } from './contracts.js';
 import {
   levelRoomPct,
   profitFloor,
+  profitLockLevelInr,
   type ExitReason,
   type GateId,
   type Leaning,
@@ -220,8 +221,11 @@ function planText(input: {
     plan.targetPrice !== null
       ? `Take profit at ${formatInr(plan.targetPrice)} (₹${params.takeProfitInr} above the buy price), about ` +
         `${formatInr(plan.targetProfitInr ?? 0)} after charges; once it reaches ${lock}. `
-      : `Once it reaches ${lock}, locking about ${formatInr(plan.lockedProfitInr)} after charges; bigger gains keep ` +
-        'a growing share. ';
+      : params.profitStepInr > 0
+        ? `Once it reaches ${lock} (about ${formatInr(plan.lockedProfitInr)} after charges) and then ` +
+          `₹${params.profitStepInr} higher for every further ₹${params.profitStepInr} gain; it is never sold at a target. `
+        : `Once it reaches ${lock}, locking about ${formatInr(plan.lockedProfitInr)} after charges; bigger gains keep ` +
+          'a growing share. ';
   return `${stop}${room}${profit}Sell by ${formatClockTime(params.squareOffMinute)} at the latest.`;
 }
 
@@ -381,7 +385,10 @@ export function describeHold(input: {
         ? `the ₹${params.profitLockInr} profit lock starts at ${formatInr(lockPrice)}`
         : `profit protection starts at ${formatInr(breakevenFrom)} and the ₹${params.profitLockInr} profit lock at ${formatInr(lockPrice)}`
       : floor.kind === 'lock'
-        ? `the ₹${params.profitLockInr} profit lock is on, so it sells below ${formatInr(floorPrice)}`
+        ? params.profitStepInr > 0
+          ? `the profit lock is at ${formatInr(floorPrice)} (₹${Math.round(floorPrice - position.entryPrice)} above the buy price) ` +
+            `and rises ₹${params.profitStepInr} with every further ₹${params.profitStepInr} gain`
+          : `the ₹${params.profitLockInr} profit lock is on, so it sells below ${formatInr(floorPrice)}`
         : floor.kind === 'breakeven'
           ? `the exit has moved up to ${formatInr(floorPrice)} so this trade cannot turn into a loss`
           : `profit protection is on and sells below ${formatInr(floorPrice)}`;
@@ -442,8 +449,14 @@ const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, position: OpenPosit
       ? 'the index broke the chart level that supported the trade'
       : `${position.index} ${position.side === 'CE' ? 'fell below' : 'rose above'} ${wholeNumber.format(position.stopSpot)}, ` +
         `past the ${position.side === 'CE' ? 'low' : 'high'} that supported the trade, so the chart no longer backed it`,
-  'profit-lock': (p, position) =>
-    `the option had gained ₹${p.profitLockInr} and slipped back to the profit lock at ${formatInr(position.entryPrice + p.profitLockInr)}, so the gain was kept`,
+  'profit-lock': (p, position) => {
+    const level = profitLockLevelInr(position.entryPrice, position.peakPrice, p) ?? p.profitLockInr;
+    const best = Math.max(level, position.peakPrice - position.entryPrice);
+    return (
+      `the option had gained ${formatInr(best)} and slipped back to its profit lock at ` +
+      `${formatInr(position.entryPrice + level)} (₹${level} above the buy price), so the gain was kept`
+    );
+  },
   'target-reached': (p, position) =>
     `the option reached our ₹${p.takeProfitInr} profit target at ${formatInr(position.entryPrice + p.takeProfitInr)}`,
 };

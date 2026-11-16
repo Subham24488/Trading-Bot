@@ -102,6 +102,7 @@ import {
 } from '../strategy/contracts.js';
 import {
   checkPositionExit,
+  profitLockLevelInr,
   decideEntry,
   summarizeDay,
   type DayRow,
@@ -1222,6 +1223,7 @@ export class LlmTradeAdvisorService {
         now,
         position,
         price: exitCheckPrice(quote, price),
+        lastPrice: price,
         spot: view.spots[position.index] ?? null,
         reading,
       },
@@ -1274,6 +1276,7 @@ export class LlmTradeAdvisorService {
       stopSpot: position.stopSpot,
       premiumStop: position.premiumStop,
       lockArmed: position.peakPrice >= position.entryPrice + this.params.profitLockInr,
+      profitLockPrice: this.profitLockPrice(position),
     });
     return stored;
   }
@@ -1318,6 +1321,7 @@ export class LlmTradeAdvisorService {
         now,
         position,
         price: exitCheckPrice(quote, price),
+        lastPrice: price,
         spot: spots[position.index] ?? null,
       },
       this.params,
@@ -1825,7 +1829,14 @@ export class LlmTradeAdvisorService {
       entryDelta: position.entryDelta,
       stopSpot: position.stopSpot,
       premiumStop: position.premiumStop,
+      profitLockPrice: this.profitLockPrice(position),
     };
+  }
+
+  /** Price the ratcheting profit lock sells below (buy + ₹10, + ₹15 …); null until armed. */
+  private profitLockPrice(position: OpenPosition): number | null {
+    const level = profitLockLevelInr(position.entryPrice, position.peakPrice, this.params);
+    return level === null ? null : round(position.entryPrice + level);
   }
 
   private snapshot(input: {

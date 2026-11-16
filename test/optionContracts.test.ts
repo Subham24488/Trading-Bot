@@ -163,7 +163,7 @@ describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
     expect(candidates[0]!.delta).toBeLessThan(0.46);
   });
 
-  it('puts the stop ₹10 under the buy price on the tick, and the target ₹15 over it', () => {
+  it('puts the stop ₹10 under the buy price on the tick, the lock ₹10 over it and no target', () => {
     const { candidates } = candidatesFor(nearMoney(), DEFAULT_STRATEGY, plan);
     for (const candidate of candidates) {
       const stopped = candidate.plan!;
@@ -172,7 +172,8 @@ describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
       expect(candidate.ask - stopped.premiumStop).toBeGreaterThan(9.95 - 1e-9);
       expect(Math.round(stopped.premiumStop * 20)).toBeCloseTo(stopped.premiumStop * 20, 6);
       expect(stopped.riskPerUnit).toBe(10);
-      expect(stopped.targetPrice).toBeCloseTo(candidate.ask + 15, 2);
+      expect(stopped.targetPrice).toBeNull();
+      expect(stopped.lockPrice).toBeCloseTo(candidate.ask + 10, 2);
       const atStop = estimateOptionsRoundTripCost({
         buyPremium: candidate.ask,
         sellPremium: stopped.premiumStop,
@@ -182,7 +183,8 @@ describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
         (candidate.ask - stopped.premiumStop) * 65 + atStop.totalInr,
         1,
       );
-      expect(stopped.targetProfitInr).toBeGreaterThan(15 * 65 - 100);
+      expect(stopped.targetProfitInr).toBeNull();
+      expect(stopped.lockedProfitInr).toBeGreaterThan(10 * 65 - 100);
     }
   });
 
@@ -197,8 +199,8 @@ describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
       code: 'target-out-of-reach',
       reason: expect.stringContaining('short of the ₹15 target'),
     });
-    // A dead market: ₹15 needs ~36 points, more than 3 swings of 10.
-    const quiet = candidatesFor(nearMoney(), DEFAULT_STRATEGY, { ...plan, atr: 10 });
+    // A dead market: the ₹10 lock needs ~24 points, more than 3 swings of 7.
+    const quiet = candidatesFor(nearMoney(), DEFAULT_STRATEGY, { ...plan, atr: 7 });
     expect(quiet.rejected.find((item) => item.symbol === 'NIFTY26OCT25100CE')).toMatchObject({
       code: 'target-out-of-reach',
       reason: expect.stringContaining('normal 5-minute swings'),

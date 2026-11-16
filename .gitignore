@@ -2,6 +2,8 @@ logs/
 trades/*.json
 universe/*.json
 simulations/
+# Raw Kite candle downloads (large; re-download any time).
+src/History/
 !universe/.gitkeep
 .kite-session.json
 node_modules/
@@ -14,3 +16,5 @@ coverage/
 *.log
 .pnpm-debug.log*
 prisma/generated/
+# Backtest runs from src/History data (recordings, results).
+Backtest/

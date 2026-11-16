@@ -285,10 +285,36 @@ export function profitLockPct(entryPrice: number, params: StrategyParams): numbe
 }
 
 /**
+ * ₹ per unit above the buy price that the profit lock keeps, from the best price so far: null
+ * below buy + `profitLockInr`, then `profitLockInr`, rising by `profitStepInr` for each further
+ * step reached (10, 15, 20 … with the defaults).
+ */
+export function profitLockLevelInr(
+  entryPrice: number,
+  peakPrice: number,
+  params: StrategyParams,
+): number | null {
+  const gain = peakPrice - entryPrice;
+  if (
+    !(entryPrice > 0) ||
+    params.profitLockInr <= 0 ||
+    gain + ROUNDING_SLACK < params.profitLockInr
+  ) {
+    return null;
+  }
+  if (params.profitStepInr <= 0) {
+    return params.profitLockInr;
+  }
+  const steps = Math.floor((gain - params.profitLockInr) / params.profitStepInr + ROUNDING_SLACK);
+  return params.profitLockInr + steps * params.profitStepInr;
+}
+
+/**
  * Lowest gain (% on premium) the trade may fall back to before it is sold, from its best gain
  * so far; null until the break-even lock or the ₹ profit lock arms. With `entryPrice`, a best
- * price of buy + `profitLockInr` moves the floor up to that price. Shared by the live checks,
- * the HOLD rationale and the review's what-if replay.
+ * price of buy + `profitLockInr` moves the floor up to that price; with `profitStepInr` the lock
+ * then ratchets up and alone decides the floor. Shared by the live checks, the HOLD rationale
+ * and the review's what-if replay.
  */
 export function profitFloor(
   peakGainPct: number,
@@ -298,6 +324,10 @@ export function profitFloor(
 ): ProfitFloor | null {
   const lockPct = entryPrice === null ? null : profitLockPct(entryPrice, params);
   const lockArmed = lockPct !== null && peakGainPct + ROUNDING_SLACK >= lockPct;
+  if (lockArmed && entryPrice !== null && params.profitStepInr > 0) {
+    const level = profitLockLevelInr(entryPrice, entryPrice * (1 + peakGainPct / 100), params);
+    return { floorPct: ((level ?? params.profitLockInr) / entryPrice) * 100, kind: 'lock' };
+  }
   const breakevenArmed = peakGainPct >= params.breakevenActivatePct;
   if (!breakevenArmed && !lockArmed) {
     return null;
@@ -411,7 +441,8 @@ export function decideEntry(
 }
 
 /**
- * Open position, checked in order: stale position, end-of-day square-off, the planned premium
+ * Open position, checked in order: stale position, end-of-day square-off; once the ratcheting ₹
+ * profit lock has armed, only that lock; otherwise the planned premium
  * stop, the chart stop on the index (or the fixed index move without one), the ₹ take-profit,
  * the profit floor (₹ profit lock, break-even lock, stepped trailing stop, tighter at a big
  * level on cycle checks), time stop; then (cycle only, after the minimum hold) trend reversal
@@ -424,6 +455,11 @@ export function checkPositionExit(
     price: number | null;
     /** Current spot of the position's index. */
     spot?: number | null;
+    /**
+     * Last traded price. The ratcheting profit lock triggers on it, like a GTT order, so a bid a
+     * few paise under a step just reached does not sell at once; `price` (the bid) otherwise.
+     */
+    lastPrice?: number | null;
     reading?: IndexReading | null;
   },
   params: StrategyParams,
@@ -435,6 +471,20 @@ export function checkPositionExit(
   }
   if (clock.minute >= params.squareOffMinute) {
     return { action: 'EXIT', reason: 'square-off' };
+  }
+  // Once the ratcheting profit lock has armed, only it (and the square-off above) can sell.
+  if (params.profitStepInr > 0) {
+    const level = profitLockLevelInr(
+      position.entryPrice,
+      Math.max(position.peakPrice, price ?? 0),
+      params,
+    );
+    if (level !== null) {
+      const trigger = input.lastPrice ?? price;
+      return trigger !== null && trigger < position.entryPrice + level - ROUNDING_SLACK
+        ? { action: 'EXIT', reason: 'profit-lock' }
+        : { action: 'HOLD' };
+    }
   }
   const pnlPct = pctChange(position.entryPrice, price);
   const premiumStop = position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);

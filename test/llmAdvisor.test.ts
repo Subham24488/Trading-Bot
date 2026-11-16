@@ -633,7 +633,8 @@ describe('LlmTradeAdvisorService safety', () => {
       // The chart plan: a stop under the setup, a loss within ₹15 a unit, the ₹10 lock.
       const plan = (stored.marketSnapshot as StoredRow['marketSnapshot']).entry?.plan;
       expect(plan?.lockPrice).toBeCloseTo(ask + 10, 2);
-      expect(plan?.targetPrice).toBeCloseTo(ask + 15, 2);
+      // No target sell: the lock ratchets up instead.
+      expect(plan?.targetPrice).toBeNull();
       // The fixed ₹10 stop, on the ₹0.05 tick.
       expect(ask - (plan?.premiumStop ?? 0)).toBeLessThanOrEqual(10 + 1e-9);
       expect(ask - (plan?.premiumStop ?? 0)).toBeGreaterThan(9.95 - 1e-9);
@@ -971,15 +972,23 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       const { advisor, setOptionPriceFactor } = await optionsAdvisorScenario();
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
-      // +10% is about +₹15.4: the ₹15 target sells it, roughly ₹930 after charges.
+      // +10% is about +₹15.4: the lock moves to +₹15 and the trade is held.
       setOptionPriceFactor(1.1);
       vi.setSystemTime(ist('2026-10-21', '10:31'));
       await advisor.runDecisionCycle();
-      expect(storedRows()[1]?.marketSnapshot.exit?.reason).toBe('target-reached');
+      expect(storedRows()[1]).toMatchObject({
+        action: 'HOLD',
+        marketSnapshot: { position: { profitLockPrice: expect.any(Number) } },
+      });
+      // Back to +5%: it slips through the lock and is sold, roughly ₹420 after charges.
+      setOptionPriceFactor(1.05);
+      vi.setSystemTime(ist('2026-10-21', '10:32'));
+      await advisor.runDecisionCycle();
+      expect(storedRows()[2]?.marketSnapshot.exit?.reason).toBe('profit-lock');
       setOptionPriceFactor(1);
       vi.setSystemTime(ist('2026-10-21', '11:05'));
       await advisor.runDecisionCycle();
-      expect(storedRows()[2]).toMatchObject({ action: 'BUY' });
+      expect(storedRows()[3]).toMatchObject({ action: 'BUY' });
     } finally {
       vi.useRealTimers();
     }
@@ -993,13 +1002,18 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
 
-      // A +30% jump sells at once on the ₹15 target, about ₹2,900 on the lot after charges.
+      // A +30% jump (about +₹46) moves the lock to +₹45; it is not sold at a target.
       setOptionPriceFactor(1.3);
       vi.setSystemTime(ist('2026-10-21', '10:31'));
       await advisor.runDecisionCycle();
-      const exit = storedRows()[1];
-      expect(exit?.marketSnapshot.exit?.reason).toBe('target-reached');
-      expect(Number(exit?.sellPrice) - Number(exit?.buyPrice)).toBeGreaterThanOrEqual(15);
+      expect(storedRows()[1]).toMatchObject({ action: 'HOLD' });
+      // Back to +20% (about +₹31): through the lock, sold for about ₹1,900 after charges.
+      setOptionPriceFactor(1.2);
+      vi.setSystemTime(ist('2026-10-21', '10:32'));
+      await advisor.runDecisionCycle();
+      const exit = storedRows()[2];
+      expect(exit?.marketSnapshot.exit?.reason).toBe('profit-lock');
+      expect(Number(exit?.sellPrice) - Number(exit?.buyPrice)).toBeGreaterThan(25);
 
       // Past the cool-down, the same market would buy again; the day is up over ₹1,500.
       setOptionPriceFactor(1);

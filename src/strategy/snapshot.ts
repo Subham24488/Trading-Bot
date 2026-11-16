@@ -134,6 +134,8 @@ export const decisionSnapshotSchema = z.object({
       /** Current (trailed) chart stop on the index and the planned premium stop. */
       stopSpot: nullableNumber.optional(),
       premiumStop: nullableNumber.optional(),
+      /** Current ratcheting profit-lock price; null until buy + ₹10 is reached. */
+      profitLockPrice: nullableNumber.optional(),
     })
     .optional(),
   exit: z
