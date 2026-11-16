@@ -617,7 +617,18 @@ describe('pullback entries (the defaults)', () => {
         ...chart.candle,
       },
     });
-  // The bounce turned the price votes up: +5, the way the real 10:55 reading looked.
+  // Votes leaning down, −3, like the winning 11-12 and 11-13 puts.
+  const bearishVotes = {
+    averagePrice: -1,
+    trend: -1,
+    openingRange: 0,
+    volume: 0,
+    optionFlow: -1,
+    futuresPositioning: 0,
+    breadth: 0,
+    globalMood: 0,
+  } as const;
+  // A bounce that turned the price votes up: +5 against the put.
   const bullishVotes = {
     averagePrice: 1,
     trend: 1,
@@ -628,7 +639,7 @@ describe('pullback entries (the defaults)', () => {
     breadth: 0,
     globalMood: 0,
   } as const;
-  const decide = (chart: ChartRead, votes: Partial<Record<SignalName, Vote>> = bullishVotes) =>
+  const decide = (chart: ChartRead, votes: Partial<Record<SignalName, Vote>> = bearishVotes) =>
     decideEntry(
       {
         now,
@@ -646,9 +657,42 @@ describe('pullback entries (the defaults)', () => {
       current,
     );
 
-  it('buys a put on a bounce to value in a 15-minute downtrend, whatever the price votes say', () => {
+  it('buys a put on a bounce to value in a 15-minute downtrend when the votes agree', () => {
     // Swings up and below-usual volume no longer block a pullback.
     expect(decide(bounceInDowntrend())).toMatchObject({ action: 'BUY', side: 'PE' });
+  });
+
+  it('skips when the 8 votes lean the other way (6 of 8 such entries lost in the 10-day replay)', () => {
+    expect(decide(bounceInDowntrend(), bullishVotes)).toMatchObject({
+      action: 'SKIP',
+      blockedBy: ['signals-disagree'],
+    });
+    const flat = { ...bearishVotes, averagePrice: 0, trend: 0, optionFlow: 0 } as const;
+    expect(decide(bounceInDowntrend(), flat)).toMatchObject({
+      action: 'SKIP',
+      blockedBy: ['signals-disagree'],
+    });
+    expect(decide(bounceInDowntrend(), { ...flat, trend: -1 })).toMatchObject({ action: 'BUY' });
+    const text = describeSkip({
+      now,
+      blockedBy: ['signals-disagree'],
+      leaning: { index: 'NIFTY', side: 'PE', score: 5 },
+      reading: reading({ chart: bounceInDowntrend() }),
+      params: current,
+    });
+    expect(text).toContain('the 8 market signals lean the other way');
+  });
+
+  it('accepts a shallower pullback, up to 1 normal swing from value, when the votes agree strongly', () => {
+    // 2026-11-05: votes +5 to +7 all day, the price never back within 0.5 of value.
+    const strongVotes = { ...bearishVotes, openingRange: -1, volume: -1 } as const;
+    const shallow = bounceInDowntrend({ valueGapAtr: 0.8 });
+    expect(decide(shallow, strongVotes)).toMatchObject({ action: 'BUY', side: 'PE' });
+    expect(decide(shallow)).toMatchObject({ action: 'SKIP', blockedBy: ['no-pullback'] });
+    expect(decide(bounceInDowntrend({ valueGapAtr: 1.2 }), strongVotes)).toMatchObject({
+      action: 'SKIP',
+      blockedBy: ['no-pullback'],
+    });
   });
 
   it.each([
@@ -677,13 +721,14 @@ describe('pullback entries (the defaults)', () => {
     expect(decide(crowded)).toMatchObject({ action: 'BUY', side: 'PE' });
   });
 
-  it('lets only the market backdrop votes block it: two against is too many', () => {
-    // Option flow already points up; large stocks rising as well makes two against the put.
-    expect(decide(bounceInDowntrend(), { ...bullishVotes, breadth: 1 })).toMatchObject({
-      action: 'SKIP',
-      blockedBy: ['too-many-opposing'],
+  it('counts only the market backdrop votes as opposing: two against is too many', () => {
+    // Large stocks and global mood both up: two backdrop votes against the put.
+    expect(
+      decide(bounceInDowntrend(), { ...bearishVotes, breadth: 1, globalMood: 1 }),
+    ).toMatchObject({ action: 'SKIP', blockedBy: ['too-many-opposing'] });
+    expect(decide(bounceInDowntrend(), { ...bearishVotes, breadth: 1 })).toMatchObject({
+      action: 'BUY',
     });
-    expect(decide(bounceInDowntrend(), bullishVotes)).toMatchObject({ action: 'BUY' });
   });
 
   it('records the trend side as the leaning and says so in plain words', () => {

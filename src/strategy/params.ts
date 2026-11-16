@@ -53,6 +53,10 @@ export type ChartParams = {
   maxTargetAtr: number;
   /** Pullback entries: the price must be back within this many ATRs of VWAP or the 21-bar EMA. */
   maxValueGapAtr: number;
+  /** When the votes agree with the trend by at least this score, a shallower pullback will do... */
+  strongTrendScore: number;
+  /** ...up to this many ATRs from value (strong trend days never come all the way back). */
+  strongTrendMaxValueGapAtr: number;
 };
 
 /**
@@ -71,6 +75,8 @@ export type StrategyParams = {
   squareOffMinute: number;
   minEntryScore: number;
   maxOpposingVotes: number;
+  /** Pullback entries: the vote score must lean the trade's way by at least this (−8 turns it off). */
+  minAgreeingScore: number;
   rsiChaseLimit: number;
   maxVixRiseForCallsPct: number;
   newsLookbackMinutes: number;
@@ -137,6 +143,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   squareOffMinute: 15 * 60 + 15,
   minEntryScore: 4,
   maxOpposingVotes: 1,
+  // 10-day replay: 6 of 8 entries with the votes against lost; 6 of 8 with them agreeing won.
+  minAgreeingScore: 1,
   rsiChaseLimit: 75,
   maxVixRiseForCallsPct: 8,
   newsLookbackMinutes: 60,
@@ -219,6 +227,9 @@ export const DEFAULT_STRATEGY: StrategyParams = {
     targetFallbackAtr: 2,
     maxTargetAtr: 3,
     maxValueGapAtr: 0.5,
+    // 2026-11-05: votes +5 to +7 all day, price never back within 0.5 ATR of value, no trade.
+    strongTrendScore: 5,
+    strongTrendMaxValueGapAtr: 1,
   },
 };
 

@@ -29,6 +29,7 @@ export const GATE_IDS = [
   'target-out-of-reach',
   'risk-too-wide',
   'no-pullback',
+  'signals-disagree',
 ] as const;
 
 export type GateId = (typeof GATE_IDS)[number];
@@ -175,10 +176,20 @@ function readingGates(
   const { chart } = reading;
   const pullback = usesPullback(reading, params);
   if (pullback) {
-    // A clear 15-minute trend and the price back near value (VWAP or the 21-bar average).
+    // A clear 15-minute trend and the price back near value (VWAP or the 21-bar average); when
+    // the votes agree strongly, a shallower pullback will do.
+    const agreement = side === null ? 0 : reading.score * (side === 'CE' ? 1 : -1);
+    const maxGap =
+      agreement >= params.chart.strongTrendScore
+        ? params.chart.strongTrendMaxValueGapAtr
+        : params.chart.maxValueGapAtr;
     const gap = chart?.valueGapAtr ?? null;
-    if (side === null || gap === null || gap > params.chart.maxValueGapAtr) {
+    if (side === null || gap === null || gap > maxGap) {
       gates.push('no-pullback');
+    }
+    // The 8 votes must lean the trade's way: entries against them lost 6 times out of 8.
+    if (side !== null && agreement < params.minAgreeingScore) {
+      gates.push('signals-disagree');
     }
   } else if (side === null || Math.abs(reading.score) < params.minEntryScore) {
     gates.push('weak-signal');

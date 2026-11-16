@@ -116,6 +116,8 @@ const GATE_TEXT: Record<GateId, (params: StrategyParams) => string> = {
     `no option could gain ₹${p.takeProfitInr > 0 ? p.takeProfitInr : p.profitLockInr} before the next level where the price may turn back`,
   'risk-too-wide': (p) =>
     `the stop the chart calls for is too far away: the loss there would be more than ₹${p.maxRiskPerUnitInr} a unit`,
+  'signals-disagree': (p) =>
+    `the 8 market signals lean the other way (we need at least ${p.minAgreeingScore} more pointing with the trade)`,
   'no-pullback': () =>
     "we buy only in a clear 15-minute trend once the price has come back to its average (today's average price or the 21-candle average), and it has not",
 };
