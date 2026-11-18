@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+
 import { readChart, type ChartPlan, type ChartRead } from '../src/strategy/chart.js';
 import { msUntilNextCycle } from '../src/strategy/clock.js';
 import type { ChainQuote, ContractCandidate } from '../src/strategy/contracts.js';
@@ -33,6 +34,7 @@ import {
   type SignalName,
   type Vote,
 } from '../src/strategy/signals.js';
+import { checkTrendDay, type TrendDay } from '../src/strategy/trendDay.js';
 import {
   fiveMinuteBars,
   ist,
@@ -130,6 +132,8 @@ function reading(
     expiryToday: false,
     newsLevel: 'none',
     coreDataOk: true,
+    trendDay: null,
+    trendDayEntry: null,
     ...overrides,
     votes,
     score: overrides.score ?? Object.values(votes).reduce((sum, vote) => sum + vote, 0),
@@ -977,7 +981,7 @@ describe('checkPositionExit', () => {
   });
 });
 
-describe('checkPositionExit with the ₹5-step profit ratchet and pullback rules', () => {
+describe('checkPositionExit with the ₹10-step profit ratchet and pullback rules', () => {
   const position: OpenPosition = {
     symbol: 'NIFTY26N1725150PE',
     index: 'NIFTY',
@@ -1007,15 +1011,18 @@ describe('checkPositionExit with the ₹5-step profit ratchet and pullback rules
       current,
     );
 
-  it('locks buy + ₹10 at +₹10, then moves ₹5 higher for every further ₹5 gain', () => {
+  it('locks buy + ₹10 at +₹10, then moves ₹10 higher for every further ₹10 gain', () => {
     expect(profitLockLevelInr(120.3, 130.2, current)).toBeNull();
     expect(profitLockLevelInr(120.3, 130.3, current)).toBe(10);
-    expect(profitLockLevelInr(120.3, 135.3, current)).toBe(15);
-    expect(profitLockLevelInr(120.3, 144.29, current)).toBe(20);
-    expect(profitLockLevelInr(120.3, 165.3, current)).toBe(45);
-    // Best ₹136 (+₹15.70): the lock is at ₹135.30.
-    expect(at('11:05', 135.3, null, 136)).toEqual({ action: 'HOLD' });
-    expect(at('11:05', 135.25, null, 136)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+    expect(profitLockLevelInr(120.3, 135.3, current)).toBe(10);
+    expect(profitLockLevelInr(120.3, 140.3, current)).toBe(20);
+    expect(profitLockLevelInr(120.3, 150.29, current)).toBe(20);
+    expect(profitLockLevelInr(120.3, 165.3, current)).toBe(40);
+    // Best ₹136 (+₹15.70): the lock stays at ₹130.30, so ₹131 still holds.
+    expect(at('11:05', 131, null, 136)).toEqual({ action: 'HOLD' });
+    // Best ₹141 (+₹20.70): the lock is at ₹140.30.
+    expect(at('11:05', 140.3, null, 141)).toEqual({ action: 'HOLD' });
+    expect(at('11:05', 140.25, null, 141)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
     // Best ₹130.30: the lock is at ₹130.30, and there is no target sell however high it goes.
     expect(at('11:05', 130.25, null, 130.3)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
     expect(at('11:05', 200)).toEqual({ action: 'HOLD' });
@@ -1348,6 +1355,95 @@ describe('plain-English rationale', () => {
     expect(overnight).toContain('recorded at its 3:15 PM price on the day it was bought');
   });
 
+  it('explains a breakout buy on a trend day in plain words', () => {
+    const { data, backdrop } = bullishMarket();
+    const trendDay: TrendDay = {
+      side: 'CE',
+      flaggedAtMinute: 10 * 60,
+      reasons: ['one', 'two', 'three'],
+    };
+    const breakout = readIndex(data, backdrop, current, now, trendDay);
+    const stopSpot = breakout.chart?.plans.CE.stopSpot ?? NaN;
+    const plan = {
+      stopSpot,
+      targetSpot: 25_060,
+      riskPoints: 25_000 - stopSpot,
+      rewardPoints: 60,
+      rewardPerUnit: 30.8,
+      riskPerUnit: 9.03,
+      premiumStop: 110.2,
+      lockPrice: 130.2,
+      maxLossInr: 657.4,
+      lockedProfitInr: 576.3,
+      targetPrice: null,
+      targetProfitInr: null,
+    };
+    const buy = describeBuy({
+      now,
+      candidate: { ...candidate, plan },
+      fillPrice: 120.2,
+      reading: breakout,
+      candidateCount: 3,
+      params: current,
+    });
+    expect(buy).not.toMatch(JARGON);
+    expect(buy.length).toBeLessThanOrEqual(1200);
+    expect(buy.endsWith('…')).toBe(false);
+    expect(buy).toMatch(
+      /Chart: today is a trend day upward \(flagged at 10:00 AM, 3 of 5 checks agree\); NIFTY futures closed above the last hour's high \([\d,]+\) on 3\.0× the day's usual volume, so we bought without waiting for a pullback\./,
+    );
+    expect(buy).toContain("(just under the last hour's high, the level it broke)");
+  });
+
+  it('explains a shallow-pullback buy on a trend day in plain words', () => {
+    const { data, backdrop } = bullishMarket();
+    // Flat volume: no breakout.
+    const futuresBars = data.futuresBars.map((bar) => ({ ...bar, v: 1_000 }));
+    const futuresPrice =
+      ema(
+        futuresBars.map((bar) => bar.c),
+        9,
+      )! + 2;
+    const trendDay: TrendDay = { side: 'CE', flaggedAtMinute: 10 * 60, reasons: ['a', 'b', 'c'] };
+    const dip = readIndex(
+      { ...data, futuresBars, futuresPrice, futuresVwap: futuresPrice - 30 },
+      backdrop,
+      current,
+      now,
+      trendDay,
+    );
+    expect(dip.trendDayEntry?.trigger).toBeNull();
+    const buy = describeBuy({
+      now,
+      candidate: {
+        ...candidate,
+        plan: {
+          stopSpot: 24_983.4,
+          targetSpot: 25_060,
+          riskPoints: 16.6,
+          rewardPoints: 60,
+          rewardPerUnit: 30.8,
+          riskPerUnit: 10,
+          premiumStop: 110.2,
+          lockPrice: 130.2,
+          maxLossInr: 721.4,
+          lockedProfitInr: 576.3,
+          targetPrice: null,
+          targetProfitInr: null,
+        },
+      },
+      fillPrice: 120.2,
+      reading: dip,
+      candidateCount: 3,
+      params: current,
+    });
+    expect(buy).toContain(
+      'Chart: today is a trend day upward, and NIFTY dipped to its 9-candle average instead of coming all the way back to its average price',
+    );
+    expect(buy).not.toMatch(JARGON);
+    expect(buy.length).toBeLessThanOrEqual(1200);
+  });
+
   it('states the chart stop, the planned loss, the target and the ₹10 lock on a BUY', () => {
     const plan = {
       stopSpot: 24_983.4,
@@ -1468,7 +1564,7 @@ describe('plain-English rationale', () => {
       'Plan: a stop-loss order sells if the option trades at ₹110.20 (₹10 below the buy price), a planned loss of about ₹721.40 on 1 lot after charges, or we sell earlier if NIFTY falls below 24,983',
     );
     expect(buy).toContain(
-      'Once it reaches ₹130.20 (₹10 above the buy price), the exit moves up to ₹130.20 (about ₹576.30 after charges) and then ₹5 higher for every further ₹5 gain; it is never sold at a target.',
+      'Once it reaches ₹130.20 (₹10 above the buy price), the exit moves up to ₹130.20 (about ₹576.30 after charges) and then ₹10 higher for every further ₹10 gain; it is never sold at a target.',
     );
     expect(buy).toContain(
       'Chart: the 15-minute trend is up and NIFTY came back to its average price; the last 5-minute candles show a strong up candle',
@@ -1491,7 +1587,7 @@ describe('plain-English rationale', () => {
       params: current,
     });
     expect(armed).toContain(
-      'the profit lock is at ₹135.20 (₹15 above the buy price) and rises ₹5 with every further ₹5 gain',
+      'the profit lock is at ₹130.20 (₹10 above the buy price) and rises ₹10 with every further ₹10 gain',
     );
     const exit = describeExit({
       now: ist('2026-10-21', '10:50'),
@@ -1520,5 +1616,129 @@ describe('plain-English rationale', () => {
     expect(skip).not.toMatch(JARGON);
     expect(skip).toContain('the possible gain is less than 1.5× the loss at our stop');
     expect(skip).toContain("today's closed trades are already in profit, so we stop for the day");
+  });
+});
+
+describe('trend days', () => {
+  const today = '2026-10-21';
+  const at = (hhmm: string) => new Date(ist(today, hhmm).getTime() + 20_000);
+  /** A steady climb (+12 / −6 a candle) with today's last three candles on 3× the volume. */
+  const climb = (todayBars: number) =>
+    uptrendFuturesBars({ yesterday: '2026-10-20', today, todayBars });
+  const check = (hhmm: string, todayBars: number, advancersPct: number) =>
+    checkTrendDay(
+      { now: at(hhmm), bars: climb(todayBars), dailyBars: [], advancersPct },
+      current.trendDay,
+    );
+  const flaggedUp: TrendDay = {
+    side: 'CE',
+    flaggedAtMinute: 10 * 60,
+    reasons: ['one', 'two', 'three'],
+  };
+  const decideAt = (hhmm: string, read: IndexReading) =>
+    decideEntry({ now: at(hhmm), readings: [read], day: quietDay, vixPct: 0 }, current);
+
+  it('flags a trend day when three of the five checks agree between 09:45 and 10:30', () => {
+    const flagged = check('10:00', 9, 75);
+    expect(flagged).toMatchObject({ side: 'CE', flaggedAtMinute: 10 * 60 });
+    expect(flagged?.reasons).toEqual([
+      'it broke above the first-15-minute range and held for 2 candles',
+      "it is above today's average price, which rose for 6 candles",
+      '75% of the breadth stocks are up',
+    ]);
+    for (const reason of flagged?.reasons ?? []) {
+      expect(reason).not.toMatch(JARGON);
+    }
+    // With breadth at 50% only two checks agree.
+    expect(check('10:00', 9, 50)).toBeNull();
+  });
+
+  it('does not flag a trend day before 09:45 or after 10:30', () => {
+    expect(check('09:40', 5, 75)).toBeNull();
+    expect(check('10:35', 16, 75)).toBeNull();
+  });
+
+  it("on a trend day, buys a close above the last hour's high on 1.5× the usual volume without waiting for a pullback", () => {
+    // The last candle closes above the last hour's high on 3× the usual volume, about 2 normal
+    // swings above today's average price: too far for a pullback entry.
+    const { data, backdrop } = bullishMarket();
+    const read = readIndex(data, backdrop, current, at('10:30'), flaggedUp);
+    expect(read.trendDay).toBe(flaggedUp);
+    expect(read.trendDayEntry?.trigger).toMatchObject({
+      kind: 'breakout',
+      name: "the last hour's high",
+    });
+    expect(read.chart?.valueGapAtr).toBeGreaterThan(current.chart.maxValueGapAtr);
+    expect(decideAt('10:30', read)).toMatchObject({ action: 'BUY', side: 'CE' });
+  });
+
+  it('does not buy the same breakout on a day that is not a trend day', () => {
+    // 10:35: after the trend-day check, and no earlier reading flagged the day.
+    const { data, backdrop } = bullishMarket();
+    const read = readIndex(data, backdrop, current, at('10:35'));
+    expect(read.trendDay).toBeNull();
+    expect(read.trendDayEntry).toBeNull();
+    expect(decideAt('10:35', read)).toMatchObject({
+      action: 'SKIP',
+      blockedBy: expect.arrayContaining(['no-pullback']),
+    });
+  });
+
+  it('does not buy a breakout on thin volume', () => {
+    const { data, backdrop } = bullishMarket();
+    const thin = { ...data, futuresBars: data.futuresBars.map((bar) => ({ ...bar, v: 1_000 })) };
+    const read = readIndex(thin, backdrop, current, at('10:30'), flaggedUp);
+    expect(read.trendDay?.side).toBe('CE');
+    expect(read.trendDayEntry?.trigger).toBeNull();
+    expect(decideAt('10:30', read)).toMatchObject({
+      action: 'SKIP',
+      blockedBy: expect.arrayContaining(['no-pullback']),
+    });
+  });
+
+  /** The trend-day climb on flat volume (no breakout), the futures 2 points over its 9-candle average. */
+  const dipToShortAverage = () => {
+    const { data: climbing, backdrop } = bullishMarket();
+    const data = {
+      ...climbing,
+      futuresBars: climbing.futuresBars.map((bar) => ({ ...bar, v: 1_000 })),
+    };
+    const futuresPrice = ema(
+      data.futuresBars.map((bar) => bar.c),
+      9,
+    )! + 2;
+    return { data: { ...data, futuresPrice, futuresVwap: futuresPrice - 30 }, backdrop };
+  };
+
+  it('on a trend day, a dip to the 9-candle average is pullback enough', () => {
+    const { data, backdrop } = dipToShortAverage();
+    const read = readIndex(data, backdrop, current, at('10:30'), flaggedUp);
+    expect(read.trendDayEntry?.shallowPullback).toBe('dipped to its 9-candle average');
+    // Still more than half a normal swing from the average price.
+    expect(read.chart?.valueGapAtr).toBeGreaterThan(current.chart.maxValueGapAtr);
+    expect(decideAt('10:30', read)).toMatchObject({ action: 'BUY', side: 'CE' });
+  });
+
+  it('on other days the same dip still waits for the average price or the 21-candle average', () => {
+    const { data, backdrop } = dipToShortAverage();
+    const read = readIndex(data, backdrop, current, at('10:35'));
+    expect(read.trendDayEntry).toBeNull();
+    expect(decideAt('10:35', read)).toMatchObject({ action: 'SKIP', blockedBy: ['no-pullback'] });
+  });
+
+  it('puts the index stop just under the level the breakout cleared', () => {
+    const { data, backdrop } = bullishMarket();
+    const read = readIndex(data, backdrop, current, at('10:30'), flaggedUp);
+    const level = read.trendDayEntry?.trigger?.level ?? NaN;
+    const chart = read.chart!;
+    expect(chart.plans.CE.stopBeyondBrokenLevel).toBe(true);
+    expect(chart.plans.CE.stopSpot).toBeCloseTo(
+      level - chart.basis - current.chart.stopBufferAtr * chart.atr,
+      6,
+    );
+    expect(chart.plans.CE.riskPoints).toBeCloseTo(25_000 - chart.plans.CE.stopSpot, 6);
+    // Without a trend day the stop stays under the setup candles.
+    const plain = readIndex(data, backdrop, current, at('10:35'));
+    expect(plain.chart?.plans.CE.stopBeyondBrokenLevel).toBeUndefined();
   });
 });

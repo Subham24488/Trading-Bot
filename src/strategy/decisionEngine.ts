@@ -140,8 +140,14 @@ function trendSide(chart: ChartRead): OptionSide | null {
   return chart.higherTrend === 'up' ? 'CE' : chart.higherTrend === 'down' ? 'PE' : null;
 }
 
-/** The side a reading would trade: the 15-minute trend in pullback mode, else the votes. */
+/**
+ * The side a reading would trade: a trend-day trigger's side (a breakout in the trend day's
+ * direction), else the 15-minute trend in pullback mode, else the votes.
+ */
 function entrySide(reading: IndexReading, params: StrategyParams): OptionSide | null {
+  if (reading.trendDayEntry?.trigger) {
+    return reading.trendDayEntry.side;
+  }
   return usesPullback(reading, params) && reading.chart
     ? trendSide(reading.chart)
     : sideOf(reading.score);
@@ -196,6 +202,11 @@ function readingGates(
   }
   const { chart } = reading;
   const pullback = usesPullback(reading, params);
+  // On a trend day, a trade in its direction may enter on a breakout: the breakout candle is the
+  // confirmation, so it does not wait for a pullback, a confirming candle or the votes.
+  const trendEntry =
+    side !== null && reading.trendDayEntry?.side === side ? reading.trendDayEntry : null;
+  const trigger = trendEntry?.trigger ?? null;
   if (pullback) {
     // A clear 15-minute trend and the price back near value (VWAP or the 21-bar average); when
     // the votes agree strongly, a shallower pullback will do.
@@ -205,11 +216,13 @@ function readingGates(
         ? params.chart.strongTrendMaxValueGapAtr
         : params.chart.maxValueGapAtr;
     const gap = chart?.valueGapAtr ?? null;
-    if (side === null || gap === null || gap > maxGap) {
+    // On a trend day a shallow dip (to the 9-candle average, or a higher low) is pullback enough.
+    const shallow = trendEntry?.shallowPullback ?? null;
+    if (!trigger && !shallow && (side === null || gap === null || gap > maxGap)) {
       gates.push('no-pullback');
     }
     // The 8 votes must lean the trade's way: entries against them lost 6 times out of 8.
-    if (side !== null && agreement < params.minAgreeingScore) {
+    if (!trigger && side !== null && agreement < params.minAgreeingScore) {
       gates.push('signals-disagree');
     }
   } else if (side === null || Math.abs(reading.score) < params.minEntryScore) {
@@ -245,9 +258,10 @@ function readingGates(
   // Pullback entries check the candle's shape only: volume against earlier days' same slot
   // swings too much (all six 11-13 pullback winners traded at 0.4–0.6× of it).
   const confirmed = pullback ? chart?.candle.shapeConfirms : chart?.candle.confirms;
-  if (reading.lastCandle.side !== null && reading.lastCandle.side !== side) {
+  // A trend-day trigger's own candle confirms the entry.
+  if (!trigger && reading.lastCandle.side !== null && reading.lastCandle.side !== side) {
     gates.push('opposite-candle');
-  } else if (chart && confirmed !== side) {
+  } else if (!trigger && chart && confirmed !== side) {
     gates.push('no-candle-confirmation');
   }
   if (side === 'CE' && vixPct !== null && vixPct >= params.maxVixRiseForCallsPct) {
@@ -308,7 +322,7 @@ export function profitLockPct(entryPrice: number, params: StrategyParams): numbe
 /**
  * ₹ per unit above the buy price that the profit lock keeps, from the best price so far: null
  * below buy + `profitLockInr`, then `profitLockInr`, rising by `profitStepInr` for each further
- * step reached (10, 15, 20 … with the defaults).
+ * step reached (10, 20, 30 … with the defaults).
  */
 export function profitLockLevelInr(
   entryPrice: number,

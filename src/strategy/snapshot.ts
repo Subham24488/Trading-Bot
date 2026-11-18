@@ -71,6 +71,21 @@ export const decisionSnapshotSchema = z.object({
       /** The index's 20-day average close; absent on rows from before the filter existed. */
       dayAverage: nullableNumber.optional(),
       chart: chartSchema.nullable().optional(),
+      /** Today's trend day (trendDay.ts); absent on rows from before trend days existed. */
+      trendDay: z
+        .object({ side: sideSchema, flaggedAtMinute: z.number(), reasons: z.array(z.string()) })
+        .nullable()
+        .optional(),
+      /** The trend-day breakout a trade in its direction could enter on. */
+      entryTrigger: z
+        .object({
+          kind: z.enum(['breakout']),
+          level: z.number(),
+          name: z.string(),
+          reason: z.string(),
+        })
+        .nullable()
+        .optional(),
     }),
   ),
   market: z.object({

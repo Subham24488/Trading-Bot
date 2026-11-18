@@ -84,6 +84,8 @@ export type ChartPlan = {
   rewardToRisk: number;
   /** A chart level just ahead of the price (inside the level buffer), not yet broken. */
   nearLevel: ChartLevel | null;
+  /** The stop sits just beyond the level a trend-day breakout broke (trendDay.ts). */
+  stopBeyondBrokenLevel?: boolean;
 };
 
 export type ChartRead = {

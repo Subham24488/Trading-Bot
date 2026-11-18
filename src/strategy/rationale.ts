@@ -170,12 +170,27 @@ function chartText(reading: IndexReading, side: OptionSide, params: StrategyPara
     return '';
   }
   const up = side === 'CE';
+  const trigger = reading.trendDayEntry?.side === side ? reading.trendDayEntry.trigger : null;
+  if (trigger && reading.trendDay) {
+    return (
+      `Chart: today is a trend day ${up ? 'upward' : 'downward'} (flagged at ` +
+      `${formatClockTime(reading.trendDay.flaggedAtMinute)}, ${reading.trendDay.reasons.length} of 5 checks agree); ` +
+      `${trigger.reason}, so we bought without waiting for a pullback. `
+    );
+  }
   const { candle } = chart;
   const pattern = candle.side === side ? PATTERN_TEXT[candle.pattern] : undefined;
   const shape = pattern
     ? `candles show ${pattern}`
     : `candle closed near its ${up ? 'high' : 'low'}, ${up ? 'above' : 'below'} the candle before`;
   if (params.entryMode === 'pullback') {
+    const shallow = reading.trendDayEntry?.side === side ? reading.trendDayEntry.shallowPullback : null;
+    if (shallow && (chart.valueGapAtr ?? Infinity) > params.chart.maxValueGapAtr) {
+      return (
+        `Chart: today is a trend day ${up ? 'upward' : 'downward'}, and ${reading.index} ${shallow} instead of coming ` +
+        `all the way back to its average price; the last 5-minute ${shape}, turning ${up ? 'up' : 'down'} again. `
+      );
+    }
     return (
       `Chart: the 15-minute trend is ${up ? 'up' : 'down'} and ${reading.index} came back to its ` +
       `average price; the last 5-minute ${shape}, turning ${up ? 'up' : 'down'} again. `
@@ -197,6 +212,8 @@ function planText(input: {
   targetKind: LevelKind;
   rewardToRisk: number;
   params: StrategyParams;
+  /** The level a trend-day breakout broke, when the stop sits just beyond it. */
+  brokenLevelName?: string;
 }): string {
   const { plan, params } = input;
   const up = input.side === 'CE';
@@ -206,7 +223,9 @@ function planText(input: {
       : `Next level: ${wholeNumber.format(plan.targetSpot)} (${LEVEL_TEXT[input.targetKind]})`;
   const indexStop =
     `${input.index} ${up ? 'falls below' : 'rises above'} ${wholeNumber.format(plan.stopSpot)} ` +
-    `(${up ? 'under the low' : 'over the high'} of the last two 5-minute candles)`;
+    (input.brokenLevelName
+      ? `(just ${up ? 'under' : 'over'} ${input.brokenLevelName}, the level it broke)`
+      : `(${up ? 'under the low' : 'over the high'} of the last two 5-minute candles)`);
   const loss = `a planned loss of about ${formatInr(plan.maxLossInr)} on 1 lot after charges`;
   const stop =
     params.stopLossInr > 0
@@ -298,6 +317,9 @@ export function describeBuy(input: {
           targetKind: chartPlan.targetKind,
           rewardToRisk: chartPlan.rewardToRisk,
           params,
+          ...(chartPlan.stopBeyondBrokenLevel && input.reading.trendDayEntry?.trigger
+            ? { brokenLevelName: input.reading.trendDayEntry.trigger.name }
+            : {}),
         }),
     );
   }

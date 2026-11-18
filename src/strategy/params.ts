@@ -60,6 +60,31 @@ export type ChartParams = {
 };
 
 /**
+ * Trend days (trendDay.ts): a day the index runs one way. Trades in its direction may also enter
+ * on a breakout, without waiting for a pullback to value.
+ */
+export type TrendDayParams = {
+  /** The day is checked from this minute until `checkUntilMinute`; once flagged it stays flagged. */
+  checkFromMinute: number;
+  checkUntilMinute: number;
+  /** At least this many of the 5 checks must agree on a side, and more than on the other side. */
+  checksNeeded: number;
+  /** Breadth check: at least this % of the breadth stocks up (calls), at most `breadthDownPct` (puts). */
+  breadthUpPct: number;
+  breadthDownPct: number;
+  /** VWAP check: the price is above a VWAP that rose for this many 5-minute candles in a row. */
+  vwapRisingBars: number;
+  /** Trend-strength check: ADX(14) of the completed 15-minute candles is at least this. */
+  trendStrengthMin: number;
+  /** Range check: the first hour's range is at least this share of the average daily range. */
+  firstHourRangeOfDayRange: number;
+  /** Breakout entries start at this minute... */
+  breakoutFromMinute: number;
+  /** ...and need a candle with at least this multiple of the day's median 5-minute volume. */
+  breakoutVolumeMultiple: number;
+};
+
+/**
  * `pullback`: the 15-minute trend picks the side and a BUY waits for the price to come back to
  * value with a confirming candle; only the market-backdrop votes can block it. `momentum`: the
  * earlier rules, where the 8 votes pick the side and must agree.
@@ -127,8 +152,8 @@ export type StrategyParams = {
   takeProfitInr: number;
   /**
    * ₹ per unit: once `profitLockInr` is reached, the lock rises by this for each further step of
-   * profit (+10, +15, +20 …), and only the lock or the square-off can close the trade. 0 keeps a
-   * single lock at `profitLockInr`.
+   * profit (+10, +20, +30 … with ₹10 steps), and only the lock or the square-off can close the
+   * trade. 0 keeps a single lock at `profitLockInr`.
    */
   profitStepInr: number;
   /** Once the best gain reaches this %, the exit moves up to cost plus `breakevenLockPct`. */
@@ -157,6 +182,7 @@ export type StrategyParams = {
   minOptionOi: number;
   signals: SignalThresholds;
   chart: ChartParams;
+  trendDay: TrendDayParams;
 };
 
 export const DEFAULT_STRATEGY: StrategyParams = {
@@ -202,7 +228,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   openPositionCycleMinutes: 5,
   // No target sell: the profit lock ratchets up instead (10-day replay +₹4,400 vs +₹3,751).
   takeProfitInr: 0,
-  profitStepInr: 5,
+  // 42-session backtest (2026-11-18): ₹10 steps made +₹478 over ₹5 steps on real prices.
+  profitStepInr: 10,
   // Three trades reached +9% to +15% and still closed at a loss before this lock existed.
   breakevenActivatePct: 8,
   breakevenLockPct: 2,
@@ -266,6 +293,20 @@ export const DEFAULT_STRATEGY: StrategyParams = {
     // 2026-11-05: votes +5 to +7 all day, price never back within 0.5 ATR of value, no trade.
     strongTrendScore: 5,
     strongTrendMaxValueGapAtr: 1,
+  },
+  // 42-session backtest (2026-11-18): breakout entries on trend days made +₹15,608 against
+  // +₹7,402; the pullback rule alone had missed 43 of 44 rallies of 0.5% in 90 minutes.
+  trendDay: {
+    checkFromMinute: 9 * 60 + 45,
+    checkUntilMinute: 10 * 60 + 30,
+    checksNeeded: 3,
+    breadthUpPct: 70,
+    breadthDownPct: 30,
+    vwapRisingBars: 6,
+    trendStrengthMin: 25,
+    firstHourRangeOfDayRange: 0.6,
+    breakoutFromMinute: 10 * 60,
+    breakoutVolumeMultiple: 1.5,
   },
 };
 

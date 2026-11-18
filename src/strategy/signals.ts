@@ -17,6 +17,13 @@ import {
   type OptionSide,
 } from './indicators.js';
 import type { SignalThresholds, StrategyParams } from './params.js';
+import {
+  checkTrendDay,
+  stopBeyondBrokenLevel,
+  trendDayEntryOf,
+  type TrendDay,
+  type TrendDayEntry,
+} from './trendDay.js';
 
 export type Vote = -1 | 0 | 1;
 
@@ -86,6 +93,13 @@ export type IndexReading = {
   newsLevel: OptionNewsRiskLevel;
   /** Futures quote, enough futures bars and an option chain are all present. */
   coreDataOk: boolean;
+  /** Today is a trend day for this index (trendDay.ts); null until flagged and on other days. */
+  trendDay: TrendDay | null;
+  /**
+   * On a trend day: a breakout its trades can enter on without a pullback, and a shallow dip
+   * that is pullback enough.
+   */
+  trendDayEntry: TrendDayEntry | null;
 };
 
 const EMA_FAST = 9;
@@ -330,12 +344,16 @@ function averageClose(bars: readonly DailyBar[], days: number): number | null {
   return bars.slice(-days).reduce((sum, bar) => sum + bar.c, 0) / days;
 }
 
-/** Reads one index into eight votes plus the extra facts the entry gates need. */
+/**
+ * Reads one index into eight votes plus the extra facts the entry gates need. `heldTrendDay` is
+ * today's trend day when an earlier reading already flagged it; it stays for the rest of the day.
+ */
 export function readIndex(
   data: IndexMarketData,
   backdrop: MarketBackdrop,
   params: StrategyParams,
   now: Date,
+  heldTrendDay: TrendDay | null = null,
 ): IndexReading {
   const clock = istClock(now);
   const thresholds = params.signals;
@@ -356,7 +374,7 @@ export function readIndex(
     Vote
   >;
   const levels = optionLevels(data.chain, data.spot, params.bigLevelBufferPct);
-  const chart = readChart(
+  const chartRead = readChart(
     {
       bars: data.futuresBars,
       todayYmd: clock.ymd,
@@ -368,6 +386,29 @@ export function readIndex(
     },
     params.chart,
   );
+  const trendDay =
+    heldTrendDay ??
+    checkTrendDay(
+      {
+        now,
+        bars: data.futuresBars,
+        dailyBars: data.dailyBars,
+        advancersPct: backdrop.advancersPct,
+      },
+      params.trendDay,
+    );
+  const trendDayEntry = trendDayEntryOf(
+    {
+      now,
+      indexName: data.index,
+      trendDay,
+      bars: data.futuresBars,
+      chart: chartRead,
+      futuresPrice: data.futuresPrice,
+    },
+    params,
+  );
+  const chart = stopBeyondBrokenLevel(chartRead, trendDayEntry, data.spot, params.chart);
   return {
     index: data.index,
     score: signals.reduce((sum, item) => sum + item.vote, 0),
@@ -391,6 +432,8 @@ export function readIndex(
       data.futuresVwap !== null &&
       closes.length >= EMA_SLOW &&
       data.chain.length > 0,
+    trendDay,
+    trendDayEntry,
   };
 }
 

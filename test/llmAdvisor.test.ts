@@ -393,7 +393,11 @@ type StoredRow = Record<string, unknown> & {
   marketSnapshot: {
     trigger?: string;
     exit?: { reason: string };
-    readings?: Array<{ index: string; chart?: { atr: number } | null }>;
+    readings?: Array<{
+      index: string;
+      chart?: { atr: number } | null;
+      trendDay?: { side: string; flaggedAtMinute: number; reasons: string[] } | null;
+    }>;
     entry?: {
       plan?: {
         stopSpot: number;
@@ -892,7 +896,8 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
   it('sells when NIFTY breaks the chart stop under the setup candles', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
-      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      // After 10:30, when the trend-day check has ended: the usual stop under the setup candles.
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:35').getTime() + 20_000));
       const { advisor, setNiftySpot } = await optionsAdvisorScenario();
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
@@ -902,10 +907,10 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       expect(storedRows()[0]?.rationale).toContain('or we sell earlier if NIFTY falls below 24,983');
 
       setNiftySpot(24_984);
-      vi.setSystemTime(ist('2026-10-21', '10:31'));
+      vi.setSystemTime(ist('2026-10-21', '10:36'));
       await advisor.runDecisionCycle();
       setNiftySpot(24_982);
-      vi.setSystemTime(ist('2026-10-21', '10:32'));
+      vi.setSystemTime(ist('2026-10-21', '10:37'));
       await advisor.runDecisionCycle();
 
       expect(storedRows().slice(1).map((row) => row.action)).toEqual(['HOLD', 'EXIT']);
@@ -959,10 +964,52 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
     }
   });
 
+  it('keeps the trend day for the rest of the day, also after a restart', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      // 10:30: a steady climb with every breadth stock up is flagged a trend day upward.
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      const first = await optionsAdvisorScenario();
+      await first.advisor.startDecisionLoop(['NIFTY']);
+      first.advisor.stop();
+      const [buy] = storedRows();
+      const trendDay = buy?.marketSnapshot.readings?.[0]?.trendDay;
+      expect(trendDay).toMatchObject({ side: 'CE', flaggedAtMinute: 10 * 60 + 30 });
+
+      // 10:45, after the check has ended: a restarted bot reads it back from today's decisions.
+      findMany.mockResolvedValue([
+        {
+          action: 'BUY',
+          decidedAt: ist('2026-10-21', '10:30'),
+          symbol: buy?.symbol,
+          tuuid: buy?.tuuid,
+          buyPrice: Number(buy?.buyPrice),
+          sellPrice: null,
+          marketSnapshot: buy?.marketSnapshot,
+        },
+      ]);
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:45').getTime() + 20_000));
+      const second = await optionsAdvisorScenario();
+      await second.advisor.startDecisionLoop(['NIFTY']);
+      second.advisor.stop();
+      expect(storedRows().at(-1)?.marketSnapshot.readings?.[0]?.trendDay).toEqual(trendDay);
+
+      // Without that stored decision, 10:45 is too late to flag the day.
+      findMany.mockResolvedValue([]);
+      const third = await optionsAdvisorScenario();
+      await third.advisor.startDecisionLoop(['NIFTY']);
+      third.advisor.stop();
+      expect(storedRows().at(-1)?.marketSnapshot.readings?.[0]?.trendDay).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('raises the chart stop under a new swing low and sells when NIFTY breaks it', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
-      vi.setSystemTime(new Date(ist('2026-10-21', '10:30').getTime() + 20_000));
+      // After 10:30, when the trend-day check has ended: the usual stop under the setup candles.
+      vi.setSystemTime(new Date(ist('2026-10-21', '10:35').getTime() + 20_000));
       const { advisor, getFiveMinuteCandles, setNiftySpot } = await optionsAdvisorScenario();
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();

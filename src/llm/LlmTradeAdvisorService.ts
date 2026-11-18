@@ -128,6 +128,7 @@ import {
   describeUnrestorableExit,
 } from '../strategy/rationale.js';
 import { readIndex, SIGNAL_NAMES, type IndexReading } from '../strategy/signals.js';
+import type { TrendDay } from '../strategy/trendDay.js';
 import {
   parseDecisionSnapshot,
   SNAPSHOT_SCHEMA,
@@ -289,6 +290,11 @@ export class LlmTradeAdvisorService {
   private decisionIndexes: IndexOptionName[] = [...INDEX_OPTION_NAMES];
   /** Today's rows for the daily limits: read from the DB once a day, then updated in memory. */
   private dayRows: { ymd: string; rows: DayRow[] } | null = null;
+  /**
+   * Today's trend day per index once flagged; it holds for the rest of the day. Read back from
+   * today's stored decisions on the first cycle of a day, so a restart keeps it.
+   */
+  private trendDays: { ymd: string; byIndex: Partial<Record<string, TrendDay>> } | null = null;
 
   public constructor(options: LlmTradeAdvisorOptions) {
     this.llm = options.llm;
@@ -889,6 +895,7 @@ export class LlmTradeAdvisorService {
     this.includedSymbols = [];
     this.sessionStartPayload = { instruments: [] };
     this.dayRows = null;
+    this.trendDays = null;
     this.running = true;
     this.loopGeneration += 1;
     const generation = this.loopGeneration;
@@ -1020,6 +1027,7 @@ export class LlmTradeAdvisorService {
     this.book = 'options';
     this.decisionIndexes = input.indexes.length > 0 ? [...input.indexes] : [...INDEX_OPTION_NAMES];
     this.dayRows = null;
+    this.trendDays = null;
     await this.restoreOpenPosition();
     await this.runDecisionCycle();
     const nextSlot = () => {
@@ -1092,7 +1100,15 @@ export class LlmTradeAdvisorService {
       );
       return 0;
     }
-    const readings = view.indexes.map((data) => readIndex(data, view.backdrop, this.params, now));
+    const trendDays = await this.heldTrendDays(now);
+    const readings = view.indexes.map((data) =>
+      readIndex(data, view.backdrop, this.params, now, trendDays[data.index] ?? null),
+    );
+    for (const reading of readings) {
+      if (reading.trendDay) {
+        trendDays[reading.index] = reading.trendDay;
+      }
+    }
     return open
       ? this.reviewOpenPosition(open, view, readings, now)
       : this.lookForEntry(view, readings, now);
@@ -1166,14 +1182,27 @@ export class LlmTradeAdvisorService {
     return this.storeBuy({ view, readings, now, reading: entry.reading, candidates });
   }
 
+  /** Today's trend days by index, read back with today's rows on the first call of a day. */
+  private async heldTrendDays(now: Date): Promise<Partial<Record<string, TrendDay>>> {
+    await this.todayRows(now);
+    return this.trendDays!.byIndex;
+  }
+
+  /** Today's rows for the daily limits, and today's trend days, read once a day. */
   private async todayRows(now: Date): Promise<DayRow[]> {
     const ymd = istClock(now).ymd;
-    if (this.dayRows?.ymd !== ymd) {
+    if (this.dayRows?.ymd !== ymd || this.trendDays?.ymd !== ymd) {
       const stored = await findDecisionsSince(istDayStart(now), this.simulationId);
+      const trendDays: Partial<Record<string, TrendDay>> = {};
       this.dayRows = {
         ymd,
         rows: stored.map((row) => {
           const snapshot = parseDecisionSnapshot(row.marketSnapshot);
+          for (const reading of snapshot?.readings ?? []) {
+            if (reading.trendDay && !trendDays[reading.index]) {
+              trendDays[reading.index] = reading.trendDay;
+            }
+          }
           return {
             ...row,
             trigger: snapshot?.trigger ?? null,
@@ -1181,6 +1210,7 @@ export class LlmTradeAdvisorService {
           };
         }),
       };
+      this.trendDays = { ymd, byIndex: trendDays };
     }
     return this.dayRows.rows;
   }
@@ -2016,6 +2046,8 @@ export class LlmTradeAdvisorService {
               valueGapAtr: round(reading.chart.valueGapAtr),
             }
           : null,
+        trendDay: reading.trendDay,
+        entryTrigger: reading.trendDayEntry?.trigger ?? null,
       })),
       market: backdrop
         ? {
