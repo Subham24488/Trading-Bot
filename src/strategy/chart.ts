@@ -61,10 +61,16 @@ export type SignalCandle = {
   pattern: CandlePatternName;
   /** Side the pattern favours once its context is read. */
   side: OptionSide | null;
-  /** Side the candle confirms: direction, a strong close, size, volume and follow-through. */
+  /**
+   * Side the candle confirms: a named pattern on that side (bullish engulfing, hammer, morning
+   * star, piercing line or bullish marubozu for calls; the mirrors for puts) closing strongly,
+   * at least `minSignalRangeAtr` tall, on at least the usual volume.
+   */
   confirms: OptionSide | null;
   /** The same test without the volume condition (used by pullback entries). */
   shapeConfirms: OptionSide | null;
+  /** The level the candle traded at (within `levelTouchAtr`), in words; null away from levels. */
+  atLevel: string | null;
   /** Where the close sits in the candle's range: 0 at the low, 1 at the high. */
   closeLocation: number;
   rangeAtr: number;
@@ -109,6 +115,12 @@ export type ChartRead = {
    * null without a VWAP.
    */
   valueGapAtr: number | null;
+  /** The 15-minute 20-candle average (EMA) of the futures price; null without enough candles. */
+  trendAverage: number | null;
+  /** The last finished 15-minute candle's pattern; null before the first one has finished. */
+  fifteenMinuteCandle: { pattern: CandlePatternName; side: OptionSide | null } | null;
+  /** Size of a normal 15-minute swing (ATR of finished 15-minute candles); null without enough. */
+  fifteenMinuteAtr: number | null;
 };
 
 type Ohlc = { o: number; h: number; l: number; c: number };
@@ -256,25 +268,59 @@ function signalCandle(
   today: string,
   atr: number,
   params: ChartParams,
+  levels: readonly { name: string; price: number }[],
 ): SignalCandle {
   const last = bars.at(-1)!;
-  const prior = bars.at(-2) ?? null;
   const pattern = classifyLastCandles(todayBars.slice(-PATTERN_BARS), { atr });
   const range = rangeOf(last);
   const closeLocation = range > 0 ? (last.c - last.l) / range : 0.5;
   const rangeAtr = range / atr;
   const volumeRatio = volumeRatioOf(bars, clocks, today);
-  let shapeConfirms: OptionSide | null = null;
-  if (rangeAtr >= params.minSignalRangeAtr) {
-    if (last.c > last.o && closeLocation >= params.confirmCloseLocation) {
-      shapeConfirms = !prior || last.c > prior.h || pattern.side === 'CE' ? 'CE' : null;
-    } else if (last.c < last.o && 1 - closeLocation >= params.confirmCloseLocation) {
-      shapeConfirms = !prior || last.c < prior.l || pattern.side === 'PE' ? 'PE' : null;
-    }
-  }
+  // Only a named pattern confirms, and only when it closes strongly (top 40% of its range for a
+  // call, bottom 40% for a put) and is at least half a normal swing tall.
+  const strongClose =
+    pattern.side === 'CE'
+      ? closeLocation >= params.confirmCloseLocation
+      : pattern.side === 'PE' && 1 - closeLocation >= params.confirmCloseLocation;
+  const shapeConfirms = rangeAtr >= params.minSignalRangeAtr && strongClose ? pattern.side : null;
   const usualVolume = volumeRatio === null || volumeRatio >= params.minSignalVolumeRatio;
   const confirms = usualVolume ? shapeConfirms : null;
-  return { ...pattern, confirms, shapeConfirms, closeLocation, rangeAtr, volumeRatio };
+  const near = params.levelTouchAtr * atr;
+  const atLevel =
+    levels.find((level) => last.l - near <= level.price && level.price <= last.h + near)?.name ??
+    null;
+  return { ...pattern, confirms, shapeConfirms, closeLocation, rangeAtr, volumeRatio, atLevel };
+}
+
+/**
+ * Finished 15-minute candles (09:15–09:30, 09:30–09:45 …) built from 5-minute bars, each with the
+ * time of its first 5-minute bar; a 15-minute candle still forming is left out.
+ */
+export function fifteenMinuteCandles(bars: readonly IntradayBar[]): IntradayBar[] {
+  const out: IntradayBar[] = [];
+  const slots: string[] = [];
+  const counts: number[] = [];
+  for (const bar of bars) {
+    const clock = clockOf(bar);
+    const slot = `${clock.ymd}:${Math.floor((clock.minute - SESSION_OPEN_MINUTE) / 15)}`;
+    const current = out.at(-1);
+    if (current && slots.at(-1) === slot) {
+      current.h = Math.max(current.h, bar.h);
+      current.l = Math.min(current.l, bar.l);
+      current.c = bar.c;
+      current.v += bar.v;
+      counts[counts.length - 1]! += 1;
+    } else {
+      out.push({ t: bar.t, o: bar.o, h: bar.h, l: bar.l, c: bar.c, v: bar.v });
+      slots.push(slot);
+      counts.push(1);
+    }
+  }
+  // Three 5-minute bars make a finished 15-minute candle.
+  if ((counts.at(-1) ?? 3) < 3) {
+    out.pop();
+  }
+  return out;
 }
 
 /**
@@ -451,6 +497,53 @@ export function readChart(
     VALUE_EMA_PERIOD,
   );
   const vwap = input.vwap ?? null;
+  const trendCloses = groupBars(bars, params.trendMinutes).map((bar) => bar.c);
+  const trendAverage = ema(trendCloses, params.trendEmaPeriod);
+  // The levels a candle must trade at to count (futures prices).
+  const previousDay = sessions.filter((ymd) => ymd < today).at(-1);
+  const previous = bars.filter((_, index) => clocks[index]!.ymd === previousDay);
+  const opening = openingRange(todayBars);
+  const strike = (value: number) => new Intl.NumberFormat('en-IN').format(value);
+  const touchLevels = [
+    ...(vwap !== null ? [{ name: "today's average price", price: vwap }] : []),
+    ...(trendAverage !== null
+      ? [{ name: 'the 15-minute 20-candle average', price: trendAverage }]
+      : []),
+    ...(previous.length
+      ? [
+          { name: "yesterday's high", price: Math.max(...previous.map((bar) => bar.h)) },
+          { name: "yesterday's low", price: Math.min(...previous.map((bar) => bar.l)) },
+        ]
+      : []),
+    ...(input.callWall !== null
+      ? [
+          {
+            name: `the ${strike(input.callWall)} call strike with the most open interest`,
+            price: input.callWall + basis,
+          },
+        ]
+      : []),
+    ...(input.putWall !== null
+      ? [
+          {
+            name: `the ${strike(input.putWall)} put strike with the most open interest`,
+            price: input.putWall + basis,
+          },
+        ]
+      : []),
+    ...(opening
+      ? [
+          { name: "the opening range's high", price: opening.high },
+          { name: "the opening range's low", price: opening.low },
+        ]
+      : []),
+  ];
+  const fifteen = fifteenMinuteCandles(bars);
+  const fifteenMinuteAtr = averageTrueRange(fifteen, params.atrPeriod);
+  const fifteenToday = fifteen.filter((bar) => clockOf(bar).ymd === today);
+  const fifteenMinuteCandle = fifteenToday.length
+    ? classifyLastCandles(fifteenToday.slice(-PATTERN_BARS), { atr: fifteenMinuteAtr })
+    : null;
   const valueGapAtr =
     vwap === null
       ? null
@@ -461,18 +554,18 @@ export function readChart(
   return {
     atr,
     structure: structureOf(swings),
-    higherTrend: higherTrendOf(
-      groupBars(bars, params.trendMinutes).map((bar) => bar.c),
-      params.trendEmaPeriod,
-    ),
+    higherTrend: higherTrendOf(trendCloses, params.trendEmaPeriod),
     burstAtr,
-    candle: signalCandle(bars, todayBars, clocks, today, atr, params),
+    candle: signalCandle(bars, todayBars, clocks, today, atr, params, touchLevels),
     support: nearest(true),
     resistance: nearest(false),
     plans: { CE: plan('CE'), PE: plan('PE') },
     basis,
     swings,
     valueGapAtr,
+    trendAverage,
+    fifteenMinuteCandle,
+    fifteenMinuteAtr,
   };
 }
 

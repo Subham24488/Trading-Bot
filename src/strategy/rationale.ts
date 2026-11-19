@@ -87,7 +87,13 @@ const GATE_TEXT: Record<GateId, (params: StrategyParams) => string> = {
   'expiry-day-cutoff': (p) =>
     `today is an expiry day and it is past ${formatClockTime(p.expiryDayLastEntryMinute)}, when prices often get stuck near popular levels`,
   'against-day-average': (p) =>
-    `we buy calls only while the index is above its ${p.trendAverageDays}-day average price and puts only while it is below, and it is on the other side`,
+    `the index is on the other side of its ${p.trendAverageDays}-day average price, and a trade against it needs at least ${p.againstDayAverageMinScore} of the 8 signals on its side`,
+  'bank-nifty-disagrees': (p) =>
+    `Bank NIFTY is moving the other way (${p.bankNiftyAgainstPct}% or more in the last ${p.recentMoveMinutes} minutes), and banks are a large part of NIFTY`,
+  'after-vix-spike': (p) =>
+    `the fear index (India VIX) jumped ${p.vixSpikePct}% or more in the last ${p.recentMoveMinutes} minutes, and option prices tend to fall back after a jump`,
+  'scheduled-event': (p) =>
+    `a scheduled announcement, such as an RBI policy decision, is less than ${p.eventBlockMinutes} minutes away`,
   'weak-signal': (p) =>
     `the signals are not strong enough (we need at least ${p.minEntryScore} of 8 pointing the same way)`,
   'trend-disagrees': () =>
@@ -111,7 +117,17 @@ const GATE_TEXT: Record<GateId, (params: StrategyParams) => string> = {
   'day-in-profit': (p) =>
     `today's closed trades are already ${p.dayProfitLockInr > 0 ? `up more than ${formatInr(p.dayProfitLockInr)}` : 'in profit'}, so we stop for the day to keep it`,
   'no-candle-confirmation': (p) =>
-    `the last 5-minute candle did not confirm the move (we wait for one that closes strongly past the candle before it${p.entryMode === 'pullback' ? '' : ', on at least the usual volume'})`,
+    `the last 5-minute candle did not confirm the move (we wait for an engulfing candle, a hammer or shooting star, a morning or evening star, a piercing line or dark cloud, or a marubozu that closes strongly${p.entryMode === 'pullback' ? '' : ', on at least the usual volume'})`,
+  'doji-wait': () =>
+    'the last 5-minute candle is a doji (it closed about where it opened), a sign the move is pausing, so we wait',
+  'candle-not-at-level': () =>
+    "the confirming candle is not at a level (today's average price, the 15-minute average, yesterday's high or low, a big option strike or the opening range), and away from a level a candle is just noise",
+  'unclear-day-wait': (p) =>
+    `the day is neither clearly trending nor range-bound yet, so we wait until ${formatClockTime(p.trendDay.unclearWaitUntilMinute)}`,
+  'not-for-this-day-type': () =>
+    'this kind of trade does not suit today: on a trend day we trade only in its direction, and on a range-bound day only reversals at a level',
+  'candles-disagree': () =>
+    'the last 15-minute candle and the last 5-minute candle point opposite ways',
   'near-chart-level': () =>
     'the price is right at a level where it turned back before, so we wait for a clear break through it',
   'chart-trend-disagrees': () =>
@@ -175,15 +191,23 @@ function chartText(reading: IndexReading, side: OptionSide, params: StrategyPara
   if (trigger && reading.trendDay) {
     return (
       `Chart: today is a trend day ${up ? 'upward' : 'downward'} (flagged at ` +
-      `${formatClockTime(reading.trendDay.flaggedAtMinute)}, ${reading.trendDay.reasons.length} of 5 checks agree); ` +
+      `${formatClockTime(reading.trendDay.flaggedAtMinute)}, all 3 checks agree); ` +
       `${trigger.reason}, so we bought without waiting for a pullback. `
     );
+  }
+  const setup = reading.setup?.side === side ? reading.setup : null;
+  if (setup) {
+    const target =
+      setup.targetSpot !== null && reading.dayType === 'range'
+        ? `; on a range-bound day we sell at its target, ${wholeNumber.format(setup.targetSpot)}`
+        : '';
+    return `Chart: ${setup.reason}, so we bought a ${up ? 'call' : 'put'}${target}. `;
   }
   const { candle } = chart;
   const pattern = candle.side === side ? PATTERN_TEXT[candle.pattern] : undefined;
   const shape = pattern
-    ? `candles show ${pattern}`
-    : `candle closed near its ${up ? 'high' : 'low'}, ${up ? 'above' : 'below'} the candle before`;
+    ? `candles show ${pattern}${candle.atLevel ? ` at ${candle.atLevel}` : ''}`
+    : `candle closed near its ${up ? 'high' : 'low'}`;
   if (params.entryMode === 'pullback') {
     const shallow = reading.trendDayEntry?.side === side ? reading.trendDayEntry.shallowPullback : null;
     if (shallow && (chart.valueGapAtr ?? Infinity) > params.chart.maxValueGapAtr) {
@@ -222,6 +246,8 @@ function planText(input: {
   params: StrategyParams;
   /** The level a trend-day breakout broke, when the stop sits just beyond it. */
   brokenLevelName?: string;
+  /** A chart setup's own stop level, for example "the flag's low". */
+  setupStopName?: string;
 }): string {
   const { plan, params } = input;
   const up = input.side === 'CE';
@@ -233,7 +259,9 @@ function planText(input: {
     `${input.index} ${up ? 'falls below' : 'rises above'} ${wholeNumber.format(plan.stopSpot)} ` +
     (input.brokenLevelName
       ? `(just ${up ? 'under' : 'over'} ${input.brokenLevelName}, the level it broke)`
-      : `(${up ? 'under the low' : 'over the high'} of the last two 5-minute candles)`);
+      : input.setupStopName
+        ? `(${up ? 'under' : 'over'} ${input.setupStopName})`
+        : `(${up ? 'under the low' : 'over the high'} of the last two 5-minute candles)`);
   const loss = `a planned loss of about ${formatInr(plan.maxLossInr)} on 1 lot after charges`;
   const stop =
     params.stopLossInr > 0
@@ -329,7 +357,9 @@ export function describeBuy(input: {
           params,
           ...(chartPlan.stopBeyondBrokenLevel && input.reading.trendDayEntry?.trigger
             ? { brokenLevelName: input.reading.trendDayEntry.trigger.name }
-            : {}),
+            : chartPlan.stopBeyondBrokenLevel && input.reading.setup?.side === candidate.side
+              ? { setupStopName: input.reading.setup.stopName }
+              : {}),
         }),
     );
   }
@@ -504,7 +534,9 @@ const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, position: OpenPosit
     );
   },
   'target-reached': (p, position) =>
-    `the option reached our ₹${p.takeProfitInr} profit target at ${formatInr(position.entryPrice + p.takeProfitInr)}`,
+    position.targetSpot !== null && position.targetSpot !== undefined
+      ? `${position.index} reached the setup's target, ${wholeNumber.format(position.targetSpot)}, and on a range-bound day we take the smaller target`
+      : `the option reached our ₹${p.takeProfitInr} profit target at ${formatInr(position.entryPrice + p.takeProfitInr)}`,
 };
 
 /** Planned loss on 1 lot at the premium stop, charges included; null without a planned stop. */

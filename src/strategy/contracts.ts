@@ -256,6 +256,10 @@ export function buildCandidates(
       reject(`price below ₹${params.minPremium}`);
       continue;
     }
+    if (row.ask > params.maxPremium) {
+      reject(`price above ₹${params.maxPremium}`);
+      continue;
+    }
     const spread = spreadPct(row.bid, row.ask);
     if (spread === null || spread > params.maxSpreadPct) {
       reject('gap between buy and sell prices is too wide');

@@ -59,6 +59,23 @@ function candidatesFor(
 
 const nearMoney = () => [24_900, 24_950, 25_000, 25_050, 25_100].map((strike) => callQuote(strike));
 
+describe('the option itself', () => {
+  it('buys only options with delta 0.40–0.55 that cost ₹200 or less', () => {
+    const { candidates } = candidatesFor(nearMoney());
+    expect(candidates.length).toBeGreaterThan(0);
+    for (const candidate of candidates) {
+      expect(candidate.delta).toBeGreaterThanOrEqual(0.4);
+      expect(candidate.delta).toBeLessThanOrEqual(0.55);
+    }
+    // A ₹150 call 100 points in the money moves almost one-for-one with the index.
+    const deep = candidatesFor([callQuote(24_900, { ltp: 150, bid: 149.9, ask: 150.1 })]);
+    expect(deep.rejected[0]?.reason).toBe('moves too little or too much with the index');
+    const pricey = candidatesFor([callQuote(25_000, { ltp: 230, bid: 229.9, ask: 230.1 })]);
+    expect(pricey.candidates).toHaveLength(0);
+    expect(pricey.rejected[0]?.reason).toBe('price above ₹200');
+  });
+});
+
 describe('expiry and futures selection', () => {
   it('can skip a contract that expires today', () => {
     expect(chooseTradingExpiry(['2026-10-28', '2026-10-21'], '2026-10-21')).toBe('2026-10-21');
@@ -266,8 +283,10 @@ describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
     // A 60-point chart stop is beyond the ₹15 limit under the earlier rules, but not with ₹10.
     const far = { ...plan, riskPoints: 60 };
     expect(candidatesFor(nearMoney(), DEFAULT_STRATEGY, far).candidates.length).toBeGreaterThan(0);
-    expect(candidatesFor(nearMoney(), MOMENTUM_RULES, far).rejected[0]).toMatchObject({
-      code: 'risk-too-wide',
-    });
+    expect(
+      candidatesFor(nearMoney(), MOMENTUM_RULES, far).rejected.some(
+        (item) => item.code === 'risk-too-wide',
+      ),
+    ).toBe(true);
   });
 });

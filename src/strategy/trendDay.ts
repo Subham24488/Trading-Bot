@@ -1,5 +1,5 @@
-import type { DailyBar, IntradayBar } from '../universe/types.js';
-import { groupBars, type ChartRead } from './chart.js';
+import type { IntradayBar } from '../universe/types.js';
+import { averageTrueRange, fifteenMinuteCandles, groupBars, type ChartRead } from './chart.js';
 import { istClock } from './clock.js';
 import { barsOnDay, ema, median, openingRange, type OptionSide } from './indicators.js';
 import type { ChartParams, StrategyParams, TrendDayParams } from './params.js';
@@ -7,8 +7,8 @@ import type { ChartParams, StrategyParams, TrendDayParams } from './params.js';
 /**
  * Trend days. On a day the index runs one way, waiting for a pullback to VWAP misses the move:
  * in the 42-session backtest of 2026-11-18 the pullback rule alone caught 1 of 44 rallies of
- * 0.5% in 90 minutes. A day is flagged a trend day between 09:45 and 10:30 when at least 3 of 5
- * checks agree on a side, and stays one for the rest of the day. Trades in its direction may then
+ * 0.5% in 90 minutes. A day is flagged a trend day between 09:45 and 10:30 when all 3 checks
+ * agree on a side, and stays one for the rest of the day. Trades in its direction may then
  * also buy a breakout through the opening-range, yesterday's or the last hour's high (lows for
  * puts) without waiting for a pullback or a confirming candle, and a shallow dip (to the
  * 9-candle average, or a higher low that holds) is pullback enough.
@@ -41,8 +41,6 @@ export type TrendDayEntry = {
 };
 
 const SESSION_OPEN_MINUTE = 9 * 60 + 15;
-/** The first hour of the range check: candles starting before 10:15. */
-const FIRST_HOUR_END_MINUTE = 10 * 60 + 15;
 /** The short average of a shallow pullback, in 5-minute candles. */
 const SHORT_AVERAGE_BARS = 9;
 /** The opening-range check needs the last this many closes beyond the range. */
@@ -125,30 +123,13 @@ export function trendStrength(
   return null;
 }
 
-/** Average daily range (true range, gaps included) of the daily bars; null with too few. */
-export function dailyAverageRange(days: readonly DailyBar[], period = 14): number | null {
-  if (days.length < period + 1) {
-    return null;
-  }
-  let average = 0;
-  for (let i = 1; i < days.length; i += 1) {
-    const day = days[i]!;
-    const prior = days[i - 1]!;
-    const trueRange = Math.max(day.h - day.l, Math.abs(day.h - prior.c), Math.abs(day.l - prior.c));
-    average =
-      i <= period ? average + trueRange / period : (average * (period - 1) + trueRange) / period;
-  }
-  return average;
-}
-
 /**
- * Flags a trend day when at least `checksNeeded` of these agree on a side (and more of them
- * than on the other side), between `checkFromMinute` and `checkUntilMinute`:
- * - the last 2 closes are beyond the opening range;
- * - the price is above a VWAP that rose for `vwapRisingBars` candles (below a falling one);
- * - trend strength (ADX) of the completed 15-minute candles is `trendStrengthMin` or more;
- * - breadth is `breadthUpPct` or more up (`breadthDownPct` or less for puts);
- * - the first hour's range is at least `firstHourRangeOfDayRange` of a normal day's (either side).
+ * Flags a trend day when all three agree on a side, between `checkFromMinute` and
+ * `checkUntilMinute`:
+ * - the opening range broke and held: the last 2 closes are beyond it;
+ * - the price stays on one side of today's average price (VWAP): the last `vwapSideBars` closes;
+ * - the 15-minute trend is strong: ADX(14) of the completed 15-minute candles is
+ *   `trendStrengthMin` or more, rising for calls and falling for puts.
  * Null when it is not a trend day (yet).
  */
 export function checkTrendDay(
@@ -156,9 +137,6 @@ export function checkTrendDay(
     now: Date;
     /** Completed 5-minute futures bars over several days, oldest first. */
     bars: readonly IntradayBar[];
-    /** The index's daily bars before today. */
-    dailyBars: readonly DailyBar[];
-    advancersPct: number | null;
   },
   params: TrendDayParams,
 ): TrendDay | null {
@@ -167,7 +145,7 @@ export function checkTrendDay(
     return null;
   }
   const today = barsOnDay(input.bars, clock.ymd);
-  if (today.length < 6) {
+  if (today.length < Math.max(6, params.vwapSideBars)) {
     return null;
   }
   const up: string[] = [];
@@ -184,27 +162,14 @@ export function checkTrendDay(
     }
   }
 
-  let volume = 0;
-  let value = 0;
-  const vwaps = today.map((bar) => {
-    volume += bar.v;
-    value += ((bar.h + bar.l + bar.c) / 3) * bar.v;
-    return volume > 0 ? value / volume : bar.c;
-  });
-  if (vwaps.length >= params.vwapRisingBars + 1) {
-    const close = today.at(-1)!.c;
-    const vwap = vwaps.at(-1)!;
-    const steps = vwaps.slice(-(params.vwapRisingBars + 1));
-    const rising = steps.every((step, i) => i === 0 || step > steps[i - 1]!);
-    const falling = steps.every((step, i) => i === 0 || step < steps[i - 1]!);
-    if (close > vwap && rising) {
-      up.push(`it is above today's average price, which rose for ${params.vwapRisingBars} candles`);
-    }
-    if (close < vwap && falling) {
-      down.push(
-        `it is below today's average price, which fell for ${params.vwapRisingBars} candles`,
-      );
-    }
+  const vwaps = averagePriceByCandle(today);
+  const recent = today.slice(-params.vwapSideBars);
+  const recentVwaps = vwaps.slice(-params.vwapSideBars);
+  if (recent.every((bar, i) => bar.c > recentVwaps[i]!)) {
+    up.push(`its last ${params.vwapSideBars} closes are above today's average price`);
+  }
+  if (recent.every((bar, i) => bar.c < recentVwaps[i]!)) {
+    down.push(`its last ${params.vwapSideBars} closes are below today's average price`);
   }
 
   const strength = trendStrength(completedFifteenMinuteCandles(input.bars, input.now));
@@ -214,32 +179,72 @@ export function checkTrendDay(
     );
   }
 
-  if (input.advancersPct !== null && input.advancersPct >= params.breadthUpPct) {
-    up.push(`${input.advancersPct.toFixed(0)}% of the breadth stocks are up`);
-  }
-  if (input.advancersPct !== null && input.advancersPct <= params.breadthDownPct) {
-    down.push(`only ${input.advancersPct.toFixed(0)}% of the breadth stocks are up`);
-  }
-
-  const firstHour = today.filter((bar) => istClock(new Date(bar.t)).minute < FIRST_HOUR_END_MINUTE);
-  const dayRange = dailyAverageRange(input.dailyBars);
-  if (dayRange && firstHour.length > 0) {
-    const moved =
-      Math.max(...firstHour.map((bar) => bar.h)) - Math.min(...firstHour.map((bar) => bar.l));
-    if (moved >= params.firstHourRangeOfDayRange * dayRange) {
-      const text = `the first hour moved ${moved.toFixed(0)} points, ${(moved / dayRange).toFixed(1)}× a normal day's range`;
-      up.push(text);
-      down.push(text);
-    }
-  }
-
-  if (up.length >= params.checksNeeded && up.length > down.length) {
+  if (up.length === 3) {
     return { side: 'CE', flaggedAtMinute: clock.minute, reasons: up };
   }
-  if (down.length >= params.checksNeeded && down.length > up.length) {
+  if (down.length === 3) {
     return { side: 'PE', flaggedAtMinute: clock.minute, reasons: down };
   }
   return null;
+}
+
+/** Today's average price (VWAP) at the close of each of today's candles. */
+function averagePriceByCandle(today: readonly IntradayBar[]): number[] {
+  let volume = 0;
+  let value = 0;
+  return today.map((bar) => {
+    volume += bar.v;
+    value += ((bar.h + bar.l + bar.c) / 3) * bar.v;
+    return volume > 0 ? value / volume : bar.c;
+  });
+}
+
+/**
+ * A range-bound day, from `rangeFromMinute`: the 15-minute 20-candle average is flat (it moved
+ * less than `flatAverageAtr` of a normal 15-minute swing over its last `flatAverageCandles`
+ * candles) and today's 15-minute closes crossed today's average price at least
+ * `rangeVwapCrossings` times. Returns the reason in words, or null on other days.
+ */
+export function checkRangeDay(
+  input: {
+    now: Date;
+    /** Completed 5-minute futures bars over several days, oldest first. */
+    bars: readonly IntradayBar[];
+    trendEmaPeriod: number;
+  },
+  params: TrendDayParams,
+): string | null {
+  const clock = istClock(input.now);
+  if (clock.minute < params.rangeFromMinute) {
+    return null;
+  }
+  const fifteen = fifteenMinuteCandles(input.bars);
+  const atr = averageTrueRange(fifteen, 14);
+  const closes = fifteen.map((bar) => bar.c);
+  const average = ema(closes, input.trendEmaPeriod);
+  const earlier = ema(closes.slice(0, -params.flatAverageCandles), input.trendEmaPeriod);
+  if (atr === null || !(atr > 0) || average === null || earlier === null) {
+    return null;
+  }
+  const flat = Math.abs(average - earlier) < params.flatAverageAtr * atr;
+  // Today's average price at each 15-minute close: the 5-minute VWAP at the candle's last bar.
+  const today = barsOnDay(input.bars, clock.ymd);
+  const vwaps = averagePriceByCandle(today);
+  const fifteenToday = fifteen.filter((bar) => istClock(new Date(bar.t)).ymd === clock.ymd);
+  const sides = fifteenToday.map((candle) => {
+    const end = Date.parse(candle.t) + FIFTEEN_MINUTES * 60_000;
+    const index = today.findLastIndex((bar) => Date.parse(bar.t) < end);
+    return index < 0 ? 0 : Math.sign(candle.c - vwaps[index]!);
+  });
+  let crossings = 0;
+  for (let i = 1; i < sides.length; i += 1) {
+    if (sides[i] !== 0 && sides[i - 1] !== 0 && sides[i] !== sides[i - 1]) {
+      crossings += 1;
+    }
+  }
+  return flat && crossings >= params.rangeVwapCrossings
+    ? `the 15-minute average is flat and NIFTY crossed today's average price ${crossings} times`
+    : null;
 }
 
 /**

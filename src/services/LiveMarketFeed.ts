@@ -52,6 +52,8 @@ export type MarketView = {
 };
 
 export const VIX_KEY = 'NSE:INDIA VIX';
+/** Kite's instrument token for India VIX, for its 1-minute candles. */
+export const INDIA_VIX_TOKEN = 264969;
 export const CHAIN_WINGS = 5;
 /** Futures prices never come from a contract that expires today. */
 export const MIN_DAYS_TO_EXPIRY = 1;
@@ -133,6 +135,8 @@ export class LiveMarketFeed {
       extraSymbols?: readonly string[];
       newsLookbackMinutes: number;
       minTradingDaysToExpiry: number;
+      /** Minutes over which Bank NIFTY's and India VIX's latest move is measured (30). */
+      recentMoveMinutes?: number;
     },
   ): Promise<MarketView> {
     const clock = istClock(now);
@@ -237,6 +241,24 @@ export class LiveMarketFeed {
       });
     }
 
+    // Bank NIFTY's and India VIX's move over the last 30 minutes, for the checks before a trade.
+    const recentMinutes = options.recentMoveMinutes ?? 30;
+    const bankNifty = underlyings.find((row) => row.tradingsymbol === 'BANKNIFTY');
+    const bankNiftyMovePct = await this.recentMovePct(
+      bankNifty?.instrumentToken ?? null,
+      now,
+      recentMinutes,
+      'Bank NIFTY',
+      gaps,
+    );
+    const vixMovePct = await this.recentMovePct(
+      INDIA_VIX_TOKEN,
+      now,
+      recentMinutes,
+      'India VIX',
+      gaps,
+    );
+
     const news = await newsPromise;
     for (const data of indexData) {
       data.newsLevel = news.levels[data.index] ?? 'none';
@@ -263,6 +285,8 @@ export class LiveMarketFeed {
         gapPct: pctChange(gapQuote?.prevClose ?? null, gapQuote?.open ?? null),
         advancersPct: this.advancersPct(marketQuotes),
         headlineTone: news.tone,
+        bankNiftyMovePct,
+        vixMovePct,
       },
       spots,
       indexDaily,
@@ -380,6 +404,37 @@ export class LiveMarketFeed {
       volume: quote?.volume ?? 0,
       oiChangeToday,
     };
+  }
+
+  /**
+   * % move of an index over the last `minutes`, from the open of the first finished 1-minute
+   * candle in that window to the close of the latest; null when the candles are not available.
+   */
+  private async recentMovePct(
+    token: number | null,
+    now: Date,
+    minutes: number,
+    label: string,
+    gaps: string[],
+  ): Promise<number | null> {
+    if (token === null) {
+      return null;
+    }
+    try {
+      const candles = await this.kite.getMinuteCandles(
+        token,
+        formatIstWallClock(new Date(now.getTime() - (minutes + 1) * 60_000)),
+        formatIstWallClock(now),
+      );
+      const bars = completedBars(candles, 1, now);
+      const first = bars[0];
+      const last = bars.at(-1);
+      return first && last && first.o > 0 ? pctChange(first.o, last.c) : null;
+    } catch (error: unknown) {
+      this.logger.warn({ err: error, label }, 'Recent 1-minute candles failed.');
+      gaps.push(`${label}: recent 1-minute candles not available`);
+      return null;
+    }
   }
 
   private advancersPct(quotes: Record<string, MarketQuote>): number | null {

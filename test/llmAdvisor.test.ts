@@ -728,7 +728,7 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       expect(storedRows()[2]).toMatchObject({ action: 'EXIT', tuuid: buy?.tuuid });
       expect(advisor.getDecisionLoopStatus().tuuid).toBeNull();
 
-      // Flat again but inside the 30-minute cooldown after the SELL: no BUY yet.
+      // Flat again but inside the 10-minute cooldown after the SELL: no BUY yet.
       setOptionPriceFactor(1);
       vi.setSystemTime(ist('2026-10-21', '10:33'));
       await advisor.runDecisionCycle();

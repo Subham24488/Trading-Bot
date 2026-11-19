@@ -14,6 +14,8 @@ export const MOMENTUM_RULES: StrategyParams = {
   profitStepInr: 0,
   targetDelta: 0.5,
   dayProfitLockInr: 0,
+  // Headlines blocked new trades for 60 minutes under these rules.
+  newsLookbackMinutes: 60,
 };
 
 export function ist(ymd: string, hhmm: string): Date {

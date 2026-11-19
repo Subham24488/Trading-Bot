@@ -111,21 +111,21 @@ export type CandlePatternName =
   | 'three_bar_push_down'
   | 'none';
 
+/** The candles that can confirm a call (2026-11-19 candle rules). */
 const BULLISH_PATTERNS: CandlePatternName[] = [
   'bullish_engulfing',
+  'hammer',
   'morning_star',
   'piercing',
-  'hammer',
   'bull_marubozu',
-  'three_bar_push_up',
 ];
+/** The candles that can confirm a put. */
 const BEARISH_PATTERNS: CandlePatternName[] = [
   'bearish_engulfing',
+  'shooting_star',
   'evening_star',
   'dark_cloud',
-  'shooting_star',
   'bear_marubozu',
-  'three_bar_push_down',
 ];
 
 /** A last candle smaller than this share of a normal 5-minute swing (ATR) is noise, not a pattern. */

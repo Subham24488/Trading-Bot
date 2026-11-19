@@ -17,7 +17,9 @@ import {
   type OptionSide,
 } from './indicators.js';
 import type { SignalThresholds, StrategyParams } from './params.js';
+import { findSetup, withSetupStop, type SetupSignal } from './setups.js';
 import {
+  checkRangeDay,
   checkTrendDay,
   stopBeyondBrokenLevel,
   trendDayEntryOf,
@@ -68,7 +70,13 @@ export type MarketBackdrop = {
   gapPct: number | null;
   advancersPct: number | null;
   headlineTone: number;
+  /** Bank NIFTY's move (%) over the last `recentMoveMinutes`; null when not known. */
+  bankNiftyMovePct?: number | null;
+  /** India VIX's move (%) over the last `recentMoveMinutes`; null when not known. */
+  vixMovePct?: number | null;
 };
+
+export type DayType = 'trend' | 'range' | 'unclear';
 
 export type IndexReading = {
   index: IndexOptionName;
@@ -100,6 +108,19 @@ export type IndexReading = {
    * that is pullback enough.
    */
   trendDayEntry: TrendDayEntry | null;
+  /**
+   * Which setups suit today: a trend day (its direction's breakouts and pullbacks), a range-bound
+   * day (reversals at a level) or unclear (nothing before 10:30). Absent on hand-made readings.
+   */
+  dayType?: DayType;
+  /** Why today counts as range-bound, in words; null on other days. */
+  rangeDayReason?: string | null;
+  /** A chart setup giving a signal at this check (setups.ts); null without one. */
+  setup?: SetupSignal | null;
+  /** Bank NIFTY's latest move (%); null for Bank NIFTY itself and when not known. */
+  bankNiftyMovePct?: number | null;
+  /** India VIX's latest move (%); null when not known. */
+  vixMovePct?: number | null;
 };
 
 const EMA_FAST = 9;
@@ -386,17 +407,15 @@ export function readIndex(
     },
     params.chart,
   );
-  const trendDay =
-    heldTrendDay ??
-    checkTrendDay(
-      {
-        now,
-        bars: data.futuresBars,
-        dailyBars: data.dailyBars,
-        advancersPct: backdrop.advancersPct,
-      },
-      params.trendDay,
-    );
+  const trendDay = heldTrendDay ?? checkTrendDay({ now, bars: data.futuresBars }, params.trendDay);
+  // Day type: a trend day (held for the day), else a range-bound day, else unclear.
+  const rangeDay = trendDay
+    ? null
+    : checkRangeDay(
+        { now, bars: data.futuresBars, trendEmaPeriod: params.chart.trendEmaPeriod },
+        params.trendDay,
+      );
+  const dayType: DayType = trendDay ? 'trend' : rangeDay ? 'range' : 'unclear';
   const trendDayEntry = trendDayEntryOf(
     {
       now,
@@ -408,7 +427,29 @@ export function readIndex(
     },
     params,
   );
-  const chart = stopBeyondBrokenLevel(chartRead, trendDayEntry, data.spot, params.chart);
+  // The chart setups (flag, opening-range retest, double bottom or top, failed breakout); a
+  // trend-day breakout comes first.
+  const setup =
+    chartRead && data.spot !== null && !trendDayEntry?.trigger
+      ? findSetup(
+          {
+            now,
+            indexName: data.index,
+            bars: data.futuresBars,
+            chart: chartRead,
+            spot: data.spot,
+            callWall: levels.callWall,
+            putWall: levels.putWall,
+            dailyBars: data.dailyBars,
+          },
+          params,
+        )
+      : null;
+  const chart = withSetupStop(
+    stopBeyondBrokenLevel(chartRead, trendDayEntry, data.spot, params.chart),
+    setup,
+    data.spot,
+  );
   return {
     index: data.index,
     score: signals.reduce((sum, item) => sum + item.vote, 0),
@@ -434,6 +475,11 @@ export function readIndex(
       data.chain.length > 0,
     trendDay,
     trendDayEntry,
+    dayType,
+    rangeDayReason: rangeDay,
+    setup,
+    bankNiftyMovePct: data.index === 'BANKNIFTY' ? null : (backdrop.bankNiftyMovePct ?? null),
+    vixMovePct: backdrop.vixMovePct ?? null,
   };
 }
 

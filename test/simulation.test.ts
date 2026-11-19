@@ -122,9 +122,9 @@ function toMinuteBars(bars: readonly IntradayBar[]): IntradayBar[] {
 /**
  * 2026-10-21: the uptrend from the live-loop tests until 10:30, a pullback to today's average
  * price until 10:45, then a quiet drift to the close. Every breadth stock is up and the climb
- * holds above the first-15-minute range and a rising average price, so it is a trend day; the
- * rules BUY a call at 10:20, when NIFTY futures close above the last hour's high on 3× the day's
- * usual volume.
+ * holds above the first-15-minute range and a rising average price, so it is a trend day. Its
+ * 10:20 breakout candle is away from every level, so the candle rules pass it by; the rules BUY a
+ * call at 11:00, when a bullish engulfing candle turns up at today's average price.
  */
 function recordedDay(): MarketRecording {
   const trend = uptrendFuturesBars({ yesterday: '2026-10-20', today: DAY, startPrice: 24_796 });
@@ -373,21 +373,21 @@ describe('simulated replay of a day', () => {
       expect(row.decidedAt).toEqual(row.asOf);
     }
     const actions = rows.map((row) => row.action);
-    // Flat from 09:30: one SKIP per 5-minute slot until the 10:20 breakout BUY.
+    // Flat from 09:30: one SKIP per 5-minute slot until the 11:00 BUY.
     const skipsBefore = rows.slice(0, actions.indexOf('BUY'));
     expect(skipsBefore.map((row) => (row.decidedAt as Date).toISOString())).toEqual(
-      Array.from({ length: 10 }, (_, slot) =>
+      Array.from({ length: 18 }, (_, slot) =>
         new Date(ist(DAY, '09:30').getTime() + slot * 5 * 60_000 + 20_000).toISOString(),
       ),
     );
     const buyIndex = actions.indexOf('BUY');
     expect(rows[buyIndex]).toMatchObject({ symbol: BOUGHT });
-    expect(rows[buyIndex]?.decidedAt).toEqual(new Date(ist(DAY, '10:20').getTime() + 20_000));
+    expect(rows[buyIndex]?.decidedAt).toEqual(new Date(ist(DAY, '11:00').getTime() + 20_000));
     expect(rows[buyIndex]?.marketSnapshot).toMatchObject({
       readings: [
         {
           trendDay: { side: 'CE' },
-          entryTrigger: { kind: 'breakout', name: "the last hour's high" },
+          chart: { candle: { pattern: 'bullish_engulfing', atLevel: "today's average price" } },
         },
       ],
     });
@@ -443,12 +443,73 @@ describe('simulated replay of a day', () => {
     expect(firstHold).toMatchObject({
       simulationId: '00000000-0000-4000-8000-000000000002',
       symbol: BOUGHT,
-      at: '2026-10-21 10:25:20',
+      at: '2026-10-21 11:05:20',
     });
     expect(firstHold).toHaveProperty('pnlPct');
     const firstSkip = decisionLines[0]?.[0];
     expect(firstSkip).toMatchObject({ action: 'SKIP', at: '2026-10-21 09:30:20' });
     expect(firstSkip).toHaveProperty('blockedBy');
+  });
+});
+
+describe('Bank NIFTY and India VIX', () => {
+  it("reads Bank NIFTY's and India VIX's move over the last 30 minutes from their 1-minute candles", async () => {
+    const day = recordedDay();
+    const minutes = Array.from(
+      { length: 75 },
+      (_, i) => new Date(ist(DAY, '09:15').getTime() + i * 60_000),
+    );
+    // From 10:00 Bank NIFTY climbs 5 points a minute from 55,000; at 10:15 India VIX jumps from 14 to 15.
+    const bankAt = (i: number) => 55_000 + Math.max(0, i - 45) * 5;
+    const vixAt = (i: number) => (i < 60 ? 14 : 15);
+    day.series.push(
+      {
+        key: 'NSE:NIFTY BANK',
+        token: 260_105,
+        minuteBars: minutes.map((t, i) => ({
+          t: t.toISOString(),
+          o: bankAt(i),
+          h: bankAt(i + 1),
+          l: bankAt(i),
+          c: bankAt(i + 1),
+          v: 0,
+        })),
+        prevClose: 55_000,
+        option: false,
+      },
+      {
+        key: 'NSE:INDIA VIX',
+        token: 264_969,
+        minuteBars: minutes.map((t, i) => ({
+          t: t.toISOString(),
+          o: vixAt(i),
+          h: vixAt(i),
+          l: vixAt(i),
+          c: vixAt(i),
+          v: 0,
+        })),
+        prevClose: 14,
+        option: false,
+      },
+    );
+    // 10:30:20: the candles from 10:00 to 10:29 have finished.
+    const now = new Date(ist(DAY, '10:30').getTime() + 20_000);
+    const broker = new ReplayBroker(day, () => now);
+    const { LiveMarketFeed } = await import('../src/services/LiveMarketFeed.js');
+    const feed = new LiveMarketFeed({
+      kite: broker as never,
+      news: new ReplayHeadlines(day, () => now),
+      logger: logger(),
+    });
+    const view = await feed.load(['NIFTY'], now, {
+      newsLookbackMinutes: 30,
+      minTradingDaysToExpiry: 2,
+      recentMoveMinutes: 30,
+    });
+    // Bank NIFTY: from the 10:00 open of 55,000 to the 10:29 close of 55,150, +0.27%.
+    expect(view.backdrop.bankNiftyMovePct).toBeCloseTo(0.2727, 3);
+    // India VIX: 14 at the 10:00 open, 15 now, +7.1%.
+    expect(view.backdrop.vixMovePct).toBeCloseTo(7.142, 2);
   });
 });
 
@@ -508,7 +569,7 @@ describe('SimulationService', () => {
       expect(first.decisions.BUY).toBeGreaterThan(0);
       expect(first.trades[0]).toMatchObject({
         symbol: BOUGHT,
-        buyAt: new Date(ist(DAY, '10:20').getTime() + 20_000).toISOString(),
+        buyAt: new Date(ist(DAY, '11:00').getTime() + 20_000).toISOString(),
       });
       expect(first.trades[0]?.exitReason).not.toBeNull();
       const calls = kite.getMinuteCandles.mock.calls.length;

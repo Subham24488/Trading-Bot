@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { IntradayBar } from '../src/universe/types.js';
 
 
 import { readChart, type ChartPlan, type ChartRead } from '../src/strategy/chart.js';
@@ -34,7 +35,8 @@ import {
   type SignalName,
   type Vote,
 } from '../src/strategy/signals.js';
-import { checkTrendDay, type TrendDay } from '../src/strategy/trendDay.js';
+import { checkRangeDay, checkTrendDay, type TrendDay } from '../src/strategy/trendDay.js';
+import type { SetupSignal } from '../src/strategy/setups.js';
 import {
   fiveMinuteBars,
   ist,
@@ -280,23 +282,33 @@ describe('decideEntry', () => {
     expect(decision).toMatchObject({ action: 'BUY', index: 'NIFTY', side: 'CE', score: 8 });
   });
 
-  it('buys puts only below the 20-day average, and either side while it is unknown', () => {
-    const bearish = Object.fromEntries(SIGNAL_NAMES.map((name) => [name, -1])) as Record<
+  it('buys puts below the 20-day average, and above it only with at least 5 of the 8 signals on their side', () => {
+    const allBearish = Object.fromEntries(SIGNAL_NAMES.map((name) => [name, -1])) as Record<
       SignalName,
       Vote
     >;
-    const decide = (dayAverage: number | null) =>
+    // Four signals point down and four nowhere.
+    const fourBearish = {
+      ...allBearish,
+      optionFlow: 0,
+      volume: 0,
+      breadth: 0,
+      globalMood: 0,
+    } as const;
+    const decide = (votes: Record<SignalName, Vote>, dayAverage: number | null) =>
       decideEntry(
-        { now, readings: [reading({ votes: bearish, dayAverage })], day: quietDay, vixPct: 0 },
+        { now, readings: [reading({ votes, dayAverage })], day: quietDay, vixPct: 0 },
         params,
       );
     // NIFTY is at 25,000.
-    expect(decide(25_100)).toMatchObject({ action: 'BUY', side: 'PE' });
-    expect(decide(null)).toMatchObject({ action: 'BUY', side: 'PE' });
-    expect(decide(24_900)).toMatchObject({
+    expect(decide(fourBearish, 25_100)).toMatchObject({ action: 'BUY', side: 'PE' });
+    expect(decide(fourBearish, null)).toMatchObject({ action: 'BUY', side: 'PE' });
+    expect(decide(fourBearish, 24_900)).toMatchObject({
       action: 'SKIP',
       blockedBy: ['against-day-average'],
     });
+    // All 8 signals point down: strong enough to buy a put above the 20-day average.
+    expect(decide(allBearish, 24_900)).toMatchObject({ action: 'BUY', side: 'PE' });
   });
 
   it.each([
@@ -311,13 +323,17 @@ describe('decideEntry', () => {
     ['once the day is in profit', { day: { ...quietDay, netPnlInr: 450 } }, 'day-in-profit'],
     [
       'soon after an exit',
-      { day: { ...quietDay, lastExitAt: new Date(now.getTime() - 10 * 60_000) } },
+      { day: { ...quietDay, lastExitAt: new Date(now.getTime() - 9 * 60_000) } },
       'cooldown',
     ],
     ['with two opposing signals', { votes: { breadth: -1, globalMood: -1 } }, 'too-many-opposing'],
     ['against the trend', { votes: { trend: -1 } }, 'trend-disagrees'],
     ['when chasing a stretched move', { rsi: 80 }, 'chasing'],
-    ['a call while NIFTY is below its 20-day average', { dayAverage: 25_100 }, 'against-day-average'],
+    [
+      'a call below its 20-day average with only 4 of the 8 signals on its side',
+      { dayAverage: 25_100, votes: { optionFlow: 0, volume: 0, breadth: 0, globalMood: 0 } },
+      'against-day-average',
+    ],
   ] as const)('skips %s', (_label, scenario, gate) => {
     const scenarioReading = reading({
       expiryToday: 'expiry' in scenario,
@@ -340,6 +356,73 @@ describe('decideEntry', () => {
       index: 'NIFTY',
       side: 'CE',
     });
+  });
+
+  it('skips a NIFTY trade while Bank NIFTY moves the other way', () => {
+    const gates = (
+      bankNiftyMovePct: number | null,
+      votes: Partial<Record<SignalName, Vote>> = {},
+    ) => {
+      const decision = decideEntry(
+        { now, readings: [reading({ bankNiftyMovePct, votes })], day: quietDay, vixPct: 0 },
+        params,
+      );
+      return decision.action === 'SKIP' ? decision.blockedBy : [];
+    };
+    // A call while Bank NIFTY fell 0.12% in the last 30 minutes.
+    expect(gates(-0.12)).toContain('bank-nifty-disagrees');
+    expect(gates(-0.05)).not.toContain('bank-nifty-disagrees');
+    expect(gates(0.3)).not.toContain('bank-nifty-disagrees');
+    expect(gates(null)).not.toContain('bank-nifty-disagrees');
+    // A put while Bank NIFTY rose 0.2%.
+    const bearish = Object.fromEntries(SIGNAL_NAMES.map((name) => [name, -1]));
+    expect(gates(0.2, bearish)).toContain('bank-nifty-disagrees');
+  });
+
+  it('does not buy straight after India VIX jumps 5% in 30 minutes, calls or puts', () => {
+    const gates = (vixMovePct: number, votes: Partial<Record<SignalName, Vote>> = {}) => {
+      const decision = decideEntry(
+        { now, readings: [reading({ vixMovePct, votes })], day: quietDay, vixPct: 0 },
+        params,
+      );
+      return decision.action === 'SKIP' ? decision.blockedBy : [];
+    };
+    expect(gates(5.5)).toContain('after-vix-spike');
+    expect(gates(4)).not.toContain('after-vix-spike');
+    const bearish = Object.fromEntries(SIGNAL_NAMES.map((name) => [name, -1]));
+    expect(gates(6, bearish)).toContain('after-vix-spike');
+  });
+
+  it('does not buy from 30 minutes before a scheduled announcement until 30 minutes after', () => {
+    const withEvent = { ...params, scheduledEvents: ['2026-10-21 10:00'] };
+    const blocked = (at: string) => {
+      const decision = decideEntry(
+        { now: ist('2026-10-21', at), readings: [reading({})], day: quietDay, vixPct: 0 },
+        withEvent,
+      );
+      return decision.action === 'SKIP' && decision.blockedBy.includes('scheduled-event');
+    };
+    expect(blocked('09:31')).toBe(true);
+    expect(blocked('10:29')).toBe(true);
+    expect(blocked('10:30')).toBe(false);
+    expect(blocked('09:30')).toBe(false);
+  });
+
+  it('waits 10 minutes after a sale before buying again', () => {
+    const coolingDown = (minutesSinceSale: number) => {
+      const decision = decideEntry(
+        {
+          now,
+          readings: [reading({})],
+          day: { ...quietDay, lastExitAt: new Date(now.getTime() - minutesSinceSale * 60_000) },
+          vixPct: 0,
+        },
+        params,
+      );
+      return decision.action === 'SKIP' && decision.blockedBy.includes('cooldown');
+    };
+    expect(coolingDown(9)).toBe(true);
+    expect(coolingDown(10)).toBe(false);
   });
 });
 
@@ -439,6 +522,7 @@ function chartRead(
       closeLocation: 0.9,
       rangeAtr: 1.1,
       volumeRatio: 1.4,
+      atLevel: "today's average price",
       ...candle,
     },
     support: { price: 24_985, kind: 'swing-low' },
@@ -447,9 +531,154 @@ function chartRead(
     basis: 60,
     swings: { highs: [], lows: [] },
     valueGapAtr: 0.3,
+    trendAverage: null,
+    fifteenMinuteCandle: null,
+    fifteenMinuteAtr: null,
     ...rest,
   };
 }
+
+describe('candle rules', () => {
+  const now = ist('2026-10-21', '10:30');
+  const decide = (chart: ChartRead) =>
+    decideEntry({ now, readings: [reading({ chart })], day: quietDay, vixPct: 0 }, current);
+  const blockedBy = (chart: ChartRead) => {
+    const decision = decide(chart);
+    return decision.action === 'SKIP' ? decision.blockedBy : [];
+  };
+
+  it('buys a pullback on a bullish marubozu that closes strongly at a level', () => {
+    expect(decide(chartRead())).toMatchObject({ action: 'BUY', side: 'CE' });
+  });
+
+  it('does not count three rising closes, which are not one of the confirming candles', () => {
+    const push = {
+      pattern: 'three_bar_push_up',
+      side: null,
+      confirms: null,
+      shapeConfirms: null,
+    } as const;
+    expect(blockedBy(chartRead({ candle: push }))).toContain('no-candle-confirmation');
+  });
+
+  it('waits on a doji: the move is pausing', () => {
+    const doji = { pattern: 'doji', side: null, confirms: null, shapeConfirms: null } as const;
+    expect(blockedBy(chartRead({ candle: doji }))).toContain('doji-wait');
+  });
+
+  it('does not count a confirming candle away from every level', () => {
+    expect(blockedBy(chartRead({ candle: { atLevel: null } }))).toContain('candle-not-at-level');
+  });
+
+  it('does not trade when the 15-minute and 5-minute candles point opposite ways', () => {
+    const chart = chartRead({ fifteenMinuteCandle: { pattern: 'bearish_engulfing', side: 'PE' } });
+    expect(blockedBy(chart)).toContain('candles-disagree');
+    const agreeing = chartRead({ fifteenMinuteCandle: { pattern: 'bull_marubozu', side: 'CE' } });
+    expect(decide(agreeing)).toMatchObject({ action: 'BUY', side: 'CE' });
+  });
+
+  it('explains the doji, level and disagreeing-candle skips in plain words', () => {
+    const skip = describeSkip({
+      now,
+      blockedBy: ['doji-wait', 'candle-not-at-level', 'candles-disagree'],
+      leaning: { index: 'NIFTY', side: 'CE', score: 4 },
+      reading: reading({}),
+      params: current,
+    });
+    expect(skip).not.toMatch(JARGON);
+    expect(skip).toContain('a sign the move is pausing, so we wait');
+    expect(skip).toContain('away from a level a candle is just noise');
+    expect(skip).toContain(
+      'the last 15-minute candle and the last 5-minute candle point opposite ways',
+    );
+  });
+});
+
+describe('chart setups in the entry decision', () => {
+  const now = ist('2026-10-21', '10:45');
+  const signal = (kind: SetupSignal['kind'], side: 'CE' | 'PE'): SetupSignal => ({
+    kind,
+    side,
+    stopSpot: side === 'CE' ? 24_970 : 25_030,
+    stopName: 'the setup level',
+    targetSpot: side === 'CE' ? 25_060 : 24_940,
+    reason: 'a setup',
+  });
+  const quiet = Object.fromEntries(SIGNAL_NAMES.map((name) => [name, 0]));
+  const trendUp: TrendDay = { side: 'CE', flaggedAtMinute: 600, reasons: ['a', 'b', 'c'] };
+  const decide = (overrides: Partial<IndexReading>) =>
+    decideEntry(
+      {
+        now,
+        readings: [reading({ votes: quiet, chart: chartRead({ valueGapAtr: 3 }), ...overrides })],
+        day: quietDay,
+        vixPct: 0,
+      },
+      current,
+    );
+  const blockedBy = (overrides: Partial<IndexReading>) => {
+    const decision = decide(overrides);
+    return decision.action === 'SKIP' ? decision.blockedBy : [];
+  };
+
+  it('buys a failed breakout on a range-bound day without waiting for a pullback or the votes', () => {
+    expect(decide({ dayType: 'range', setup: signal('failed-breakout', 'PE') })).toMatchObject({
+      action: 'BUY',
+      side: 'PE',
+    });
+  });
+
+  it('buys a flag only on a trend day in its direction, with the 15-minute trend agreeing', () => {
+    const flag = signal('flag', 'CE');
+    expect(decide({ dayType: 'trend', trendDay: trendUp, setup: flag })).toMatchObject({
+      action: 'BUY',
+      side: 'CE',
+    });
+    expect(blockedBy({ dayType: 'range', setup: flag })).toContain('not-for-this-day-type');
+    const trendDown = chartRead({ valueGapAtr: 3, higherTrend: 'down' });
+    expect(blockedBy({ dayType: 'trend', trendDay: trendUp, setup: flag, chart: trendDown })).toContain(
+      'chart-trend-disagrees',
+    );
+  });
+
+  it('takes no double bottom or failed breakout on a trend day', () => {
+    const trendDown: TrendDay = { side: 'PE', flaggedAtMinute: 600, reasons: ['a', 'b', 'c'] };
+    expect(
+      blockedBy({ dayType: 'trend', trendDay: trendDown, setup: signal('failed-breakout', 'PE') }),
+    ).toContain('not-for-this-day-type');
+    expect(
+      blockedBy({ dayType: 'trend', trendDay: trendUp, setup: signal('double-bottom', 'CE') }),
+    ).toContain('not-for-this-day-type');
+  });
+
+  it('sells a range-day setup at its target on the index, even after the profit lock has armed', () => {
+    const position: OpenPosition = {
+      symbol: 'NIFTY26OCT25000CE',
+      index: 'NIFTY',
+      side: 'CE',
+      strike: 25_000,
+      expiry: '2026-10-27',
+      token: 1,
+      entryPrice: 120.2,
+      enteredAt: ist('2026-10-21', '10:45'),
+      peakPrice: 135,
+      troughPrice: 120.2,
+      lotSize: 65,
+      entryDelta: 0.45,
+      entrySpot: 25_000,
+      stopSpot: 24_970,
+      premiumStop: 110.2,
+      targetSpot: 25_060,
+    };
+    const at = (spot: number) =>
+      checkPositionExit(
+        { now: ist('2026-10-21', '11:15'), position, price: 134, spot },
+        current,
+      );
+    expect(at(25_061)).toEqual({ action: 'EXIT', reason: 'target-reached' });
+    expect(at(25_055)).toEqual({ action: 'HOLD' });
+  });
+});
 
 describe('chart gates', () => {
   const now = ist('2026-10-21', '10:30');
@@ -550,7 +779,10 @@ describe('chart gates', () => {
       params,
     );
     // Stop above the last two candles is ~64 points away; the put wall is 55 points down.
-    expect(decision).toMatchObject({ action: 'SKIP', blockedBy: ['chasing', 'low-reward'] });
+    expect(decision).toMatchObject({
+      action: 'SKIP',
+      blockedBy: expect.arrayContaining(['chasing', 'low-reward']),
+    });
     // The pullback rules skip it too: no clear 15-minute trend, and nothing came back to value.
     const pullback = decideEntry(
       {
@@ -609,7 +841,10 @@ describe('chart gates', () => {
       },
       params,
     );
-    expect(decision).toMatchObject({ action: 'SKIP', blockedBy: ['near-chart-level'] });
+    expect(decision).toMatchObject({
+      action: 'SKIP',
+      blockedBy: expect.arrayContaining(['near-chart-level']),
+    });
     const pullback = decideEntry(
       {
         now: ist('2026-11-11', '11:20'),
@@ -1403,9 +1638,49 @@ describe('plain-English rationale', () => {
     expect(buy.length).toBeLessThanOrEqual(1200);
     expect(buy.endsWith('…')).toBe(false);
     expect(buy).toMatch(
-      /Chart: today is a trend day upward \(flagged at 10:00 AM, 3 of 5 checks agree\); NIFTY futures closed above the last hour's high \([\d,]+\) on 3\.0× the day's usual volume, so we bought without waiting for a pullback\./,
+      /Chart: today is a trend day upward \(flagged at 10:00 AM, all 3 checks agree\); NIFTY futures closed above the last hour's high \([\d,]+\) on 3\.0× the day's usual volume, so we bought without waiting for a pullback\./,
     );
     expect(buy).toContain("(just under the last hour's high, the level it broke)");
+  });
+
+  it('explains a failed-breakout buy on a range-bound day in plain words', () => {
+    const setup: SetupSignal = {
+      kind: 'failed-breakout',
+      side: 'PE',
+      stopSpot: 25_040,
+      stopName: "the failed breakout's high",
+      targetSpot: 24_960,
+      reason:
+        "NIFTY futures broke above yesterday's high (25,090) and a 15-minute bearish engulfing candle closed back below it, then a 5-minute candle closed below that candle",
+    };
+    const chart = chartRead({ plan: { stopSpot: 25_040, stopBeyondBrokenLevel: true } });
+    const plan = {
+      stopSpot: 25_040,
+      targetSpot: 24_940,
+      riskPoints: 40,
+      rewardPoints: 60,
+      rewardPerUnit: 30.8,
+      riskPerUnit: 10,
+      premiumStop: 110.2,
+      lockPrice: 130.2,
+      maxLossInr: 721.4,
+      lockedProfitInr: -53.8,
+      targetPrice: null,
+      targetProfitInr: null,
+    };
+    const buy = describeBuy({
+      now,
+      candidate: { ...candidate, side: 'PE', symbol: 'NIFTY26OCT25000PE', plan },
+      fillPrice: 120.2,
+      reading: reading({ chart, setup, dayType: 'range' }),
+      candidateCount: 3,
+      params: current,
+    });
+    expect(buy).not.toMatch(JARGON);
+    expect(buy).toContain(
+      'Chart: NIFTY futures broke above yesterday\'s high (25,090) and a 15-minute bearish engulfing candle closed back below it, then a 5-minute candle closed below that candle, so we bought a put; on a range-bound day we sell at its target, 24,960.',
+    );
+    expect(buy).toContain("NIFTY rises above 25,040 (over the failed breakout's high)");
   });
 
   it('explains a shallow-pullback buy on a trend day in plain words', () => {
@@ -1643,6 +1918,129 @@ describe('plain-English rationale', () => {
     expect(skip).toContain('the possible gain is less than 1.5× the loss at our stop');
     expect(skip).toContain("today's closed trades are already in profit, so we stop for the day");
   });
+
+  it('explains the Bank NIFTY, India VIX, announcement and 20-day skips in plain words', () => {
+    const skip = describeSkip({
+      now,
+      blockedBy: ['bank-nifty-disagrees', 'after-vix-spike', 'scheduled-event'],
+      leaning: { index: 'NIFTY', side: 'CE', score: 4 },
+      reading: marketReading,
+      params: current,
+    });
+    expect(skip).not.toMatch(JARGON);
+    expect(skip).toContain(
+      'Bank NIFTY is moving the other way (0.1% or more in the last 30 minutes)',
+    );
+    expect(skip).toContain('the fear index (India VIX) jumped 5% or more in the last 30 minutes');
+    expect(skip).toContain(
+      'a scheduled announcement, such as an RBI policy decision, is less than 30 minutes away',
+    );
+    const against = describeSkip({
+      now,
+      blockedBy: ['against-day-average'],
+      leaning: { index: 'NIFTY', side: 'CE', score: 4 },
+      reading: marketReading,
+      params: current,
+    });
+    expect(against).toContain('a trade against it needs at least 5 of the 8 signals on its side');
+  });
+});
+
+describe('day types', () => {
+  const day = '2026-10-21';
+  const at = (hhmm: string) => new Date(ist(day, hhmm).getTime() + 20_000);
+  /**
+   * Yesterday flat around 25,000; today from 09:15 every 15-minute candle swings 20 points
+   * the other way (25,020, 24,980, 25,020 …), so the price keeps crossing today's average.
+   */
+  const choppy = (todayCandles: number) => {
+    const flat = Array.from({ length: 75 }, (_, i) => {
+      const o = 25_000 + (i % 2 === 0 ? -3 : 3);
+      const c = 25_000 + (i % 2 === 0 ? 3 : -3);
+      return [o, Math.max(o, c) + 1, Math.min(o, c) - 1, c] as const;
+    });
+    const today: Array<readonly [number, number, number, number]> = [];
+    let price = 25_000;
+    for (let candle = 0; candle < todayCandles; candle += 1) {
+      const target = candle % 2 === 0 ? 25_020 : 24_980;
+      for (let step = 1; step <= 3; step += 1) {
+        const next = price + ((target - price) * step) / (4 - step) / 3;
+        const close = step === 3 ? target : next;
+        today.push([price, Math.max(price, close) + 2, Math.min(price, close) - 2, close]);
+        price = close;
+      }
+    }
+    return [...fiveMinuteBars('2026-10-20', '09:15', flat), ...fiveMinuteBars(day, '09:15', today)];
+  };
+  const range = (hhmm: string, bars: IntradayBar[]) =>
+    checkRangeDay({ now: at(hhmm), bars, trendEmaPeriod: 20 }, current.trendDay);
+
+  it("calls a day range-bound when the 15-minute average is flat and the price keeps crossing today's average", () => {
+    const reason = range('11:00', choppy(7));
+    expect(reason).toMatch(
+      /^the 15-minute average is flat and NIFTY crossed today's average price \d+ times$/,
+    );
+    expect(reason).not.toMatch(JARGON);
+    // Not before 10:00.
+    expect(range('09:55', choppy(2))).toBeNull();
+    // A steady climb is not range-bound.
+    expect(
+      range('10:30', uptrendFuturesBars({ yesterday: '2026-10-20', today: day, todayBars: 15 })),
+    ).toBeNull();
+  });
+
+  it('waits until 10:30 on a day that is neither a trend day nor range-bound', () => {
+    const blocked = (hhmm: string) => {
+      const decision = decideEntry(
+        {
+          now: ist(day, hhmm),
+          readings: [reading({ dayType: 'unclear', chart: chartRead() })],
+          day: quietDay,
+          vixPct: 0,
+        },
+        current,
+      );
+      return decision.action === 'SKIP' && decision.blockedBy.includes('unclear-day-wait');
+    };
+    expect(blocked('10:15')).toBe(true);
+    expect(blocked('10:30')).toBe(false);
+  });
+
+  it("trades only the trend day's direction on a trend day, and no pullback on a range-bound day", () => {
+    const now = ist(day, '10:45');
+    const trendDown: TrendDay = { side: 'PE', flaggedAtMinute: 600, reasons: ['a', 'b', 'c'] };
+    const gates = (overrides: Partial<IndexReading>) => {
+      const decision = decideEntry(
+        {
+          now,
+          readings: [reading({ chart: chartRead(), ...overrides })],
+          day: quietDay,
+          vixPct: 0,
+        },
+        current,
+      );
+      return decision.action === 'SKIP' ? decision.blockedBy : [];
+    };
+    // A call pullback (the 15-minute trend is up) on a day flagged a trend day downward.
+    expect(gates({ dayType: 'trend', trendDay: trendDown })).toContain('not-for-this-day-type');
+    expect(gates({ dayType: 'range' })).toContain('not-for-this-day-type');
+    expect(gates({ dayType: 'unclear' })).not.toContain('not-for-this-day-type');
+  });
+
+  it('explains the day-type skips in plain words', () => {
+    const skip = describeSkip({
+      now: ist(day, '10:15'),
+      blockedBy: ['unclear-day-wait', 'not-for-this-day-type'],
+      leaning: { index: 'NIFTY', side: 'CE', score: 4 },
+      reading: reading({}),
+      params: current,
+    });
+    expect(skip).not.toMatch(JARGON);
+    expect(skip).toContain(
+      'the day is neither clearly trending nor range-bound yet, so we wait until 10:30 AM',
+    );
+    expect(skip).toContain('on a range-bound day only reversals at a level');
+  });
 });
 
 describe('trend days', () => {
@@ -1651,11 +2049,8 @@ describe('trend days', () => {
   /** A steady climb (+12 / −6 a candle) with today's last three candles on 3× the volume. */
   const climb = (todayBars: number) =>
     uptrendFuturesBars({ yesterday: '2026-10-20', today, todayBars });
-  const check = (hhmm: string, todayBars: number, advancersPct: number) =>
-    checkTrendDay(
-      { now: at(hhmm), bars: climb(todayBars), dailyBars: [], advancersPct },
-      current.trendDay,
-    );
+  const check = (hhmm: string, todayBars: number) =>
+    checkTrendDay({ now: at(hhmm), bars: climb(todayBars) }, current.trendDay);
   const flaggedUp: TrendDay = {
     side: 'CE',
     flaggedAtMinute: 10 * 60,
@@ -1664,31 +2059,42 @@ describe('trend days', () => {
   const decideAt = (hhmm: string, read: IndexReading) =>
     decideEntry({ now: at(hhmm), readings: [read], day: quietDay, vixPct: 0 }, current);
 
-  it('flags a trend day when three of the five checks agree between 09:45 and 10:30', () => {
-    const flagged = check('10:00', 9, 75);
-    expect(flagged).toMatchObject({ side: 'CE', flaggedAtMinute: 10 * 60 });
+  it('flags a trend day only when all three checks agree between 09:45 and 10:30', () => {
+    const flagged = check('10:15', 12);
+    expect(flagged).toMatchObject({ side: 'CE', flaggedAtMinute: 10 * 60 + 15 });
     expect(flagged?.reasons).toEqual([
       'it broke above the first-15-minute range and held for 2 candles',
-      "it is above today's average price, which rose for 6 candles",
-      '75% of the breadth stocks are up',
+      "its last 6 closes are above today's average price",
+      'the 15-minute trend is strong (100 on a 0–100 trend-strength scale)',
     ]);
     for (const reason of flagged?.reasons ?? []) {
       expect(reason).not.toMatch(JARGON);
     }
-    // With breadth at 50% only two checks agree.
-    expect(check('10:00', 9, 50)).toBeNull();
+    // At 10:00 there are too few finished 15-minute candles to read the trend's strength.
+    expect(check('10:00', 9)).toBeNull();
+    // The last candle drops back under today's average price and the opening range.
+    const bars = climb(12);
+    const last = bars.at(-1)!;
+    bars[bars.length - 1] = { ...last, c: last.o - 200, l: last.o - 202 };
+    expect(checkTrendDay({ now: at('10:15'), bars }, current.trendDay)).toBeNull();
   });
 
   it('does not flag a trend day before 09:45 or after 10:30', () => {
-    expect(check('09:40', 5, 75)).toBeNull();
-    expect(check('10:35', 16, 75)).toBeNull();
+    expect(check('09:40', 5)).toBeNull();
+    expect(check('10:35', 16)).toBeNull();
   });
 
   it("on a trend day, buys a close above the last hour's high on 1.5× the usual volume without waiting for a pullback", () => {
-    // The last candle closes above the last hour's high on 3× the usual volume, about 2 normal
-    // swings above today's average price: too far for a pullback entry.
-    const { data, backdrop } = bullishMarket();
+    // The last candle, a bullish engulfing, closes above the last hour's high on 3× the usual
+    // volume. Today's average price sits at its low, so the candle is at a level, but the close
+    // is about a normal swing above it: too far for a pullback entry.
+    const { data: climbing, backdrop } = bullishMarket();
+    const data = { ...climbing, futuresVwap: climbing.futuresPrice! - 12 };
     const read = readIndex(data, backdrop, current, at('10:30'), flaggedUp);
+    expect(read.chart?.candle).toMatchObject({
+      pattern: 'bullish_engulfing',
+      atLevel: "today's average price",
+    });
     expect(read.trendDay).toBe(flaggedUp);
     expect(read.trendDayEntry?.trigger).toMatchObject({
       kind: 'breakout',
@@ -1736,20 +2142,27 @@ describe('trend days', () => {
     return { data: { ...data, futuresPrice, futuresVwap: futuresPrice - 30 }, backdrop };
   };
 
-  it('on a trend day, a dip to the 9-candle average is pullback enough', () => {
+  it('on a trend day, a dip to the 9-candle average is pullback enough, but its candle must still be at a level', () => {
     const { data, backdrop } = dipToShortAverage();
     const read = readIndex(data, backdrop, current, at('10:30'), flaggedUp);
     expect(read.trendDayEntry?.shallowPullback).toBe('dipped to its 9-candle average');
     // Still more than half a normal swing from the average price.
     expect(read.chart?.valueGapAtr).toBeGreaterThan(current.chart.maxValueGapAtr);
-    expect(decideAt('10:30', read)).toMatchObject({ action: 'BUY', side: 'CE' });
+    // No longer waiting for a pullback; the bullish engulfing candle is just away from every level.
+    expect(decideAt('10:30', read)).toMatchObject({
+      action: 'SKIP',
+      blockedBy: ['candle-not-at-level'],
+    });
   });
 
   it('on other days the same dip still waits for the average price or the 21-candle average', () => {
     const { data, backdrop } = dipToShortAverage();
     const read = readIndex(data, backdrop, current, at('10:35'));
     expect(read.trendDayEntry).toBeNull();
-    expect(decideAt('10:35', read)).toMatchObject({ action: 'SKIP', blockedBy: ['no-pullback'] });
+    expect(decideAt('10:35', read)).toMatchObject({
+      action: 'SKIP',
+      blockedBy: expect.arrayContaining(['no-pullback']),
+    });
   });
 
   it('puts the index stop just under the level the breakout cleared', () => {

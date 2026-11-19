@@ -20,6 +20,8 @@ const chartSchema = z.object({
     closeLocation: z.number(),
     rangeAtr: z.number(),
     volumeRatio: nullableNumber,
+    /** The level the candle traded at; absent on rows from before the candle rules of 2026-11-19. */
+    atLevel: z.string().nullable().optional(),
   }),
   support: nullableNumber,
   resistance: nullableNumber,
@@ -76,6 +78,17 @@ export const decisionSnapshotSchema = z.object({
         .object({ side: sideSchema, flaggedAtMinute: z.number(), reasons: z.array(z.string()) })
         .nullable()
         .optional(),
+      /** Today's day type (trend, range or unclear); absent on rows from before 2026-11-19. */
+      dayType: z.enum(['trend', 'range', 'unclear']).optional(),
+      /** The chart setup giving a signal (setups.ts); absent on rows from before 2026-11-19. */
+      setup: z
+        .object({
+          kind: z.enum(['flag', 'opening-range-retest', 'double-bottom', 'double-top', 'failed-breakout']),
+          side: sideSchema,
+          reason: z.string(),
+        })
+        .nullable()
+        .optional(),
       /** The trend-day breakout a trade in its direction could enter on. */
       entryTrigger: z
         .object({
@@ -95,6 +108,9 @@ export const decisionSnapshotSchema = z.object({
     gapPct: nullableNumber,
     advancersPct: nullableNumber,
     headlineTone: z.number(),
+    /** Bank NIFTY's and India VIX's move over the last 30 minutes; absent on older rows. */
+    bankNiftyMovePct: nullableNumber.optional(),
+    vixMovePct: nullableNumber.optional(),
   }),
   news: z.record(z.string(), z.enum(['none', 'elevated', 'high'])),
   headlines: z.array(z.string()),
@@ -154,6 +170,8 @@ export const decisionSnapshotSchema = z.object({
       premiumStop: nullableNumber.optional(),
       /** Current ratcheting profit-lock price; null until buy + ₹10 is reached. */
       profitLockPrice: nullableNumber.optional(),
+      /** On a range-bound day: the setup's target on the index; absent on older rows. */
+      targetSpot: nullableNumber.optional(),
     })
     .optional(),
   exit: z

@@ -1092,6 +1092,7 @@ export class LlmTradeAdvisorService {
       extraSymbols: open ? [open.symbol] : [],
       newsLookbackMinutes: this.params.newsLookbackMinutes,
       minTradingDaysToExpiry: this.params.minTradingDaysToExpiry,
+      recentMoveMinutes: this.params.recentMoveMinutes,
     });
     if (!open && !view.isTradingDay) {
       this.logger.info(
@@ -1508,6 +1509,7 @@ export class LlmTradeAdvisorService {
       // The latest HOLD carries the trailed stop; the BUY carries the planned one.
       stopSpot: latest?.stopSpot ?? buySnapshot?.entry?.plan?.stopSpot ?? null,
       premiumStop: latest?.premiumStop ?? buySnapshot?.entry?.plan?.premiumStop ?? null,
+      targetSpot: latest?.targetSpot ?? null,
       // The stop-loss order is checked again from the buy, in case it triggered while stopped.
       stopCheckedFrom: trade.enteredAt,
       stopTriggeredAt: null,
@@ -1602,6 +1604,11 @@ export class LlmTradeAdvisorService {
       entrySpot: input.view.spots[candidate.index] ?? input.reading.spot ?? null,
       stopSpot: candidate.plan?.stopSpot ?? null,
       premiumStop: candidate.plan?.premiumStop ?? null,
+      // On a range-bound day a setup's trade sells at the setup's target.
+      targetSpot:
+        input.reading.dayType === 'range' && input.reading.setup?.side === candidate.side
+          ? input.reading.setup.targetSpot
+          : null,
       // The stop-loss order is placed the moment the buy fills.
       stopCheckedFrom: input.now,
       stopTriggeredAt: null,
@@ -1990,6 +1997,7 @@ export class LlmTradeAdvisorService {
       stopSpot: position.stopSpot,
       premiumStop: position.premiumStop,
       profitLockPrice: this.profitLockPrice(position),
+      targetSpot: position.targetSpot ?? null,
     };
   }
 
@@ -2051,6 +2059,7 @@ export class LlmTradeAdvisorService {
                 closeLocation: Number(reading.chart.candle.closeLocation.toFixed(2)),
                 rangeAtr: Number(reading.chart.candle.rangeAtr.toFixed(2)),
                 volumeRatio: round(reading.chart.candle.volumeRatio),
+                atLevel: reading.chart.candle.atLevel,
               },
               support: round(reading.chart.support?.price ?? null),
               resistance: round(reading.chart.resistance?.price ?? null),
@@ -2058,6 +2067,14 @@ export class LlmTradeAdvisorService {
             }
           : null,
         trendDay: reading.trendDay,
+        ...(reading.dayType ? { dayType: reading.dayType } : {}),
+        ...(reading.setup !== undefined
+          ? {
+              setup: reading.setup
+                ? { kind: reading.setup.kind, side: reading.setup.side, reason: reading.setup.reason }
+                : null,
+            }
+          : {}),
         entryTrigger: reading.trendDayEntry?.trigger ?? null,
       })),
       market: backdrop
@@ -2068,6 +2085,8 @@ export class LlmTradeAdvisorService {
             gapPct: round(backdrop.gapPct),
             advancersPct: round(backdrop.advancersPct, 1),
             headlineTone: backdrop.headlineTone,
+            bankNiftyMovePct: round(backdrop.bankNiftyMovePct ?? null, 3),
+            vixMovePct: round(backdrop.vixMovePct ?? null),
           }
         : EMPTY_BACKDROP,
       news: input.view?.news ?? {},

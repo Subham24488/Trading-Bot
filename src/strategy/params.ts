@@ -44,6 +44,8 @@ export type ChartParams = {
   minSignalRangeAtr: number;
   /** ...and trades at least this multiple of the usual volume for its time of day. */
   minSignalVolumeRatio: number;
+  /** A candle is at a level when its range comes within this many ATRs of it. */
+  levelTouchAtr: number;
   /** Bigger-picture trend: an EMA of `trendEmaPeriod` bars of `trendMinutes` minutes. */
   trendMinutes: number;
   trendEmaPeriod: number;
@@ -67,21 +69,53 @@ export type TrendDayParams = {
   /** The day is checked from this minute until `checkUntilMinute`; once flagged it stays flagged. */
   checkFromMinute: number;
   checkUntilMinute: number;
-  /** At least this many of the 5 checks must agree on a side, and more than on the other side. */
-  checksNeeded: number;
-  /** Breadth check: at least this % of the breadth stocks up (calls), at most `breadthDownPct` (puts). */
-  breadthUpPct: number;
-  breadthDownPct: number;
-  /** VWAP check: the price is above a VWAP that rose for this many 5-minute candles in a row. */
-  vwapRisingBars: number;
+  /** VWAP check: the last this many 5-minute closes are on one side of today's average price. */
+  vwapSideBars: number;
   /** Trend-strength check: ADX(14) of the completed 15-minute candles is at least this. */
   trendStrengthMin: number;
-  /** Range check: the first hour's range is at least this share of the average daily range. */
-  firstHourRangeOfDayRange: number;
+  /** A range day is checked from this minute... */
+  rangeFromMinute: number;
+  /** ...when the 15-minute average moved less than this many 15-minute ATRs... */
+  flatAverageAtr: number;
+  /** ...over its last this many candles... */
+  flatAverageCandles: number;
+  /** ...and today's 15-minute closes crossed today's average price at least this many times. */
+  rangeVwapCrossings: number;
+  /** On a day that is neither a trend day nor a range day, no new trade before this minute. */
+  unclearWaitUntilMinute: number;
   /** Breakout entries start at this minute... */
   breakoutFromMinute: number;
   /** ...and need a candle with at least this multiple of the day's median 5-minute volume. */
   breakoutVolumeMultiple: number;
+};
+
+/** The chart setups of 2026-11-19 (setups.ts). Times are minutes after midnight IST. */
+export type SetupParams = {
+  /** Flag: a pole of at least this many 15-minute swings (ATR)... */
+  flagPoleAtr: number;
+  /** ...in up to this many 15-minute candles... */
+  flagPoleMaxCandles: number;
+  /** ...then a pause of this many to `flagMaxCandles` candles... */
+  flagMinCandles: number;
+  flagMaxCandles: number;
+  /** ...broken on at least this multiple of the 20-candle average volume... */
+  flagVolumeMultiple: number;
+  /** ...between these minutes... */
+  flagFromMinute: number;
+  flagUntilMinute: number;
+  /** ...and not within this many 15-minute swings under yesterday's high or the call-OI strike. */
+  flagClearanceAtr: number;
+  /** Opening-range retest: only between these minutes... */
+  retestFromMinute: number;
+  retestUntilMinute: number;
+  /** ...when the opening range is no wider than this many 15-minute swings. */
+  retestMaxRangeAtr: number;
+  /** Double bottom or top: two lows (highs) within this %... */
+  doubleBottomTolerancePct: number;
+  /** ...at least this many 15-minute candles apart. */
+  doubleBottomMinGap: number;
+  /** Double bottom or top and failed breakout: not before this minute. */
+  reversalFromMinute: number;
 };
 
 /**
@@ -107,6 +141,24 @@ export type StrategyParams = {
    * it; 0 turns the filter off.
    */
   trendAverageDays: number;
+  /**
+   * A trade against the 20-day average is allowed only when at least this many of the 8 votes
+   * (net) point its way: a stronger setup.
+   */
+  againstDayAverageMinScore: number;
+  /** Minutes over which Bank NIFTY's and India VIX's latest move is measured. */
+  recentMoveMinutes: number;
+  /** Skip a trade when Bank NIFTY moved at least this % the other way over `recentMoveMinutes`. */
+  bankNiftyAgainstPct: number;
+  /** No buying while India VIX is up at least this % over `recentMoveMinutes` (a fear spike). */
+  vixSpikePct: number;
+  /**
+   * Scheduled announcements inside market hours (RBI policy), as "YYYY-MM-DD HH:MM" in IST. US Fed
+   * and CPI releases come after 15:30 IST, so they never fall in market hours.
+   */
+  scheduledEvents: readonly string[];
+  /** No new trade from this many minutes before a scheduled announcement until this many after. */
+  eventBlockMinutes: number;
   squareOffMinute: number;
   minEntryScore: number;
   maxOpposingVotes: number;
@@ -125,6 +177,7 @@ export type StrategyParams = {
   maxLosingTradesPerDay: number;
   /** No new trades once today's closed trades are net above this (₹), so a green day stays green. */
   dayProfitLockInr: number;
+  /** Minutes after a sale before the next trade may be bought. */
   cooldownMinutes: number;
   /** Widest stop on the option price; the planned stop from the chart is never looser. */
   stopLossPct: number;
@@ -185,10 +238,13 @@ export type StrategyParams = {
   maxIvToHv: number;
   maxSpreadPct: number;
   minPremium: number;
+  /** Options costing more than this (₹ a unit) are not bought. */
+  maxPremium: number;
   minOptionOi: number;
   signals: SignalThresholds;
   chart: ChartParams;
   trendDay: TrendDayParams;
+  setups: SetupParams;
 };
 
 export const DEFAULT_STRATEGY: StrategyParams = {
@@ -201,6 +257,14 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   minTradingDaysToExpiry: 2,
   // 39-day backtest: the filter added ₹4,167 on real prices and ₹3,563 on weekly prices.
   trendAverageDays: 20,
+  // 2026-11-19: against the 20-day trend only with 5 of the 8 votes on the trade's side.
+  againstDayAverageMinScore: 5,
+  recentMoveMinutes: 30,
+  bankNiftyAgainstPct: 0.1,
+  vixSpikePct: 5,
+  // Add RBI policy announcements here, for example '2026-12-04 10:00'.
+  scheduledEvents: [],
+  eventBlockMinutes: 30,
   squareOffMinute: 15 * 60 + 15,
   minEntryScore: 4,
   maxOpposingVotes: 1,
@@ -208,7 +272,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   minAgreeingScore: 1,
   rsiChaseLimit: 75,
   maxVixRiseForCallsPct: 8,
-  newsLookbackMinutes: 60,
+  // No new trade within 30 minutes of a high-impact headline (60 before 2026-11-19).
+  newsLookbackMinutes: 30,
   bigLevelBufferPct: 0.15,
   // Three losing puts had 0.15–0.27% room to the put wall; no winner had less than 0.34%.
   minRewardToRisk: 2,
@@ -216,7 +281,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   maxLosingTradesPerDay: 2,
   // With ₹10–15 targets, keep trading after a winner until the day is up this much.
   dayProfitLockInr: 1_500,
-  cooldownMinutes: 30,
+  // 10 minutes since 2026-11-19 (was 30).
+  cooldownMinutes: 10,
   // Stopped trades never showed a profit; the one deep dip that recovered bottomed at −16%.
   stopLossPct: 20,
   // The premium moves ~70× the index in %, so 0.25% cost −17% on 2026-11-09; 0.15% ≈ −10%.
@@ -254,13 +320,15 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   minHoldMinutes: 15,
   targetNetPnlPct: 8,
   strikeBand: 2,
-  minDelta: 0.35,
-  maxDelta: 0.65,
+  // 2026-11-19: delta 0.40–0.55 (was 0.35–0.65).
+  minDelta: 0.4,
+  maxDelta: 0.55,
   // One strike out of the money: a ₹10 stop leaves ~25 index points instead of ~20 at 0.5.
   targetDelta: 0.4,
   maxIvToHv: 1.4,
   maxSpreadPct: 1,
   minPremium: 20,
+  maxPremium: 200,
   minOptionOi: 10_000,
   signals: {
     vwapBandPct: 0.05,
@@ -293,6 +361,7 @@ export const DEFAULT_STRATEGY: StrategyParams = {
     confirmCloseLocation: 0.6,
     minSignalRangeAtr: 0.5,
     minSignalVolumeRatio: 1,
+    levelTouchAtr: 0.25,
     trendMinutes: 15,
     trendEmaPeriod: 20,
     targetFallbackAtr: 2,
@@ -307,14 +376,34 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   trendDay: {
     checkFromMinute: 9 * 60 + 45,
     checkUntilMinute: 10 * 60 + 30,
-    checksNeeded: 3,
-    breadthUpPct: 70,
-    breadthDownPct: 30,
-    vwapRisingBars: 6,
+    // 2026-11-19: all three checks (opening range held, one side of VWAP, ADX 25+), was 3 of 5.
+    vwapSideBars: 6,
     trendStrengthMin: 25,
-    firstHourRangeOfDayRange: 0.6,
+    rangeFromMinute: 10 * 60,
+    flatAverageAtr: 0.3,
+    flatAverageCandles: 4,
+    rangeVwapCrossings: 3,
+    unclearWaitUntilMinute: 10 * 60 + 30,
     breakoutFromMinute: 10 * 60,
     breakoutVolumeMultiple: 1.5,
+  },
+  // The chart setups of 2026-11-19, as given: flag, opening-range retest, double bottom or top,
+  // failed breakout.
+  setups: {
+    flagPoleAtr: 1.5,
+    flagPoleMaxCandles: 4,
+    flagMinCandles: 3,
+    flagMaxCandles: 8,
+    flagVolumeMultiple: 1.5,
+    flagFromMinute: 10 * 60,
+    flagUntilMinute: 13 * 60 + 30,
+    flagClearanceAtr: 0.5,
+    retestFromMinute: 9 * 60 + 45,
+    retestUntilMinute: 11 * 60,
+    retestMaxRangeAtr: 1.5,
+    doubleBottomTolerancePct: 0.1,
+    doubleBottomMinGap: 4,
+    reversalFromMinute: 10 * 60,
   },
 };
 

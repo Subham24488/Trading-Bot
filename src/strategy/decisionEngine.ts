@@ -4,7 +4,8 @@ import { istClock, minutesBetween } from './clock.js';
 import { TICK } from './contracts.js';
 import { pctChange, type OptionSide } from './indicators.js';
 import type { StrategyParams } from './params.js';
-import type { IndexReading, SignalName } from './signals.js';
+import type { SetupKind } from './setups.js';
+import type { DayType, IndexReading, SignalName } from './signals.js';
 import type { ChartRead } from './chart.js';
 
 export const GATE_IDS = [
@@ -33,6 +34,14 @@ export const GATE_IDS = [
   'no-pullback',
   'signals-disagree',
   'against-day-average',
+  'bank-nifty-disagrees',
+  'after-vix-spike',
+  'scheduled-event',
+  'doji-wait',
+  'candle-not-at-level',
+  'candles-disagree',
+  'unclear-day-wait',
+  'not-for-this-day-type',
 ] as const;
 
 export type GateId = (typeof GATE_IDS)[number];
@@ -101,6 +110,8 @@ export type OpenPosition = {
    * applies.
    */
   premiumStop: number | null;
+  /** On a range-bound day: the setup's target on the index (spot), sold when reached. */
+  targetSpot?: number | null;
 };
 
 export type ExitCheck = { action: 'EXIT'; reason: ExitReason } | { action: 'HOLD' };
@@ -111,6 +122,17 @@ export type StopOrderCheck =
   | { action: 'SOLD'; price: number }
   /** Triggered, but the price is under the order's limit: it waits to be re-priced to the bid. */
   | { action: 'UNFILLED' };
+
+/** Which entries suit each day type: a trend day its breakouts, pullbacks, flags and retests. */
+const DAY_TYPE_SETUPS: Record<SetupKind | 'pullback' | 'breakout', readonly DayType[]> = {
+  pullback: ['trend', 'unclear'],
+  breakout: ['trend'],
+  flag: ['trend'],
+  'opening-range-retest': ['trend'],
+  'double-bottom': ['range', 'unclear'],
+  'double-top': ['range', 'unclear'],
+  'failed-breakout': ['range', 'unclear'],
+};
 
 /** A SKIP records which way the market leaned once at least this many net votes agree. */
 const LEANING_MIN_SCORE = 2;
@@ -147,6 +169,9 @@ function trendSide(chart: ChartRead): OptionSide | null {
 function entrySide(reading: IndexReading, params: StrategyParams): OptionSide | null {
   if (reading.trendDayEntry?.trigger) {
     return reading.trendDayEntry.side;
+  }
+  if (reading.setup) {
+    return reading.setup.side;
   }
   return usesPullback(reading, params) && reading.chart
     ? trendSide(reading.chart)
@@ -192,11 +217,13 @@ function readingGates(
   if (reading.expiryToday && minute > params.expiryDayLastEntryMinute) {
     gates.push('expiry-day-cutoff');
   }
-  // Calls only while the index is above its 20-day average close, puts only while below it.
+  // Calls while the index is above its 20-day average close, puts while below it; a trade against
+  // it needs a stronger setup: at least `againstDayAverageMinScore` of the 8 votes on its side.
   const { spot, dayAverage } = reading;
   if (side !== null && spot !== null && dayAverage !== null) {
     const rightSide = side === 'CE' ? spot > dayAverage : spot < dayAverage;
-    if (!rightSide) {
+    const agreement = reading.score * (side === 'CE' ? 1 : -1);
+    if (!rightSide && agreement < params.againstDayAverageMinScore) {
       gates.push('against-day-average');
     }
   }
@@ -207,6 +234,28 @@ function readingGates(
   const trendEntry =
     side !== null && reading.trendDayEntry?.side === side ? reading.trendDayEntry : null;
   const trigger = trendEntry?.trigger ?? null;
+  // A chart setup (flag, opening-range retest, double bottom or top, failed breakout) does not
+  // wait for a pullback or the votes either, and reads its own signal candle.
+  const setup = side !== null && reading.setup?.side === side ? reading.setup : null;
+  const kind = trigger ? 'breakout' : (setup?.kind ?? 'pullback');
+  // The day type decides which setups trade (`DAY_TYPE_SETUPS`); a trend day only in its own
+  // direction, and an unclear day nothing before 10:30.
+  if (reading.dayType === 'unclear' && minute < params.trendDay.unclearWaitUntilMinute) {
+    gates.push('unclear-day-wait');
+  }
+  if (
+    side !== null &&
+    reading.dayType !== undefined &&
+    (!DAY_TYPE_SETUPS[kind].includes(reading.dayType) ||
+      (reading.dayType === 'trend' && reading.trendDay?.side !== side))
+  ) {
+    gates.push('not-for-this-day-type');
+  }
+  // The 15-minute trend must agree, except for the reversal setups.
+  const trendWay = side === 'CE' ? 'up' : 'down';
+  if ((kind === 'flag' || kind === 'opening-range-retest') && chart?.higherTrend !== trendWay) {
+    gates.push('chart-trend-disagrees');
+  }
   if (pullback) {
     // A clear 15-minute trend and the price back near value (VWAP or the 21-bar average); when
     // the votes agree strongly, a shallower pullback will do.
@@ -218,11 +267,11 @@ function readingGates(
     const gap = chart?.valueGapAtr ?? null;
     // On a trend day a shallow dip (to the 9-candle average, or a higher low) is pullback enough.
     const shallow = trendEntry?.shallowPullback ?? null;
-    if (!trigger && !shallow && (side === null || gap === null || gap > maxGap)) {
+    if (!trigger && !setup && !shallow && (side === null || gap === null || gap > maxGap)) {
       gates.push('no-pullback');
     }
     // The 8 votes must lean the trade's way: entries against them lost 6 times out of 8.
-    if (!trigger && side !== null && agreement < params.minAgreeingScore) {
+    if (!trigger && !setup && side !== null && agreement < params.minAgreeingScore) {
       gates.push('signals-disagree');
     }
   } else if (side === null || Math.abs(reading.score) < params.minEntryScore) {
@@ -258,14 +307,37 @@ function readingGates(
   // Pullback entries check the candle's shape only: volume against earlier days' same slot
   // swings too much (all six 11-13 pullback winners traded at 0.4–0.6× of it).
   const confirmed = pullback ? chart?.candle.shapeConfirms : chart?.candle.confirms;
-  // A trend-day trigger's own candle confirms the entry.
-  if (!trigger && reading.lastCandle.side !== null && reading.lastCandle.side !== side) {
+  // Candle rules, for every entry: the last finished 5-minute candle must be a named pattern on
+  // the trade's side that closes strongly, it must trade at a level, a doji means wait, and the
+  // last 15-minute candle must not point the other way.
+  // A setup has already checked its own signal candle (15-minute for the flag, double bottom or
+  // top and failed breakout; 5-minute for the opening-range retest).
+  const candle = chart?.candle ?? null;
+  if (reading.lastCandle.side !== null && reading.lastCandle.side !== side) {
     gates.push('opposite-candle');
-  } else if (!trigger && chart && confirmed !== side) {
+  } else if (!setup && candle?.pattern === 'doji') {
+    gates.push('doji-wait');
+  } else if (!setup && chart && confirmed !== side) {
     gates.push('no-candle-confirmation');
+  } else if (!setup && candle && candle.atLevel === null) {
+    gates.push('candle-not-at-level');
+  }
+  const fifteenSide = chart?.fifteenMinuteCandle?.side ?? null;
+  if (fifteenSide !== null && candle?.side && fifteenSide !== candle.side) {
+    gates.push('candles-disagree');
   }
   if (side === 'CE' && vixPct !== null && vixPct >= params.maxVixRiseForCallsPct) {
     gates.push('fear-spike');
+  }
+  // Banks are a large part of NIFTY: skip when Bank NIFTY is moving the other way.
+  const bankMove = reading.bankNiftyMovePct ?? null;
+  if (bankMove !== null && bankMove * direction <= -params.bankNiftyAgainstPct) {
+    gates.push('bank-nifty-disagrees');
+  }
+  // Straight after a jump in India VIX, option prices tend to fall back as it settles.
+  const vixMove = reading.vixMovePct ?? null;
+  if (vixMove !== null && vixMove >= params.vixSpikePct) {
+    gates.push('after-vix-spike');
   }
   if (reading.newsLevel === 'high') {
     gates.push('high-news');
@@ -395,6 +467,14 @@ export function floorExitReason(floor: ProfitFloor): ExitReason {
   return FLOOR_EXIT_REASON[floor.kind];
 }
 
+/** Within `eventBlockMinutes` before or after a scheduled announcement (`scheduledEvents`, IST). */
+export function nearScheduledEvent(now: Date, params: StrategyParams): boolean {
+  return params.scheduledEvents.some((event) => {
+    const at = Date.parse(`${event.replace(' ', 'T')}:00+05:30`);
+    return Number.isFinite(at) && Math.abs(now.getTime() - at) < params.eventBlockMinutes * 60_000;
+  });
+}
+
 /** How far (%) the index has moved against the position since entry; 0 when unknown. */
 export function indexMovedAgainst(position: OpenPosition, spot: number | null): number {
   const moved = pctChange(position.entrySpot, spot);
@@ -436,6 +516,9 @@ export function decideEntry(
     minutesBetween(input.day.lastExitAt, input.now) < params.cooldownMinutes
   ) {
     common.push('cooldown');
+  }
+  if (nearScheduledEvent(input.now, params)) {
+    common.push('scheduled-event');
   }
 
   const evaluated = [...input.readings]
@@ -508,6 +591,16 @@ export function checkPositionExit(
   }
   if (clock.minute >= params.squareOffMinute) {
     return { action: 'EXIT', reason: 'square-off' };
+  }
+  // On a range-bound day a setup's trade takes the smaller target: it sells there on the index.
+  const targetSpot = position.targetSpot ?? null;
+  const indexNow = input.spot ?? null;
+  if (
+    targetSpot !== null &&
+    indexNow !== null &&
+    (position.side === 'CE' ? indexNow >= targetSpot : indexNow <= targetSpot)
+  ) {
+    return { action: 'EXIT', reason: 'target-reached' };
   }
   // Once the ratcheting profit lock has armed, only it (and the square-off above) can sell.
   if (params.profitStepInr > 0) {

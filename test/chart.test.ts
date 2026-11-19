@@ -113,7 +113,8 @@ describe('readChart', () => {
       basis: 50,
       structure: 'unclear',
       higherTrend: null,
-      candle: { pattern: 'three_bar_push_up', side: 'CE', confirms: 'CE', volumeRatio: 1 },
+      // Three rising closes are not one of the confirming candles.
+      candle: { pattern: 'three_bar_push_up', side: null, confirms: null, volumeRatio: 1 },
       // Today's high before the last candle (25,027.5 futures) is just under spot now.
       support: { price: 24_977.5, kind: 'day-high' },
       // Yesterday's high, 25,102.5 on futures, is 25,052.5 in spot terms.
@@ -141,20 +142,30 @@ describe('readChart', () => {
     });
   });
 
-  it('confirms only a strong close past the candle before, on usual volume, of normal size', () => {
-    expect(risingMorning()?.candle.confirms).toBe('CE');
-    // Closes in the middle of its range.
-    expect(risingMorning([25_025, 25_032.5, 25_022.5, 25_027])?.candle.confirms).toBeNull();
+  it('confirms only a named pattern that closes strongly, on usual volume, of normal size', () => {
+    // A bullish marubozu: 13.5 points tall, closing 0.5 under its high.
+    const marubozu = [25_030, 25_043, 25_029.5, 25_042.5] as const;
+    expect(risingMorning(marubozu)?.candle).toMatchObject({
+      pattern: 'bull_marubozu',
+      confirms: 'CE',
+    });
+    // Three rising closes in a row closing near the high: no longer a confirming candle.
+    expect(risingMorning()?.candle.confirms).toBeNull();
     // Half the usual volume.
-    expect(risingMorning([25_025, 25_032.5, 25_022.5, 25_030, 500])?.candle.confirms).toBeNull();
-    // Four points tall, under half a normal swing.
-    expect(risingMorning([25_025, 25_028.5, 25_024.5, 25_028])?.candle.confirms).toBeNull();
+    expect(risingMorning([...marubozu, 500])?.candle.confirms).toBeNull();
+    // A marubozu only four points tall, under half a normal swing.
+    expect(risingMorning([25_025, 25_029, 25_024.8, 25_028.8])?.candle.confirms).toBeNull();
+    const fallingBars = [
+      ...steppingBars(PREV, '09:15', 24_900, 5, 20),
+      ...steppingBars(DAY, '09:15', 25_000, -5, 6),
+    ];
+    // A bearish marubozu last.
+    fallingBars[fallingBars.length - 1] = fiveMinuteBars(DAY, '09:40', [
+      [24_975, 24_975.5, 24_962, 24_962.5],
+    ])[0]!;
     const falling = readChart(
       {
-        bars: [
-          ...steppingBars(PREV, '09:15', 24_900, 5, 20),
-          ...steppingBars(DAY, '09:15', 25_000, -5, 6),
-        ],
+        bars: fallingBars,
         todayYmd: DAY,
         spot: 24_920,
         futuresPrice: 24_970,
@@ -196,9 +207,21 @@ describe('readChart', () => {
   });
 
   it('confirms the candle shape without the volume for pullback entries', () => {
-    const quiet = risingMorning([25_025, 25_032.5, 25_022.5, 25_030, 500]);
+    const quiet = risingMorning([25_030, 25_043, 25_029.5, 25_042.5, 500]);
     expect(quiet?.candle).toMatchObject({ confirms: null, shapeConfirms: 'CE', volumeRatio: 0.5 });
     expect(risingMorning([25_025, 25_032.5, 25_022.5, 25_027])?.candle.shapeConfirms).toBeNull();
+  });
+
+  it('names the level a candle traded at, and none away from every level', () => {
+    const marubozu = [25_030, 25_043, 25_029.5, 25_042.5] as const;
+    // 12 points above the opening range's high (25,017.5), with no VWAP and no option strikes.
+    expect(risingMorning(marubozu)?.candle.atLevel).toBeNull();
+    // Today's average price at 25,031 sits inside the candle.
+    expect(risingMorning(marubozu, 25_031)?.candle.atLevel).toBe("today's average price");
+    // A candle dipping to 25,019 comes within a quarter of a normal swing of the opening range's high.
+    expect(risingMorning([25_021, 25_034, 25_019, 25_033.5])?.candle.atLevel).toBe(
+      "the opening range's high",
+    );
   });
 
   it('trails a stop only from swings that formed after the entry', () => {
