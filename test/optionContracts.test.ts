@@ -215,7 +215,7 @@ describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
     expect(candidates[0]!.delta).toBeLessThan(0.46);
   });
 
-  it('puts the stop ₹10 under the buy price on the tick, the lock ₹10 over it and no target', () => {
+  it('puts the stop ₹10 under the buy price on the tick, moves it to the buy price at ₹10 over it, and has no target', () => {
     const { candidates } = candidatesFor(nearMoney(), DEFAULT_STRATEGY, plan);
     for (const candidate of candidates) {
       const stopped = candidate.plan!;
@@ -236,7 +236,13 @@ describe('contract plans with the fixed ₹10 stop and ₹15 target', () => {
         1,
       );
       expect(stopped.targetProfitInr).toBeNull();
-      expect(stopped.lockedProfitInr).toBeGreaterThan(10 * 65 - 100);
+      // Once ₹10 up, the stop-loss order moves to the buy price: sold there, only the charges are lost.
+      const atBuyPrice = estimateOptionsRoundTripCost({
+        buyPremium: candidate.ask,
+        sellPremium: candidate.ask,
+        quantity: 65,
+      });
+      expect(stopped.lockedProfitInr).toBeCloseTo(-atBuyPrice.totalInr, 1);
     }
   });
 

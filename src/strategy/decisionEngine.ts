@@ -321,8 +321,9 @@ export function profitLockPct(entryPrice: number, params: StrategyParams): numbe
 
 /**
  * ₹ per unit above the buy price that the profit lock keeps, from the best price so far: null
- * below buy + `profitLockInr`, then `profitLockInr`, rising by `profitStepInr` for each further
- * step reached (10, 20, 30 … with the defaults).
+ * below buy + `profitLockInr`, then `profitLockStartInr`, rising by `profitStepInr` for each
+ * further step reached (with the defaults: +₹10 → 0, the buy price; +₹15 → 5; +₹20 → 10 …).
+ * Without steps it is a single lock at `profitLockInr`.
  */
 export function profitLockLevelInr(
   entryPrice: number,
@@ -341,14 +342,14 @@ export function profitLockLevelInr(
     return params.profitLockInr;
   }
   const steps = Math.floor((gain - params.profitLockInr) / params.profitStepInr + ROUNDING_SLACK);
-  return params.profitLockInr + steps * params.profitStepInr;
+  return params.profitLockStartInr + steps * params.profitStepInr;
 }
 
 /**
  * Lowest gain (% on premium) the trade may fall back to before it is sold, from its best gain
  * so far; null until the break-even lock or the ₹ profit lock arms. With `entryPrice`, a best
- * price of buy + `profitLockInr` moves the floor up to that price; with `profitStepInr` the lock
- * then ratchets up and alone decides the floor. Shared by the live checks, the HOLD rationale
+ * price of buy + `profitLockInr` moves the floor up to that price; with `profitStepInr` the floor
+ * moves to buy + `profitLockStartInr` instead, then ratchets up and alone decides the floor. Shared by the live checks, the HOLD rationale
  * and the review's what-if replay.
  */
 export function profitFloor(
@@ -361,7 +362,7 @@ export function profitFloor(
   const lockArmed = lockPct !== null && peakGainPct + ROUNDING_SLACK >= lockPct;
   if (lockArmed && entryPrice !== null && params.profitStepInr > 0) {
     const level = profitLockLevelInr(entryPrice, entryPrice * (1 + peakGainPct / 100), params);
-    return { floorPct: ((level ?? params.profitLockInr) / entryPrice) * 100, kind: 'lock' };
+    return { floorPct: ((level ?? params.profitLockStartInr) / entryPrice) * 100, kind: 'lock' };
   }
   const breakevenArmed = peakGainPct >= params.breakevenActivatePct;
   if (!breakevenArmed && !lockArmed) {
@@ -577,9 +578,18 @@ export function checkPositionExit(
   return { action: 'HOLD' };
 }
 
-/** The option price that triggers the trade's stop-loss order. */
+/**
+ * The option price that triggers the trade's stop-loss order: the planned stop until the option
+ * has been `profitLockInr` above its buy price, then the profit lock (with the defaults: the buy
+ * price, then ₹5 higher for every further ₹5 gain). It only ever moves up.
+ */
 export function stopTriggerPrice(position: OpenPosition, params: StrategyParams): number {
-  return position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
+  const planned = position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
+  const level =
+    params.profitStepInr > 0
+      ? profitLockLevelInr(position.entryPrice, position.peakPrice, params)
+      : null;
+  return level === null ? planned : Math.max(planned, position.entryPrice + level);
 }
 
 /**

@@ -131,10 +131,15 @@ export type StrategyParams = {
   /** Without a chart stop: sell when the index has moved this % against the trade since entry. */
   indexStopPct: number;
   /**
-   * ₹ per unit. A trade needs room to gain this much over its buy price; once it has, the exit
-   * moves up to buy price + this, so the gain is kept.
+   * ₹ per unit. A trade needs room to gain this much over its buy price; once it has, the
+   * stop-loss order moves up to buy price + `profitLockStartInr`.
    */
   profitLockInr: number;
+  /**
+   * ₹ per unit above the buy price where the stop-loss order moves once the option is
+   * `profitLockInr` up: 0 is the buy price itself.
+   */
+  profitLockStartInr: number;
   /** ₹ per unit: the most a trade may lose at its chart stop, spread included (`stopLossInr` 0). */
   maxRiskPerUnitInr: number;
   /** ₹ per unit: fixed stop on the option price, buy price − this; 0 uses the chart stop. */
@@ -151,9 +156,10 @@ export type StrategyParams = {
   /** ₹ per unit: sell once the option is this much above its buy price; 0 means no target. */
   takeProfitInr: number;
   /**
-   * ₹ per unit: once `profitLockInr` is reached, the lock rises by this for each further step of
-   * profit (+10, +20, +30 … with ₹10 steps), and only the lock or the square-off can close the
-   * trade. 0 keeps a single lock at `profitLockInr`.
+   * ₹ per unit: once `profitLockInr` is reached, the stop rises by this for each further step of
+   * profit (with the defaults: +₹10 → the buy price, +₹15 → buy + ₹5, +₹20 → buy + ₹10 …), and
+   * only that stop or the square-off can close the trade. 0 keeps a single lock at
+   * `profitLockInr`.
    */
   profitStepInr: number;
   /** Once the best gain reaches this %, the exit moves up to cost plus `breakevenLockPct`. */
@@ -218,6 +224,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   indexStopPct: 0.15,
   // Three trades reached +₹13 to +₹23 a unit and still closed at a loss (2026-10-23, 11-03, 11-04).
   profitLockInr: 10,
+  // Once the option is ₹10 up, the stop-loss order moves to the buy price.
+  profitLockStartInr: 0,
   // About ₹1,050 on a 65-unit NIFTY lot with charges; past stopped trades lost ₹1,650–3,340.
   maxRiskPerUnitInr: 15,
   stopLossInr: 10,
@@ -228,8 +236,8 @@ export const DEFAULT_STRATEGY: StrategyParams = {
   openPositionCycleMinutes: 5,
   // No target sell: the profit lock ratchets up instead (10-day replay +₹4,400 vs +₹3,751).
   takeProfitInr: 0,
-  // 42-session backtest (2026-11-18): ₹10 steps made +₹478 over ₹5 steps on real prices.
-  profitStepInr: 10,
+  // Then ₹5 higher for every further ₹5 gain (2026-11-19).
+  profitStepInr: 5,
   // Three trades reached +9% to +15% and still closed at a loss before this lock existed.
   breakevenActivatePct: 8,
   breakevenLockPct: 2,

@@ -1117,16 +1117,17 @@ describe('LlmTradeAdvisorService one open trade at a time', () => {
       const { advisor, setOptionPriceFactor } = await optionsAdvisorScenario();
       await advisor.startDecisionLoop(['NIFTY']);
       advisor.stop();
-      // +10% is about +₹15.4: the lock moves to +₹15 and the trade is held.
-      setOptionPriceFactor(1.1);
+      // +13% is about +₹15.6 on the ₹119.94 option: the stop-loss order moves to ₹5 above the
+      // buy price and the trade is held.
+      setOptionPriceFactor(1.13);
       vi.setSystemTime(ist('2026-10-21', '10:31'));
       await advisor.runDecisionCycle();
       expect(storedRows()[1]).toMatchObject({
         action: 'HOLD',
         marketSnapshot: { position: { profitLockPrice: expect.any(Number) } },
       });
-      // Back to +5%: it slips through the lock and is sold, roughly ₹420 after charges.
-      setOptionPriceFactor(1.05);
+      // Back to +2% (about +₹3): it slips through the stop and is sold, a small win after charges.
+      setOptionPriceFactor(1.02);
       vi.setSystemTime(ist('2026-10-21', '10:32'));
       await advisor.runDecisionCycle();
       expect(storedRows()[2]?.marketSnapshot.exit?.reason).toBe('profit-lock');

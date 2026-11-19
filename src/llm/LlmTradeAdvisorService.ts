@@ -1433,7 +1433,15 @@ export class LlmTradeAdvisorService {
       return this.storeExit({ ...input, reason: check.reason });
     }
     if (check.action === 'SOLD') {
-      return this.storeExit({ ...input, reason: 'stop-loss', stopFillPrice: check.price });
+      // Once the profit lock has moved the stop-loss order up, its sale is the profit lock's.
+      const locked =
+        this.params.profitStepInr > 0 &&
+        profitLockLevelInr(position.entryPrice, position.peakPrice, this.params) !== null;
+      return this.storeExit({
+        ...input,
+        reason: locked ? 'profit-lock' : 'stop-loss',
+        stopFillPrice: check.price,
+      });
     }
     if (lastPrice !== null) {
       this.lastQuotedPriceBySymbol[position.symbol] = lastPrice;
@@ -1985,7 +1993,10 @@ export class LlmTradeAdvisorService {
     };
   }
 
-  /** Price the ratcheting profit lock sells below (buy + ₹10, + ₹15 …); null until armed. */
+  /**
+   * Price the ratcheting profit lock sells below (the buy price once the option is ₹10 up, then
+   * ₹5 higher for every further ₹5); null until armed.
+   */
   private profitLockPrice(position: OpenPosition): number | null {
     const level = profitLockLevelInr(position.entryPrice, position.peakPrice, this.params);
     return level === null ? null : round(position.entryPrice + level);

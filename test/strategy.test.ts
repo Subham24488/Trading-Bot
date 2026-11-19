@@ -1011,20 +1011,25 @@ describe('checkPositionExit with the ₹10-step profit ratchet and pullback rule
       current,
     );
 
-  it('locks buy + ₹10 at +₹10, then moves ₹10 higher for every further ₹10 gain', () => {
+  it('moves the stop to the buy price at +₹10, then ₹5 higher for every further ₹5 gain', () => {
     expect(profitLockLevelInr(120.3, 130.2, current)).toBeNull();
-    expect(profitLockLevelInr(120.3, 130.3, current)).toBe(10);
-    expect(profitLockLevelInr(120.3, 135.3, current)).toBe(10);
-    expect(profitLockLevelInr(120.3, 140.3, current)).toBe(20);
-    expect(profitLockLevelInr(120.3, 150.29, current)).toBe(20);
-    expect(profitLockLevelInr(120.3, 165.3, current)).toBe(40);
-    // Best ₹136 (+₹15.70): the lock stays at ₹130.30, so ₹131 still holds.
-    expect(at('11:05', 131, null, 136)).toEqual({ action: 'HOLD' });
-    // Best ₹141 (+₹20.70): the lock is at ₹140.30.
-    expect(at('11:05', 140.3, null, 141)).toEqual({ action: 'HOLD' });
-    expect(at('11:05', 140.25, null, 141)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
-    // Best ₹130.30: the lock is at ₹130.30, and there is no target sell however high it goes.
-    expect(at('11:05', 130.25, null, 130.3)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+    expect(profitLockLevelInr(120.3, 130.3, current)).toBe(0);
+    expect(profitLockLevelInr(120.3, 135.29, current)).toBe(0);
+    expect(profitLockLevelInr(120.3, 135.3, current)).toBe(5);
+    expect(profitLockLevelInr(120.3, 140.3, current)).toBe(10);
+    expect(profitLockLevelInr(120.3, 150.29, current)).toBe(15);
+    expect(profitLockLevelInr(120.3, 165.3, current)).toBe(35);
+    // Best ₹130.30 (+₹10): the stop is at the buy price, so ₹125 still holds and ₹120.25 sells.
+    expect(at('11:05', 125, null, 130.3)).toEqual({ action: 'HOLD' });
+    expect(at('11:05', 120.3, null, 130.3)).toEqual({ action: 'HOLD' });
+    expect(at('11:05', 120.25, null, 130.3)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+    // Best ₹136 (+₹15.70): the stop is ₹5 above the buy price, at ₹125.30.
+    expect(at('11:05', 126, null, 136)).toEqual({ action: 'HOLD' });
+    expect(at('11:05', 125.25, null, 136)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+    // Best ₹141 (+₹20.70): the stop is ₹10 above the buy price, at ₹130.30.
+    expect(at('11:05', 130.3, null, 141)).toEqual({ action: 'HOLD' });
+    expect(at('11:05', 130.25, null, 141)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+    // There is no target sell however high it goes.
     expect(at('11:05', 200)).toEqual({ action: 'HOLD' });
   });
 
@@ -1040,9 +1045,9 @@ describe('checkPositionExit with the ₹10-step profit ratchet and pullback rule
         },
         current,
       );
-    // Best +₹20.02: the lock is at ₹140.30. The bid is ₹140.22, the last trade ₹140.32.
-    expect(check(140.22, 140.32)).toEqual({ action: 'HOLD' });
-    expect(check(140.15, 140.25)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
+    // Best +₹20.02: the lock is at ₹130.30. The bid is ₹130.22, the last trade ₹130.32.
+    expect(check(130.22, 130.32)).toEqual({ action: 'HOLD' });
+    expect(check(130.15, 130.25)).toEqual({ action: 'EXIT', reason: 'profit-lock' });
   });
 
   it('leaves the ₹10 stop to the stop-loss order: a review holds at that price', () => {
@@ -1164,11 +1169,19 @@ describe('checkStopOrder: the stop-loss order placed at BUY', () => {
     expect(check({ ...gapped, reprice: true })).toEqual({ action: 'SOLD', price: 103.9 });
   });
 
-  it('keeps resting after the profit lock has armed', () => {
-    expect(check({ lastPrice: 110.3, bid: 110.2, peakPrice: 131 })).toEqual({
+  it('moves up to the buy price once the option has been ₹10 up, then ₹5 higher for every further ₹5', () => {
+    // Never more than ₹10 up: the order still rests at ₹110.30.
+    expect(check({ lastPrice: 120.3, bid: 120.2, peakPrice: 130 })).toEqual({ action: 'HOLD' });
+    // Best ₹131 (+₹10.70): the order has moved up to the buy price, ₹120.30.
+    expect(check({ lastPrice: 120.3, bid: 120.2, peakPrice: 131 })).toEqual({
       action: 'SOLD',
-      price: 110.2,
+      price: 120.2,
     });
+    // Best ₹136 (+₹15.70): ₹5 above the buy price, ₹125.30. A candle traded down to ₹125.
+    expect(
+      check({ bars: [candle(127, 125, 126)], lastPrice: 126, bid: 125.9, peakPrice: 136 }),
+    ).toEqual({ action: 'SOLD', price: 125.15 });
+    expect(check({ lastPrice: 126, bid: 125.9, peakPrice: 136 })).toEqual({ action: 'HOLD' });
   });
 
   it('closes a trade at 3:15 PM and one left open from an earlier day', () => {
@@ -1534,7 +1547,7 @@ describe('plain-English rationale', () => {
     }
   });
 
-  it('states the ₹10 stop, the ratcheting lock and the pullback on a BUY with the defaults', () => {
+  it('states the ₹10 stop, the stop moving to the buy price at +₹10 and the pullback on a BUY with the defaults', () => {
     const plan = {
       stopSpot: 24_983.4,
       targetSpot: 25_060,
@@ -1545,7 +1558,7 @@ describe('plain-English rationale', () => {
       premiumStop: 110.2,
       lockPrice: 130.2,
       maxLossInr: 721.4,
-      lockedProfitInr: 576.3,
+      lockedProfitInr: -53.8,
       targetPrice: null,
       targetProfitInr: null,
     };
@@ -1564,7 +1577,7 @@ describe('plain-English rationale', () => {
       'Plan: a stop-loss order sells if the option trades at ₹110.20 (₹10 below the buy price), a planned loss of about ₹721.40 on 1 lot after charges, or we sell earlier if NIFTY falls below 24,983',
     );
     expect(buy).toContain(
-      'Once it reaches ₹130.20 (₹10 above the buy price), the exit moves up to ₹130.20 (about ₹576.30 after charges) and then ₹10 higher for every further ₹10 gain; it is never sold at a target.',
+      'Once it reaches ₹130.20 (₹10 above the buy price), the stop-loss order moves up to the buy price, ₹120.20 (about −₹53.80 after charges), then ₹5 higher for every further ₹5 gain; it is never sold at a target.',
     );
     expect(buy).toContain(
       'Chart: the 15-minute trend is up and NIFTY came back to its average price; the last 5-minute candles show a strong up candle',
@@ -1586,21 +1599,34 @@ describe('plain-English rationale', () => {
       reading: null,
       params: current,
     });
+    // Best ₹137 (+₹16.80): the stop-loss order is ₹5 above the buy price.
     expect(armed).toContain(
-      'the profit lock is at ₹130.20 (₹10 above the buy price) and rises ₹10 with every further ₹10 gain',
+      'the stop-loss order has moved up to ₹125.20 (₹5 above the buy price) and rises ₹5 with every further ₹5 gain',
     );
+    expect(armed).toContain('Safety exit at ₹125.20');
     const exit = describeExit({
       now: ist('2026-10-21', '10:50'),
       position: { ...position, peakPrice: 142 },
-      exitPrice: 140.1,
+      exitPrice: 130.1,
       reason: 'profit-lock',
-      netPnlInr: 1_210,
+      netPnlInr: 560,
       params: current,
     });
     expect(exit).toContain(
-      'the option had gained ₹21.80 and slipped back to its profit lock at ₹140.20 (₹20 above the buy price)',
+      'the option had gained ₹21.80 and slipped back to its profit lock at ₹130.20 (₹10 above the buy price)',
     );
-    for (const text of [hold, armed, exit]) {
+    const atBuyPrice = describeExit({
+      now: ist('2026-10-21', '10:50'),
+      position: { ...position, peakPrice: 131 },
+      exitPrice: 120.1,
+      reason: 'profit-lock',
+      netPnlInr: -60,
+      params: current,
+    });
+    expect(atBuyPrice).toContain(
+      'the option had gained ₹10.80 and slipped back to the buy price, ₹120.20, where its stop-loss order moved once it was ₹10 up, so the trade did not turn into a loss before charges',
+    );
+    for (const text of [hold, armed, exit, atBuyPrice]) {
       expect(text).not.toMatch(JARGON);
     }
   });

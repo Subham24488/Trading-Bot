@@ -6,6 +6,7 @@ import {
   levelRoomPct,
   profitFloor,
   profitLockLevelInr,
+  stopTriggerPrice,
   type ExitReason,
   type GateId,
   type Leaning,
@@ -204,6 +205,13 @@ function chartText(reading: IndexReading, side: OptionSide, params: StrategyPara
   return `Chart: the last 5-minute ${shape}${volume}${trend}. `;
 }
 
+/** Where a profit lock keeps the trade: "the buy price, ₹120.20" or "₹125.20 (₹5 above the buy price)". */
+function lockedAtText(entryPrice: number, level: number): string {
+  return level === 0
+    ? `the buy price, ${formatInr(entryPrice)}`
+    : `${formatInr(entryPrice + level)} (₹${level} above the buy price)`;
+}
+
 /** Stop, target and profit lock of a BUY made from a chart plan. */
 function planText(input: {
   index: string;
@@ -243,8 +251,10 @@ function planText(input: {
       ? `Take profit at ${formatInr(plan.targetPrice)} (₹${params.takeProfitInr} above the buy price), about ` +
         `${formatInr(plan.targetProfitInr ?? 0)} after charges; once it reaches ${lock}. `
       : params.profitStepInr > 0
-        ? `Once it reaches ${lock} (about ${formatInr(plan.lockedProfitInr)} after charges) and then ` +
-          `₹${params.profitStepInr} higher for every further ₹${params.profitStepInr} gain; it is never sold at a target. `
+        ? `Once it reaches ${formatInr(plan.lockPrice)} (₹${params.profitLockInr} above the buy price), the stop-loss order moves up to ` +
+          `${lockedAtText(plan.lockPrice - params.profitLockInr, params.profitLockStartInr)} ` +
+          `(about ${formatSignedInr(plan.lockedProfitInr)} after charges), then ₹${params.profitStepInr} higher for every ` +
+          `further ₹${params.profitStepInr} gain; it is never sold at a target. `
         : `Once it reaches ${lock}, locking about ${formatInr(plan.lockedProfitInr)} after charges; bigger gains keep ` +
           'a growing share. ';
   return `${stop}${room}${profit}Sell by ${formatClockTime(params.squareOffMinute)} at the latest.`;
@@ -377,7 +387,8 @@ export function describeHold(input: {
 }): string {
   const { position, params } = input;
   const contract = describeContract(position);
-  const stopPrice = position.premiumStop ?? position.entryPrice * (1 - params.stopLossPct / 100);
+  // The stop-loss order moves up with the profit lock.
+  const stopPrice = stopTriggerPrice(position, params);
   const pnlPct = pctChange(position.entryPrice, input.price);
   if (input.price === null || pnlPct === null) {
     return finish(
@@ -395,14 +406,27 @@ export function describeHold(input: {
   const floorPrice = floor ? position.entryPrice * (1 + floor.floorPct / 100) : null;
   const lockPrice = position.entryPrice + params.profitLockInr;
   const breakevenFrom = position.entryPrice * (1 + params.breakevenActivatePct / 100);
+  // With the ratchet: where the stop-loss order sits now, and where it moves to once armed.
+  const lockLevel = profitLockLevelInr(
+    position.entryPrice,
+    Math.max(position.peakPrice, input.price),
+    params,
+  );
+  const lockStarts =
+    params.profitStepInr > 0
+      ? `the stop-loss order moves up to ${lockedAtText(position.entryPrice, params.profitLockStartInr)} ` +
+        `once the option reaches ${formatInr(lockPrice)}`
+      : null;
   const protection =
     floor === null || floorPrice === null
       ? lockPrice <= breakevenFrom
-        ? `the ₹${params.profitLockInr} profit lock starts at ${formatInr(lockPrice)}`
-        : `profit protection starts at ${formatInr(breakevenFrom)} and the ₹${params.profitLockInr} profit lock at ${formatInr(lockPrice)}`
+        ? (lockStarts ??
+          `the ₹${params.profitLockInr} profit lock starts at ${formatInr(lockPrice)}`)
+        : `profit protection starts at ${formatInr(breakevenFrom)} and ` +
+          (lockStarts ?? `the ₹${params.profitLockInr} profit lock at ${formatInr(lockPrice)}`)
       : floor.kind === 'lock'
         ? params.profitStepInr > 0
-          ? `the profit lock is at ${formatInr(floorPrice)} (₹${Math.round(floorPrice - position.entryPrice)} above the buy price) ` +
+          ? `the stop-loss order has moved up to ${lockedAtText(position.entryPrice, lockLevel ?? params.profitLockStartInr)} ` +
             `and rises ₹${params.profitStepInr} with every further ₹${params.profitStepInr} gain`
           : `the ₹${params.profitLockInr} profit lock is on, so it sells below ${formatInr(floorPrice)}`
         : floor.kind === 'breakeven'
@@ -468,6 +492,12 @@ const EXIT_TEXT: Record<ExitReason, (params: StrategyParams, position: OpenPosit
   'profit-lock': (p, position) => {
     const level = profitLockLevelInr(position.entryPrice, position.peakPrice, p) ?? p.profitLockInr;
     const best = Math.max(level, position.peakPrice - position.entryPrice);
+    if (level === 0) {
+      return (
+        `the option had gained ${formatInr(best)} and slipped back to the buy price, ${formatInr(position.entryPrice)}, ` +
+        `where its stop-loss order moved once it was ₹${p.profitLockInr} up, so the trade did not turn into a loss before charges`
+      );
+    }
     return (
       `the option had gained ${formatInr(best)} and slipped back to its profit lock at ` +
       `${formatInr(position.entryPrice + level)} (₹${level} above the buy price), so the gain was kept`

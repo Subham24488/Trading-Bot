@@ -47,11 +47,11 @@ export type ContractPlan = {
   riskPerUnit: number;
   /** Option price that ends the trade: buy price less `riskPerUnit`, on the ₹0.05 tick. */
   premiumStop: number;
-  /** Buy price + the ₹ profit lock; once reached, the exit moves up to it. */
+  /** Buy price + the ₹ profit lock; once reached, the stop-loss order moves up (to the buy price). */
   lockPrice: number;
   /** Loss on 1 lot if sold at `premiumStop`, charges included. */
   maxLossInr: number;
-  /** Profit on 1 lot if sold at `lockPrice`, after charges. */
+  /** Profit on 1 lot if sold where the stop moves to once `lockPrice` is reached, after charges. */
   lockedProfitInr: number;
   /** Buy price + the ₹ take-profit; null when there is no take-profit. */
   targetPrice: number | null;
@@ -152,6 +152,11 @@ function planContract(
   const onTick = (fixedStop ? Math.ceil(ticks - 1e-6) : Math.floor(ticks + 1e-6)) * TICK;
   const premiumStop = round2(Math.max(widest, onTick));
   const lockPrice = round2(row.ask + params.profitLockInr);
+  // Where the stop moves once the lock price is reached: the buy price (+ `profitLockStartInr`)
+  // with the ratchet, the lock price itself without it.
+  const keptPrice = round2(
+    row.ask + (params.profitStepInr > 0 ? params.profitLockStartInr : params.profitLockInr),
+  );
   const targetPrice = params.takeProfitInr > 0 ? round2(row.ask + params.takeProfitInr) : null;
   const atTarget =
     targetPrice === null
@@ -168,7 +173,7 @@ function planContract(
   });
   const atLock = estimateOptionsRoundTripCost({
     buyPremium: row.ask,
-    sellPremium: lockPrice,
+    sellPremium: keptPrice,
     quantity: row.lotSize,
   });
   return {
@@ -182,7 +187,7 @@ function planContract(
       premiumStop,
       lockPrice,
       maxLossInr: round2((row.ask - premiumStop) * row.lotSize + atStop.totalInr),
-      lockedProfitInr: round2((lockPrice - row.ask) * row.lotSize - atLock.totalInr),
+      lockedProfitInr: round2((keptPrice - row.ask) * row.lotSize - atLock.totalInr),
       targetPrice,
       targetProfitInr:
         targetPrice === null || atTarget === null

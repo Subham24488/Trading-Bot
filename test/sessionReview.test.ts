@@ -274,8 +274,18 @@ describe('simulateExitRules with the fixed ₹10 stop and the ₹10-step profit 
   const path = (moves: Array<[string, number]>) =>
     moves.map(([time, spot]) => ({ at: ist(time), spot }));
 
-  it('ratchets the lock to +₹20 and sells at −₹10, whatever the percentage', () => {
-    // Index +32 points: about ₹16 up, so the lock is at +₹10 and +₹13 still holds.
+  it('moves the stop to the buy price at +₹10, then ₹5 higher per ₹5, and sells at −₹10, whatever the percentage', () => {
+    // Index +22 points: about ₹11 up, so the stop is at the buy price; back to −₹1: sold there.
+    const atBuyPrice = simulateExitRules(
+      start,
+      path([
+        ['10:05', 25_022],
+        ['10:10', 24_998],
+      ]),
+      DEFAULT_STRATEGY,
+    );
+    expect(atBuyPrice).toMatchObject({ reason: 'profit-lock' });
+    // Index +32 points: about ₹16 up, so the stop is at +₹5 and +₹13 still holds.
     const held = simulateExitRules(
       start,
       path([
@@ -285,12 +295,12 @@ describe('simulateExitRules with the fixed ₹10 stop and the ₹10-step profit 
       DEFAULT_STRATEGY,
     );
     expect(held?.reason).not.toBe('profit-lock');
-    // Index +42 points: about ₹21 up, so the lock is at +₹20; back to +₹18: sold on the lock.
+    // Index +42 points: about ₹21 up, so the stop is at +₹10; back to +₹9: sold on the lock.
     const locked = simulateExitRules(
       start,
       path([
         ['10:05', 25_042],
-        ['10:10', 25_036],
+        ['10:10', 25_018],
       ]),
       DEFAULT_STRATEGY,
     );
